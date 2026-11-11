@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hopshot dev preview</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">
+    {"imports": {"three": "/node_modules/three/build/three.module.js", "three/addons/": "/node_modules/three/examples/jsm/"}}
+  </script>
+  <style>
+    #dev { position: fixed; left: 10px; top: 56px; bottom: 10px; width: 262px; overflow-y: auto; padding: 10px; z-index: 50; pointer-events: auto;
+      background: rgba(10, 14, 26, 0.82); border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; font: 12px system-ui, sans-serif; color: #fff; -webkit-user-select: none; user-select: none; }
+    #dev h4 { margin: 12px 0 5px; font-size: 10px; letter-spacing: 2px; color: #ffb43a; text-transform: uppercase; }
+    #dev h4:first-child { margin-top: 0; }
+    #dev .row { display: flex; flex-wrap: wrap; gap: 4px; }
+    #dev button { font: 600 11px system-ui, sans-serif; padding: 5px 8px; color: #fff; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; cursor: pointer; }
+    #dev button:hover { background: rgba(255,255,255,0.24); }
+    #dev label { display: block; margin-top: 4px; color: rgba(255,255,255,0.75); }
+    #dev input[type=range] { width: 100%; }
+    #dev .help { color: rgba(255,255,255,0.7); line-height: 1.5; }
+    #stats { position: fixed; left: 10px; top: 10px; z-index: 50; font: 600 12px ui-monospace, Menlo, monospace; padding: 5px 9px; background: rgba(10,14,26,0.7); color: #9ff; border-radius: 8px; pointer-events: none; }
+    #dev.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="hud"></div>
+  <div id="stats">...</div>
+  <div id="dev"></div>
+
+<script type="module">
+import { createRenderer } from './render.js';
+import { createHud } from './hud.js';
+import { createAudio, SOUND_NAMES } from './audio.js';
+import { MAP } from '../shared/map.js';
+import { WEAPONS } from '../shared/weapons.js';
+
+const canvas = document.getElementById('game');
+const renderer = createRenderer(canvas, MAP);
+const hud = createHud(document.getElementById('hud'));
+const audio = createAudio();
+const settings = { sensitivity: 1, fov: 90, volume: 0.7 };
+audio.setVolume(settings.volume);
+renderer.setFov(settings.fov);
+const onResize = () => renderer.resize(window.innerWidth, window.innerHeight);
+window.addEventListener('resize', onResize); onResize();
+
+// ---------------------------------------------------------------- mock state
+const local = { alive: true, x: 0, y: 4.5, z: 24, eyeHeight: 0, yaw: 0, pitch: -0.1, vx: 0, vy: 0, vz: 0,
+  onGround: false, crouching: false, sliding: false, weapon: 0, ads: 0, reloading: false };
+const ws = { ammo: [30, 5, 6], reloadLeft: 0, cooldown: 0, switchT: 0 };
+const hudState = { alive: true, health: 100, ammo: 30, magSize: 30, weaponKey: 'rifle', weaponName: 'Rifle', reloading: false,
+  ads: 0, speed: 0, kills: 0, deaths: 0, roundTimeLeft: 300, respawnIn: 0, ping: 38, fps: 60, players: 9 };
+const frame = { dt: 0, time: 0, local, players: [] };
+const keys = new Set();
+let mode = 'fly', adsHeld = false, fireHeld = false, locked = false, deadTimer = 0, scoreHeld = false;
+let slideT = 0, stepT = 0, wasGround = false, panelOn = true;
+
+const boxes = MAP.boxes;
+function groundAt(x, z, y, step) {
+  let best = 0;
+  for (const b of boxes) {
+    if (b.max[1] > best && b.max[1] <= y + step && x > b.min[0] && x < b.max[0] && z > b.min[2] && z < b.max[2]) best = b.max[1];
+  }
+  return best;
+}
+function rayBoxes(o, d, maxT, nOut) {
+  let bt = maxT;
+  for (const b of boxes) {
+    let t0 = 0, t1 = bt, nx = 0, ny = 0, nz = 0, ok = true;
+    for (let a = 0; a < 3 && ok; a++) {
+      const inv = 1 / (d[a] || 1e-9);
+      let ta = (b.min[a] - o[a]) * inv, tb = (b.max[a] - o[a]) * inv, s = -1;
+      if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s = 1; }
+      if (ta > t0) { t0 = ta; nx = ny = nz = 0; if (a === 0) nx = s; else if (a === 1) ny = s; else nz = s; }
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) ok = false;
+    }
+    if (ok && t0 > 0.001 && t0 < bt) { bt = t0; nOut[0] = nx; nOut[1] = ny; nOut[2] = nz; }
+  }
+  return bt;
+}
+
+// ---------------------------------------------------------------- fake players
+const NAMES = ['Nova', 'Kestrel', 'Bolt', 'Mango', 'Pixel', 'Juno', 'Rex', 'Echo', 'Zephyr', 'Sprocket'];
+const bots = [];
+const spawnPts = MAP.spawns;
+for (let i = 0; i < 8; i++) {
+  const a = spawnPts[(i * 3) % spawnPts.length].pos, b = spawnPts[(i * 3 + 11) % spawnPts.length].pos;
+  const p = { id: 10 + i * 3, name: NAMES[i], x: a[0], y: a[1], z: a[2], yaw: 0, pitch: 0, crouching: false, sliding: false, alive: true,
+    weapon: i % 3, health: 100,
+    ax: a[0], az: a[2], bx: b[0], bz: b[2], t: Math.random(), dir: 1, phase: i * 1.3, state: 0, stateT: 1 + i * 0.5, fireT: 1 + Math.random() * 2, deadT: 0, vy: 0, jy: 0 };
+  bots.push(p); frame.players.push(p);
+}
+function updateBots(dt, time) {
+  for (const p of bots) {
+    p.stateT -= dt; p.fireT -= dt;
+    if (p.stateT <= 0) {
+      p.state = (p.state + 1) % 5; // 0 run, 1 crouch-walk, 2 slide, 3 run+jump, 4 die
+      p.stateT = p.state === 4 ? 2.4 : 2 + Math.random() * 2;
+      if (p.state === 4) { p.alive = false; p.deadT = 0; p.health = 0; }
+      else if (!p.alive) { p.alive = true; p.health = 100; const s = spawnPts[(Math.random() * 20) | 0]; p.ax = s.pos[0]; p.az = s.pos[2]; p.t = 0; }
+      p.weapon = (p.weapon + (Math.random() < 0.3 ? 1 : 0)) % 3;
+    }
+    p.crouching = p.alive && (p.state === 1 || p.state === 2);
+    p.sliding = p.alive && p.state === 2;
+    if (p.alive) {
+      const speed = p.state === 1 ? 3.5 : p.state === 2 ? 11 : 7;
+      const len = Math.hypot(p.bx - p.ax, p.bz - p.az) || 1;
+      p.t += (speed * dt / len) * p.dir;
+      if (p.t > 1) { p.t = 1; p.dir = -1; } else if (p.t < 0) { p.t = 0; p.dir = 1; }
+      const px = p.x, pz = p.z;
+      p.x = p.ax + (p.bx - p.ax) * p.t; p.z = p.az + (p.bz - p.az) * p.t;
+      const vx = (p.x - px) / dt, vz = (p.z - pz) / dt;
+      if (Math.hypot(vx, vz) > 0.1) p.yaw = Math.atan2(-vx, -vz);
+      if (p.state === 3 && p.jy === 0 && p.vy === 0 && Math.random() < dt * 1.5) p.vy = 8;
+      p.vy -= 25 * dt; p.jy += p.vy * dt;
+      if (p.jy < 0) { p.jy = 0; p.vy = 0; }
+      p.y = groundAt(p.x, p.z, p.y, 0.5) + p.jy;
+      p.pitch = Math.sin(time * 0.7 + p.phase) * 0.15;
+      if (p.fireT <= 0) {
+        p.fireT = 0.7 + Math.random() * 2;
+        renderer.remoteFire(p.id);
+        const ey = p.y + (p.crouching ? 0.95 : 1.62);
+        const dir = [-Math.sin(p.yaw), Math.sin(p.pitch) - 0.02, -Math.cos(p.yaw)];
+        const org = [p.x, ey, p.z], n = [0, 1, 0];
+        const t = rayBoxes(org, dir, 60, n);
+        const hit = [org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t];
+        renderer.tracer(org, hit, { local: false });
+        if (t < 60) renderer.impact(hit, n, { flesh: false });
+        audio.play(WEAPONS[p.weapon].key, { pos: [p.x, ey, p.z], volume: 0.9 });
+      }
+    } else {
+      p.deadT += dt;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- local actions
+function setWeapon(w) {
+  if (w === local.weapon) return;
+  local.weapon = w; ws.reloadLeft = 0; ws.cooldown = 0.3; local.reloading = false;
+  audio.play('switch');
+}
+function startReload() {
+  const w = WEAPONS[local.weapon];
+  if (ws.reloadLeft > 0 || ws.ammo[local.weapon] >= w.magSize) return;
+  ws.reloadLeft = w.reloadTicks / 60; local.reloading = true; audio.play('reload');
+}
+function fireLocal() {
+  const w = WEAPONS[local.weapon];
+  if (!local.alive || ws.cooldown > 0 || ws.reloadLeft > 0) return;
+  if (ws.ammo[local.weapon] <= 0) { audio.play('empty'); ws.cooldown = 0.3; startReload(); return; }
+  ws.ammo[local.weapon]--; ws.cooldown = w.fireIntervalTicks / 60;
+  renderer.localFire(local.weapon);
+  audio.play(w.key);
+  const org = [local.x, local.y + local.eyeHeight, local.z];
+  const cp = Math.cos(local.pitch);
+  const n = [0, 1, 0];
+  for (let k = 0; k < w.pellets; k++) {
+    const sp = local.ads > 0.5 ? w.adsSpread : w.spread;
+    const jx = (Math.random() - 0.5) * 2 * sp, jy = (Math.random() - 0.5) * 2 * sp;
+    const yaw = local.yaw + jx, pitch = local.pitch + jy, c = Math.cos(pitch);
+    const dir = [-Math.sin(yaw) * c, Math.sin(pitch), -Math.cos(yaw) * c];
+    let t = rayBoxes(org, dir, w.range, n), flesh = false;
+    for (const p of bots) {
+      if (!p.alive) continue;
+      const h = p.crouching ? 1.1 : 1.8;
+      const mn = [p.x - 0.35, p.y, p.z - 0.35], mx = [p.x + 0.35, p.y + h, p.z + 0.35];
+      let t0 = 0, t1 = t, ok = true;
+      for (let a = 0; a < 3 && ok; a++) {
+        const inv = 1 / (dir[a] || 1e-9);
+        let ta = (mn[a] - org[a]) * inv, tb = (mx[a] - org[a]) * inv;
+        if (ta > tb) { const q = ta; ta = tb; tb = q; }
+        if (ta > t0) t0 = ta; if (tb < t1) t1 = tb;
+        if (t0 > t1) ok = false;
+      }
+      if (ok && t0 < t) {
+        t = t0; flesh = true;
+        const hy = org[1] + dir[1] * t0;
+        const head = hy > p.y + h - 0.32;
+        setTimeout(() => { hud.hitmarker({ headshot: head, kill: false }); audio.play(head ? 'headshot' : 'hit'); }, 30);
+      }
+    }
+    const hit = [org[0] + dir[0] * Math.min(t, 200), org[1] + dir[1] * Math.min(t, 200), org[2] + dir[2] * Math.min(t, 200)];
+    renderer.tracer(org, hit, { local: true });
+    if (t < w.range) renderer.impact(hit, flesh ? [-dir[0], -dir[1], -dir[2]] : n, { flesh });
+  }
+  void cp;
+  if (ws.ammo[local.weapon] === 0) startReload();
+}
+
+// ---------------------------------------------------------------- input
+const el = (id) => document.getElementById(id);
+canvas.addEventListener('click', () => { audio.unlock(); if (!locked) canvas.requestPointerLock && canvas.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement === canvas; });
+document.addEventListener('mousemove', (e) => {
+  if (!locked && !(e.buttons & 1 && e.target === canvas)) return;
+  const s = 0.0022 * settings.sensitivity * (1 - local.ads * 0.6);
+  local.yaw -= e.movementX * s;
+  local.pitch = Math.max(-1.55, Math.min(1.55, local.pitch - e.movementY * s));
+});
+canvas.addEventListener('mousedown', (e) => { audio.unlock(); if (!locked) return; if (e.button === 0) fireHeld = true; if (e.button === 2) adsHeld = true; });
+window.addEventListener('mouseup', (e) => { if (e.button === 0) fireHeld = false; if (e.button === 2) adsHeld = false; });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+window.addEventListener('keydown', (e) => {
+  if (e.target && (e.target.tagName === 'INPUT' && e.target.type === 'text')) return;
+  keys.add(e.code);
+  if (e.code === 'Tab') { e.preventDefault(); scoreHeld = true; }
+  if (e.repeat) return;
+  if (e.code === 'Digit1') setWeapon(0); if (e.code === 'Digit2') setWeapon(1); if (e.code === 'Digit3') setWeapon(2);
+  if (e.code === 'KeyR') startReload();
+  if (e.code === 'KeyF') toggleMode();
+  if (e.code === 'KeyH') { panelOn = !panelOn; el('dev').classList.toggle('hidden', !panelOn); }
+  if (e.code === 'Space') e.preventDefault();
+});
+window.addEventListener('keyup', (e) => { keys.delete(e.code); if (e.code === 'Tab') scoreHeld = false; });
+window.addEventListener('blur', () => { keys.clear(); fireHeld = adsHeld = false; });
+
+function toggleMode() {
+  mode = mode === 'fly' ? 'walk' : 'fly';
+  if (mode === 'walk') { local.eyeHeight = 1.62; local.y = groundAt(local.x, local.z, local.y, 99); local.vy = 0; }
+  else { local.eyeHeight = 0; local.y += 1.62; local.vx = local.vy = local.vz = 0; local.onGround = false; local.crouching = local.sliding = false; }
+  modeBtn.textContent = 'Mode: ' + mode + ' (F)';
+}
+
+function updateLocal(dt) {
+  const fwd = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  const str = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const sy = Math.sin(local.yaw), cy = Math.cos(local.yaw);
+  let wx = -sy * fwd + cy * str, wz = -cy * fwd - sy * str;
+  const wl = Math.hypot(wx, wz); if (wl > 0) { wx /= wl; wz /= wl; }
+  local.ads += ((adsHeld && local.alive ? 1 : 0) - local.ads) * Math.min(1, dt * 14);
+
+  if (!local.alive) { local.vx = local.vy = local.vz = 0; return; }
+  if (mode === 'fly') {
+    const sp = (keys.has('ShiftLeft') ? 40 : 14);
+    local.x += wx * sp * dt; local.z += wz * sp * dt;
+    local.y += ((keys.has('Space') ? 1 : 0) - (keys.has('KeyC') || keys.has('ControlLeft') ? 1 : 0)) * sp * dt;
+    local.vx = wx * sp; local.vz = wz * sp; local.vy = 0; local.onGround = true; local.crouching = local.sliding = false;
+    return;
+  }
+  // crude walk mode: gravity + ground heights, slide-hop-ish speed model (no wall collision)
+  const crouchKey = keys.has('ShiftLeft') || keys.has('KeyC');
+  const hs = Math.hypot(local.vx, local.vz);
+  if (crouchKey && local.onGround && !local.sliding && slideT <= 0 && hs > 6.5) { local.sliding = true; slideT = 0.8; const k = Math.min(17, hs * 1.25) / hs; local.vx *= k; local.vz *= k; audio.play('slide'); }
+  local.crouching = crouchKey;
+  if (!crouchKey) local.sliding = false;
+  if (local.sliding) { slideT -= dt; local.vx *= 1 - dt * 0.7; local.vz *= 1 - dt * 0.7; if (slideT <= 0) { local.sliding = false; slideT = 0; } }
+  else {
+    const target = local.crouching ? 3.5 : 7;
+    const acc = local.onGround ? 14 : 3;
+    local.vx += (wx * target - local.vx) * Math.min(1, acc * dt);
+    local.vz += (wz * target - local.vz) * Math.min(1, acc * dt);
+  }
+  if (local.onGround && keys.has('Space')) { local.vy = 7.9; local.onGround = false; audio.play('jump'); local.sliding = false; }
+  local.vy -= 25 * dt;
+  local.x += local.vx * dt; local.z += local.vz * dt; local.y += local.vy * dt;
+  const g = groundAt(local.x, local.z, local.y, 0.3);
+  wasGround = local.onGround;
+  if (local.y <= g) { if (!wasGround && local.vy < -4) audio.play('land'); local.y = g; local.vy = 0; local.onGround = true; } else local.onGround = false;
+  const tgt = local.crouching ? 0.95 : 1.62;
+  local.eyeHeight += (tgt - local.eyeHeight) * Math.min(1, dt * 14);
+  if (local.onGround && !local.sliding && Math.hypot(local.vx, local.vz) > 2) {
+    stepT -= dt * Math.hypot(local.vx, local.vz) / 2.2;
+    if (stepT <= 0) { stepT = 1; audio.play('step', { volume: 0.6 }); }
+  }
+}
+
+// ---------------------------------------------------------------- panel
+const dev = el('dev');
+dev.addEventListener('mousedown', (e) => e.stopPropagation());
+function section(title) { const h = document.createElement('h4'); h.textContent = title; dev.appendChild(h); const r = document.createElement('div'); r.className = 'row'; dev.appendChild(r); return r; }
+function btn(row, label, fn) { const b = document.createElement('button'); b.textContent = label; b.addEventListener('click', (e) => { audio.unlock(); fn(e); b.blur(); }); row.appendChild(b); return b; }
+function slider(row, label, min, max, step, val, fn) {
+  const l = document.createElement('label'); l.textContent = label + ' ';
+  const i = document.createElement('input'); i.type = 'range'; i.min = min; i.max = max; i.step = step; i.value = val;
+  i.addEventListener('input', () => fn(+i.value)); l.appendChild(i); row.parentNode.insertBefore(l, row.nextSibling); return i;
+}
+const rand = (a) => a[(Math.random() * a.length) | 0];
+const help = document.createElement('div'); help.className = 'help';
+help.innerHTML = 'Click canvas to look (Esc frees mouse). <b>WASD</b> move, <b>Space</b>/<b>C</b> up/down (fly) or jump/crouch (walk, Shift slides), <b>LMB</b> fire, <b>RMB</b> aim, <b>1/2/3</b> weapon, <b>R</b> reload, <b>Tab</b> scoreboard, <b>F</b> fly/walk, <b>H</b> hide panel.';
+dev.appendChild(help);
+
+let r = section('Camera / local');
+const modeBtn = btn(r, 'Mode: fly (F)', toggleMode);
+btn(r, 'Rifle', () => setWeapon(0)); btn(r, 'Scout', () => setWeapon(1)); btn(r, 'Shotgun', () => setWeapon(2));
+btn(r, 'Reload', startReload);
+btn(r, 'Toggle ADS (latch)', () => { adsHeld = !adsHeld; });
+btn(r, 'Kill / respawn local', () => { if (local.alive) die(); else respawn(); });
+btn(r, 'Teleport to tower', () => { local.x = 26; local.z = 26; local.y = mode === 'fly' ? 5 : 2.2; });
+btn(r, 'Teleport to centre', () => { local.x = 0; local.z = 12; local.y = mode === 'fly' ? 3 : 0; });
+slider(r, 'FOV', 60, 120, 1, 90, (v) => { settings.fov = v; renderer.setFov(v); });
+
+r = section('Renderer effects');
+btn(r, 'localFire', () => { renderer.localFire(local.weapon); audio.play(WEAPONS[local.weapon].key); });
+btn(r, 'remoteFire (random bot)', () => { const p = rand(bots); renderer.remoteFire(p.id); audio.play(WEAPONS[p.weapon].key, { pos: [p.x, p.y + 1.4, p.z] }); });
+btn(r, 'tracer (local)', () => { const o = [local.x, local.y + local.eyeHeight, local.z]; const d = [-Math.sin(local.yaw), 0, -Math.cos(local.yaw)]; renderer.tracer(o, [o[0] + d[0] * 40, o[1] + d[1] * 40, o[2] + d[2] * 40], { local: true }); });
+btn(r, 'tracer (remote)', () => { const p = rand(bots); renderer.tracer([p.x, p.y + 1.4, p.z], [p.x + 25 * -Math.sin(p.yaw), p.y + 1, p.z + 25 * -Math.cos(p.yaw)], { local: false }); });
+btn(r, 'impact (wall)', () => { const o = [local.x, local.y + local.eyeHeight, local.z]; const d = [-Math.sin(local.yaw) * Math.cos(local.pitch), Math.sin(local.pitch), -Math.cos(local.yaw) * Math.cos(local.pitch)]; const n = [0, 1, 0]; const t = rayBoxes(o, d, 100, n); renderer.impact([o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t], n, { flesh: false }); });
+btn(r, 'impact (flesh)', () => { const p = rand(bots); renderer.impact([p.x, p.y + 1.2, p.z], [0, 0, 1], { flesh: true }); });
+btn(r, 'burst x8 sparks', () => { for (let i = 0; i < 8; i++) renderer.impact([local.x - Math.sin(local.yaw) * 6 + i * 0.3, 1 + i * 0.1, local.z - Math.cos(local.yaw) * 6], [0, 1, 0], { flesh: i & 1 }); });
+btn(r, 'Kill random bot', () => { const p = rand(bots); p.state = 3; p.stateT = 0; });
+
+r = section('HUD');
+btn(r, 'Kill feed', () => hud.addKill({ killerName: rand(NAMES), victimName: rand(NAMES), weaponKey: rand(['rifle', 'scout', 'shotgun']), headshot: Math.random() < 0.4, localInvolved: Math.random() < 0.3 }));
+btn(r, 'Kill feed (you)', () => hud.addKill({ killerName: 'You', victimName: rand(NAMES), weaponKey: 'scout', headshot: true, localInvolved: true }));
+btn(r, 'Hitmarker', () => hud.hitmarker({ headshot: false, kill: false }));
+btn(r, 'Headshot', () => hud.hitmarker({ headshot: true, kill: false }));
+btn(r, 'Kill marker', () => hud.hitmarker({ headshot: false, kill: true }));
+btn(r, 'Dmg front', () => hud.damageFrom(0)); btn(r, 'Dmg left', () => hud.damageFrom(Math.PI / 2));
+btn(r, 'Dmg back', () => hud.damageFrom(Math.PI)); btn(r, 'Dmg right', () => hud.damageFrom(-Math.PI / 2));
+btn(r, 'Scoreboard (toggle)', () => { scoreHeld = !scoreHeld; });
+btn(r, 'Menu show', () => hud.showMenu({ defaultName: 'Player' + ((Math.random() * 900 + 100) | 0), settings: { ...settings }, onPlay: (n) => { hud.hideMenu(); hud.setStatus('Play pressed as ' + n); setTimeout(() => hud.setStatus(''), 1500); }, onSettings: (s) => { Object.assign(settings, s); renderer.setFov(s.fov); audio.setVolume(s.volume); } }));
+btn(r, 'Menu hide', () => hud.hideMenu());
+btn(r, 'Round end show', () => hud.showRoundEnd({ winnerName: 'Nova', rows: scoreRows(), nextIn: 10 }));
+btn(r, 'Round end hide', () => hud.hideRoundEnd());
+btn(r, 'Status: Connecting', () => hud.setStatus('Connecting...'));
+btn(r, 'Status: Disconnected', () => hud.setStatus('Disconnected - click to retry'));
+btn(r, 'Status: hide', () => hud.setStatus(''));
+slider(r, 'Health', 0, 100, 1, 100, (v) => { hudState.health = v; });
+
+r = section('Audio');
+for (const n of SOUND_NAMES) btn(r, n, () => audio.play(n));
+btn(r, 'rifle (pos, left)', () => { const e = local.yaw + Math.PI / 2; audio.play('rifle', { pos: [local.x - Math.sin(e) * 12, local.y + 1, local.z - Math.cos(e) * 12] }); });
+btn(r, 'rifle (pos, right)', () => { const e = local.yaw - Math.PI / 2; audio.play('rifle', { pos: [local.x - Math.sin(e) * 12, local.y + 1, local.z - Math.cos(e) * 12] }); });
+btn(r, 'shotgun (pos, far 50m)', () => audio.play('shotgun', { pos: [local.x - Math.sin(local.yaw) * 50, local.y, local.z - Math.cos(local.yaw) * 50] }));
+slider(r, 'Volume', 0, 1, 0.01, 0.7, (v) => { settings.volume = v; audio.setVolume(v); });
+
+function die() { local.alive = false; hudState.deaths++; deadTimer = 2.5; audio.play('death'); hud.damageFrom(0.5); }
+function respawn() { local.alive = true; hudState.health = 100; ws.ammo[0] = 30; ws.ammo[1] = 5; ws.ammo[2] = 6; local.reloading = false; ws.reloadLeft = 0; }
+function scoreRows() {
+  const rows = bots.map((p) => ({ id: p.id, name: p.name, kills: (p.id * 7) % 13, deaths: (p.id * 5) % 9, ping: 20 + (p.id * 11) % 70, isLocal: false, isBot: p.id % 2 === 0 }));
+  rows.push({ id: 1, name: 'You', kills: hudState.kills, deaths: hudState.deaths, ping: 38, isLocal: true, isBot: false });
+  return rows;
+}
+
+// ---------------------------------------------------------------- loop
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsShown = 60, statsT = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  frame.dt = dt; frame.time = now / 1000;
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc >= 0.5) { fpsShown = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+
+  if (!local.alive) { deadTimer -= dt; hudState.respawnIn = deadTimer; if (deadTimer <= 0) respawn(); }
+  updateLocal(dt);
+  updateBots(dt, frame.time);
+  ws.cooldown = Math.max(0, ws.cooldown - dt);
+  if (ws.reloadLeft > 0) { ws.reloadLeft -= dt; if (ws.reloadLeft <= 0) { ws.ammo[local.weapon] = WEAPONS[local.weapon].magSize; local.reloading = false; } }
+  if (fireHeld && (WEAPONS[local.weapon].auto || !fireHeld.latched)) { fireLocal(); if (!WEAPONS[local.weapon].auto) fireHeld = false; }
+
+  audio.setListener(local.x, local.y + local.eyeHeight, local.z, local.yaw);
+  renderer.render(frame);
+
+  const w = WEAPONS[local.weapon];
+  hudState.alive = local.alive; hudState.weaponKey = w.key; hudState.weaponName = w.name; hudState.magSize = w.magSize;
+  hudState.ammo = ws.ammo[local.weapon]; hudState.reloading = local.reloading; hudState.ads = local.ads;
+  hudState.speed = Math.hypot(local.vx, local.vz); hudState.fps = fpsShown;
+  hudState.roundTimeLeft = Math.max(0, 300 - (now / 1000) % 300);
+  hud.update(hudState);
+  hud.setScoreboard(scoreHeld, scoreHeld ? scoreRows() : null);
+
+  statsT += dt;
+  if (statsT > 0.5) {
+    statsT = 0;
+    const s = renderer.stats();
+    el('stats').textContent = Math.round(fpsShown) + ' fps | ' + s.calls + ' draw calls | ' + Math.round(s.triangles / 100) / 10 + 'k tris | ' + mode;
+  }
+}
+requestAnimationFrame(loop);
+window.__dev = { local, ws, bots, frame, renderer, hud, audio, hudState, settings, setMode: (m) => { if (m !== mode) toggleMode(); }, die, respawn };
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "hopshot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hopshot - an original browser arena FPS prototype (authoritative multiplayer, 20 players per room)",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node tools/physics.test.js",
+    "loadtest": "node tools/loadtest.js"
+  },
+  "dependencies": {
+    "three": "^0.170.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

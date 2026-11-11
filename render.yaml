@@ -1,0 +1,11 @@
+# Render Blueprint: one free web service that serves the page and runs the game server.
+services:
+  - type: web
+    name: hopshot
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
