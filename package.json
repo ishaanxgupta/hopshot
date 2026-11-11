@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server/index.js",
     "test": "node tools/physics.test.js",
-    "loadtest": "node tools/loadtest.js"
+    "loadtest": "node tools/loadtest.js",
+    "build:static": "node tools/build-static.js"
   },
   "dependencies": {
     "three": "^0.170.0",
