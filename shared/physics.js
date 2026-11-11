@@ -21,10 +21,9 @@
 // holding) jump right away to hop out with the momentum. Repeat to build speed up to MOVE.maxSpeed.
 
 import { DT, PLAYER, BTN } from './constants.js';
-import { WEAPONS } from './weapons.js';
 
 export const MOVE = {
-  runSpeed: 7.0,               // m/s, standing ground wish speed (x weapon speedMult / adsSpeedMult)
+  runSpeed: 7.0,               // m/s, standing ground wish speed (x the caller's speedMult argument)
   crouchSpeed: 3.5,            // m/s, crouch-walk wish speed
   groundAccel: 12,             // Quake accel factor (1/s): reaches run speed in ~0.1 s
   groundFriction: 10,          // 1/s, strong ground friction (also bleeds off excess speed fast)
@@ -314,19 +313,20 @@ export function eyeHeight(s) {
 // ---------------------------------------------------------------------------------------------
 // Step
 
-export function stepPlayer(s, cmd, W) {
+/**
+ * speedMult: movement speed multiplier from the caller (gun in hand + attachments + aim; see
+ * weapons.moveSpeedMult). Server and client must pass the same value for the same cmd.
+ * Omitted / invalid -> 1.
+ */
+export function stepPlayer(s, cmd, W, speedMult = 1) {
   const M = MOVE;
   const buttons = cmd.buttons | 0;
   const crouchHeld = (buttons & BTN.CROUCH) !== 0;
   const jumpHeld = (buttons & BTN.JUMP) !== 0;
   let yaw = +cmd.yaw;
   if (!Number.isFinite(yaw)) yaw = 0;
-  let mult = 1;
-  const wpn = WEAPONS[cmd.weapon];
-  if (wpn !== undefined) {
-    mult = wpn.speedMult;
-    if ((buttons & BTN.ADS) !== 0) mult *= wpn.adsSpeedMult;
-  }
+  let mult = +speedMult;
+  if (!(mult > 0 && mult < 4)) mult = 1;   // also catches NaN / undefined
 
   const P = W.P;
   P[0] = s.x; P[1] = s.y; P[2] = s.z;

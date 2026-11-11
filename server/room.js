@@ -15,6 +15,12 @@
 //     after ackSeq. Only very long stalls (> MAX_SPEC ticks) commit the guess.
 //   - No hard drops in normal operation; a large sustained surplus is trimmed (latency cap)
 //     and nobody can speed-hack: at most one cmd per tick on average is ever simulated.
+//
+// Loadouts (protocol v3): each player has a PENDING loadout code (from join / 'loadout'
+// messages, sanitised) and an ACTIVE kit (weapons.getKit) that only changes in respawn(). Every
+// simulated cmd - live, replayed after a stall, or guessed - uses p.kit, and a respawn clears
+// any speculation (specN = 0), so a replay can never mix two lives' loadouts. The client gets
+// the active code in its own 'spawn' event and predicts with exactly the same kit.
 
 import { performance } from 'node:perf_hooks';
 import {
@@ -26,11 +32,13 @@ import {
   createPlayerState, copyState, spawnState, stepPlayer, eyeHeight, hitboxHeight, raycastWorld, raycastPlayer,
 } from '../shared/physics.js';
 import {
-  WEAPONS, createWeaponState, resetWeaponState, stepWeapon, shotSpread, shotDir,
+  createWeaponState, resetWeaponState, stepWeapon, shotDir, getKit, moveSpeedMult, damageAt,
+  DEFAULT_LOADOUT_CODE,
 } from '../shared/weapons.js';
 import {
   PROTOCOL_VERSION, SHOT, SNAP_SELF_BYTES, PLAYER_ENTRY_BYTES, SHOT_ENTRY_BYTES, MAX_SNAP_SHOTS,
   writeSnapshotSelf, writePlayerEntry, writeShotEntry, normalToAxis, createCmd, sanitizeCmd, encodeText,
+  parseLoadoutCode,
 } from '../shared/protocol.js';
 import { Bot } from './bots.js';
 
@@ -101,7 +109,7 @@ export class Room {
     this.shotCount = 0;
     this.selfBlock = new Uint8Array(SNAP_SELF_BYTES);
     this.selfView = new DataView(this.selfBlock.buffer);
-    this.shotScratch = { shooter: 0, weapon: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: 7 };
+    this.shotScratch = { shooter: 0, weapon: 0, gun: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: 7 };
     this.latSort = new Float32Array(LAT_N);
 
     // Fixed-step loop
@@ -193,14 +201,18 @@ export class Room {
     return 0;
   }
 
-  createPlayer(name, ws, bot) {
+  createPlayer(name, ws, bot, loadoutCode) {
     const id = this.allocId();
     if (!id) return null;
+    const lo = parseLoadoutCode(loadoutCode, DEFAULT_LOADOUT_CODE);
+    const kit = getKit(lo);
     const queue = [];
     for (let i = 0; i < QUEUE_CAP; i++) { const c = createCmd(); c.rt = 0; queue.push(c); }
     const p = {
       id, name, bot: !!bot, ws: ws || null, botBrain: null,
-      state: createPlayerState(), wstate: createWeaponState(),
+      state: createPlayerState(), wstate: createWeaponState(kit),
+      // loadout: pending code (applied at the next spawn) and the active kit of this life
+      loadout: lo, kit,
       alive: false, health: 0, respawnAt: 0, lastDamageTick: -1e9, spawnTick: 0,
       kills: 0, deaths: 0, ping: 0,
       // cmd jitter buffer
@@ -218,7 +230,7 @@ export class Room {
       hist: new Float32Array(HIST * 4), histTick: new Int32Array(HIST).fill(-1), histAlive: new Uint8Array(HIST),
       // reused snapshot views
       entry: { id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-        onGround: false, ads: false, reloading: false, weapon: 0, health: 0 },
+        onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0 },
       you: { id, alive: false, health: 0, respawnTicks: 0, state: null, weapon: null,
         inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0 },
       index: 0, removed: false,
@@ -237,15 +249,15 @@ export class Room {
     this.respawn(p);
   }
 
-  /** Add a human. Returns the player, or null if the room is full. */
-  addHuman(ws, name) {
+  /** Add a human (loadoutCode: optional client-supplied code). Returns the player, or null if the room is full. */
+  addHuman(ws, name, loadoutCode) {
     if (!this.hasFreeSlot()) return null;
     // make room by removing a bot first if necessary
     if (this.players.length >= MAX_PLAYERS) {
       const bot = this.players.find((q) => q.bot);
       if (bot) this.removePlayer(bot);
     }
-    const p = this.createPlayer(name, ws, false);
+    const p = this.createPlayer(name, ws, false, loadoutCode);
     if (!p) return null;
     this.addPlayer(p);
     this.updateBots();
@@ -253,7 +265,7 @@ export class Room {
   }
 
   addBot() {
-    const p = this.createPlayer(Bot.pickName(this), null, true);
+    const p = this.createPlayer(Bot.pickName(this), null, true, Bot.pickLoadout());
     if (!p) return null;
     p.botBrain = new Bot(this, p);
     this.addPlayer(p);
@@ -291,14 +303,25 @@ export class Room {
   }
 
   rosterEntry(p) {
-    return { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping };
+    return { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code };
+  }
+
+  /**
+   * Set p's PENDING loadout (client 'loadout' message or a bot re-roll). Sanitised; applied at
+   * p's next spawn, never mid-life. Humans get the sanitised code back. Returns the code.
+   */
+  setLoadout(p, code) {
+    const lo = parseLoadoutCode(code, p.loadout);
+    p.loadout = lo;
+    if (p.ws) this.sendTo(p, encodeText({ t: 'loadout', lo }));
+    return lo;
   }
 
   welcomeFor(p) {
     return encodeText({
       t: 'welcome', v: PROTOCOL_VERSION, id: p.id, room: this.name, tick: this.currentTick(),
       private: !!this.isPrivate, bots: this.botMin,
-      tickRate: TICK_RATE, snapshotEvery: SNAPSHOT_EVERY, map: MAP.name,
+      tickRate: TICK_RATE, snapshotEvery: SNAPSHOT_EVERY, map: MAP.name, lo: p.loadout,
       players: this.players.map((q) => this.rosterEntry(q)),
       round: { phase: this.phase, endsTick: this.endsTick },
     });
@@ -386,8 +409,8 @@ export class Room {
   /** Simulate one real cmd for p. `late` = ticks this cmd is processed behind schedule (replay). */
   runCmd(p, c, late) {
     if (p.alive) {
-      stepPlayer(p.state, c, this.world);
-      if (stepWeapon(p.wstate, c)) this.fire(p, c, c.rt, late);
+      stepPlayer(p.state, c, this.world, moveSpeedMult(p.kit, p.wstate));
+      if (stepWeapon(p.wstate, c, p.kit)) this.fire(p, c, c.rt, late);
       if (p.alive && p.state.y < MAP.killY) this.kill(p, null, 0, false);
     }
     p.ackSeq = c.seq;
@@ -400,7 +423,7 @@ export class Room {
     const g = p.guess, last = p.lastCmd;
     g.seq = last.seq; g.yaw = last.yaw; g.pitch = last.pitch; g.weapon = last.weapon;
     g.buttons = i <= GUESS_MOVE_TICKS ? (last.buttons & MOVE_BUTTONS) : 0;
-    stepPlayer(p.state, g, this.world);
+    stepPlayer(p.state, g, this.world, moveSpeedMult(p.kit, p.wstate));
   }
 
   /** This tick's input for player p (see the header comment). */
@@ -567,10 +590,12 @@ export class Room {
   }
 
   fire(p, cmd, renderTick, late = 0) {
-    const w = WEAPONS[p.wstate.weapon];
+    const slot = p.wstate.weapon;
+    const w = p.kit.slots[slot];
+    const gun = p.kit.guns[slot];
     const st = p.state;
     const ox = st.x, oy = st.y + eyeHeight(st), oz = st.z;
-    const spread = shotSpread(p.wstate.weapon, cmd.buttons);
+    const spread = p.wstate.spread;     // set by stepWeapon for this shot (aim, bloom)
 
     // Rewind other players to the time the shooter was looking at.
     // History exists up to tick-1 for everyone (this tick's moves are not final yet).
@@ -611,7 +636,7 @@ export class Room {
         }
       }
       if (victim) {
-        const dmg = w.damage * (kind === SHOT.HEAD ? w.headMult : 1);
+        const dmg = damageAt(w, best, kind === SHOT.HEAD);
         let j = 0;
         while (j < nd && this.dmgVictim[j] !== victim) j++;
         if (j === nd) { this.dmgVictim[j] = victim; this.dmgAmount[j] = 0; this.dmgHead[j] = 0; nd++; }
@@ -619,7 +644,7 @@ export class Room {
         if (kind === SHOT.HEAD) this.dmgHead[j] = 1;
       }
       if (this.shotCount < MAX_SNAP_SHOTS) {
-        shot.shooter = p.id; shot.weapon = p.wstate.weapon; shot.kind = kind;
+        shot.shooter = p.id; shot.weapon = slot; shot.gun = gun; shot.kind = kind;
         shot.victim = victim ? victim.id : 0;
         shot.x = ox + dx * best; shot.y = oy + dy * best; shot.z = oz + dz * best;
         shot.normal = kind === SHOT.WORLD ? normalToAxis(normal) : 7;
@@ -633,11 +658,11 @@ export class Room {
       const v = this.dmgVictim[j];
       this.dmgVictim[j] = null;
       if (!v.alive) continue;
-      this.damage(v, p, Math.round(this.dmgAmount[j]), this.dmgHead[j] === 1, p.wstate.weapon);
+      this.damage(v, p, Math.round(this.dmgAmount[j]), this.dmgHead[j] === 1, slot, gun);
     }
   }
 
-  damage(victim, attacker, amount, headshot, weapon) {
+  damage(victim, attacker, amount, headshot, weapon, gun = weapon * 2) {
     victim.health -= amount;
     victim.lastDamageTick = this.tick;
     const killed = victim.health <= 0;
@@ -652,10 +677,10 @@ export class Room {
       this.sendTo(attacker, encodeText({ t: 'hit', victim: victim.id, damage: amount, headshot, kill: killed }));
     }
     if (victim.botBrain) victim.botBrain.onDamaged(attacker);
-    if (killed) this.kill(victim, attacker, weapon, headshot);
+    if (killed) this.kill(victim, attacker, weapon, headshot, gun);
   }
 
-  kill(victim, killer, weapon, headshot) {
+  kill(victim, killer, weapon, headshot, gun = (weapon | 0) * 2) {
     victim.alive = false;
     if (victim.specN > 0) {          // guessed ticks are final now; drop their late cmds later
       victim.commitN += victim.specN; victim.commitTick = this.tick; victim.specN = 0;
@@ -666,7 +691,7 @@ export class Room {
     if (killer && killer !== victim && this.phase === 'playing') killer.kills++;
     this.broadcast(encodeText({
       t: 'kill', killer: killer && killer !== victim ? killer.id : 0, victim: victim.id,
-      weapon: weapon | 0, headshot: !!headshot, respawnTicks: msToTicks(RESPAWN_MS),
+      weapon: weapon | 0, gun: gun | 0, headshot: !!headshot, respawnTicks: msToTicks(RESPAWN_MS),
     }), null);
   }
 
@@ -699,14 +724,16 @@ export class Room {
     const sp = this.pickSpawn(p);
     spawnState(p.state, sp.pos[0], sp.pos[1], sp.pos[2]);
     p.specN = 0;
-    resetWeaponState(p.wstate);
+    if (p.botBrain) p.botBrain.beforeSpawn();       // bots may re-roll their pending loadout
+    p.kit = getKit(p.loadout);                      // the pending loadout becomes active (new life)
+    resetWeaponState(p.wstate, p.kit);
     p.alive = true;
     p.health = MAX_HEALTH;
     p.lastDamageTick = -1e9;
     p.spawnTick = this.tick;
     if (p.botBrain) p.botBrain.onSpawn(sp);
     this.broadcast(encodeText({
-      t: 'spawn', id: p.id, x: sp.pos[0], y: sp.pos[1], z: sp.pos[2], yaw: sp.yaw || 0,
+      t: 'spawn', id: p.id, x: sp.pos[0], y: sp.pos[1], z: sp.pos[2], yaw: sp.yaw || 0, lo: p.kit.code,
     }), null);
   }
 
@@ -765,7 +792,7 @@ export class Room {
       e.yaw = p.lastCmd.yaw; e.pitch = p.lastCmd.pitch;
       e.alive = p.alive; e.crouching = !!s.crouching; e.sliding = !!s.sliding; e.onGround = !!s.onGround;
       e.ads = (p.lastCmd.buttons & BTN.ADS) !== 0; e.reloading = p.wstate.reload > 0;
-      e.weapon = p.wstate.weapon; e.health = p.health;
+      e.weapon = p.wstate.weapon; e.gun = p.kit.guns[p.wstate.weapon]; e.health = p.health;
       writePlayerEntry(pv, i * PLAYER_ENTRY_BYTES, e);
     }
     const shotsLen = this.shotCount * SHOT_ENTRY_BYTES;

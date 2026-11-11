@@ -26,10 +26,28 @@
 //     Exposed as net.timeScale.
 //   - net.state.quality = { rttMs, jitterMs, interpDelayMs, timeScale, inputBufferTicks,
 //     corrections10s, starved10s } (same object, refreshed ~1/s) for the HUD net-stats line.
+//
+// Loadouts (protocol v3):
+//   net.setLoadout(loadout)      any form weapons.sanitizeLoadout accepts (object or code). Stored,
+//                                sent now if connected (else with the next join), and carried by
+//                                every (re)join. It is PENDING until your next spawn.
+//   net.state.loadout = { pendingCode, pending, activeCode, active, serverPendingCode }
+//                                pending = what you chose (applies at next spawn); active = the
+//                                loadout of your current life (from your last 'spawn' event);
+//                                serverPendingCode = the server's sanitised copy of pending.
+//   net.kit                      getKit(activeCode): per-slot effective stats for HUD / viewmodel
+//                                (net.kit.slots[slot].magSize, .adsFov, .name, net.kit.guns[slot]).
+//   event 'loadout' (state.loadout) whenever pending / active / serverPending changes.
+//   Prediction and predicted shots use the ACTIVE kit, bit-exact with the server.
+//   Remote players: the interpolated objects carry gun (gun id in hand), lo (that life's
+//   loadout code) and att (attachment mask of the gun in hand); roster entries carry lo.
+//   fx.gun / localView(out).gun = gun id in hand; localView(out).aim = aim progress 0..1.
 
 import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER } from '../shared/constants.js';
 import {
-  WEAPONS, createWeaponState, copyWeaponState, resetWeaponState, stepWeapon, shotSpread, shotDir,
+  createWeaponState, copyWeaponState, resetWeaponState, stepWeapon, shotDir, getKit, moveSpeedMult,
+  sameWeaponState, aimFraction, sanitizeLoadout, encodeLoadout, decodeLoadout, sanitizeLoadoutCode,
+  DEFAULT_LOADOUT_CODE,
 } from '../shared/weapons.js';
 import {
   MOVE, createPlayerState, copyState, spawnState, stepPlayer, eyeHeight, hitboxHeight, raycastWorld,
@@ -37,7 +55,7 @@ import {
 } from '../shared/physics.js';
 import {
   TICK_MS, SHOT, INPUT_REDUNDANCY, createCmd, sanitizeCmd, encodeInput, encodeJoin, encodePing,
-  decodeSnapshot, decodeText, createSnapshot,
+  decodeSnapshot, decodeText, createSnapshot, encodeSetLoadout,
 } from '../shared/protocol.js';
 
 const RING = 256;                          // prediction history (power of two, ~4.3 s)
@@ -76,14 +94,11 @@ function sameState(a, b) {
     a.hopArmed === b.hopArmed && a.jumpedAir === b.jumpedAir && a.slideTicks === b.slideTicks &&
     a.slideCooldown === b.slideCooldown && a.groundTicks === b.groundTicks && a.crouchTicks === b.crouchTicks;
 }
-function sameWeapon(a, b) {
-  return a.weapon === b.weapon && a.cooldown === b.cooldown && a.reload === b.reload &&
-    a.fireHeld === b.fireHeld && a.ammo[0] === b.ammo[0] && a.ammo[1] === b.ammo[1] && a.ammo[2] === b.ammo[2];
-}
+const sameWeapon = sameWeaponState;
 
 function createSample() {
   return { tick: 0, life: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-    onGround: false, ads: false, reloading: false, weapon: 0, health: 0 };
+    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, health: 0 };
 }
 
 function createRemote(id) {
@@ -95,7 +110,7 @@ function createRemote(id) {
     ex: 0, ey: 0, ez: 0, lx: 0, ly: 0, lz: 0, vx: 0, vy: 0, vz: 0, lastRt: 0, lastLife: -1, lastAlive: false, fresh: true,
     wasExtrap: false, wasHold: false,
     out: { id, name: '', x: 0, y: 0, z: 0, yaw: 0, pitch: 0, crouching: false, sliding: false, alive: false,
-      onGround: false, ads: false, reloading: false, weapon: 0, health: 0, life: 0, bot: false },
+      onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, att: 0, health: 0, life: 0, bot: false },
   };
 }
 
@@ -106,6 +121,7 @@ function copySampleTo(o, s) {
   o.x = s.x; o.y = s.y; o.z = s.z; o.yaw = s.yaw; o.pitch = s.pitch; o.alive = s.alive;
   o.crouching = s.crouching; o.sliding = s.sliding; o.onGround = s.onGround; o.ads = s.ads;
   o.reloading = s.reloading; o.weapon = s.weapon; o.health = s.health; o.life = s.life;
+  o.gun = s.gun; o.lo = s.lo; o.att = getKit(s.lo).masks[s.weapon] | 0;
 }
 
 /** Interpolate remote r at fractional tick rt into r.out. */
@@ -177,7 +193,12 @@ export function createNet(opts = {}) {
     id: 0, roomName: '', mapName: '',
     alive: false, health: 0, respawnAtTick: 0,
     lastSnapTick: -1, ackSeq: -1, lastSeq: 0,
-    roster: new Map(),           // id -> { id, name, bot, kills, deaths, ping }
+    roster: new Map(),           // id -> { id, name, bot, kills, deaths, ping, lo }
+    loadout: {                   // see header (Loadouts)
+      pendingCode: DEFAULT_LOADOUT_CODE, pending: decodeLoadout(DEFAULT_LOADOUT_CODE),
+      activeCode: DEFAULT_LOADOUT_CODE, active: decodeLoadout(DEFAULT_LOADOUT_CODE),
+      serverPendingCode: -1,
+    },
     round: { phase: 'playing', endsTick: 0, winner: 0 },
     rtt: NaN, ping: NaN,
     reconnectAttempt: 0, reconnectAt: 0,
@@ -194,6 +215,7 @@ export function createNet(opts = {}) {
     replays: 0, replayedCmds: 0, maxReplay: 0, snaps: 0, maxVisualError: 0,
     cmdsSent: 0, packetsSent: 0, bytesUp: 0, bytesDown: 0, remoteShots: 0, predictedShots: 0,
     connects: 0,
+    corrWeapon: 0,               // corrections where only the weapon state differed (ammo/cooldown/aim/heat)
     // instrumentation (measurement only)
     corrSum: 0, corrBig: 0, corrMax: 0, corrPos: 0,   // corrections: summed size, > 10 cm, max, with position error
     dilationExtra: 0, dilationSkip: 0, remoteBlends: 0,
@@ -201,7 +223,8 @@ export function createNet(opts = {}) {
     ackDelaySum: 0, ackDelayN: 0, ackDelays: new Float32Array(2048),   // input -> ack delay (ms), ring
   };
 
-  // prediction
+  // prediction (kit = the ACTIVE loadout of the current life)
+  let kit = getKit(DEFAULT_LOADOUT_CODE);
   const pred = createPlayerState();
   const predW = createWeaponState();
   const before = createPlayerState();
@@ -253,7 +276,7 @@ export function createNet(opts = {}) {
 
   // per-tick side effects (reused object, valid until the next tick() call)
   const fx = {
-    seq: 0, alive: false, fired: false, weapon: 0, shotCount: 0,
+    seq: 0, alive: false, fired: false, weapon: 0, gun: 0, shotCount: 0,
     shots: Array.from({ length: 8 }, () => ({ from: [0, 0, 0], to: [0, 0, 0], kind: SHOT.MISS, normal: [0, 1, 0], hasNormal: false, victim: 0 })),
     jumped: false, landed: false, landSpeed: 0, slideStart: false, slideBoost: false, reloadStart: false, switched: false,
     empty: false, groundMove: 0,
@@ -294,7 +317,7 @@ export function createNet(opts = {}) {
       if (ws !== sock) return;
       setStatus('joining');
       lastMsgAt = now();
-      sendText(encodeJoin(st.name, st.room || undefined, st.bots));
+      sendText(encodeJoin(st.name, st.room || undefined, st.bots, st.loadout.pendingCode));
     };
     sock.onmessage = (ev) => {
       if (ws !== sock) return;
@@ -354,6 +377,28 @@ export function createNet(opts = {}) {
     ws.send(str);
   }
 
+  // ------------------------------------------------------------------ loadout
+  /**
+   * Choose the loadout for your NEXT life (any form weapons.sanitizeLoadout accepts). Returns
+   * the sanitised code. Sent now when connected, otherwise with the next join.
+   */
+  function setLoadout(lo) {
+    const code = encodeLoadout(sanitizeLoadout(lo));
+    const L = st.loadout;
+    L.pendingCode = code;
+    L.pending = decodeLoadout(code);
+    if (st.connected && isOpen()) sendText(encodeSetLoadout(code));
+    emit('loadout', L);
+    return code;
+  }
+
+  function setActiveLoadout(code) {
+    const L = st.loadout;
+    L.activeCode = sanitizeLoadoutCode(code);
+    L.active = decodeLoadout(L.activeCode);
+    kit = getKit(L.activeCode);
+  }
+
   function sendPing() {
     if (!isOpen() || !st.connected) return;
     pingCount++;
@@ -392,7 +437,8 @@ export function createNet(opts = {}) {
   }
 
   function rosterEntry(p) {
-    return { id: p.id | 0, name: String(p.name || ''), bot: !!p.bot, kills: p.kills | 0, deaths: p.deaths | 0, ping: p.ping | 0 };
+    return { id: p.id | 0, name: String(p.name || ''), bot: !!p.bot, kills: p.kills | 0, deaths: p.deaths | 0, ping: p.ping | 0,
+      lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE };
   }
 
   function applyRows(rows) {
@@ -414,6 +460,9 @@ export function createNet(opts = {}) {
         st.mapName = String(m.map || '');
         for (const p of m.players || []) st.roster.set(p.id, rosterEntry(p));
         if (m.round) { st.round.phase = m.round.phase; st.round.endsTick = m.round.endsTick; st.round.winner = 0; }
+        // the server's copy of our pending loadout; re-send ours if it changed while joining
+        st.loadout.serverPendingCode = Number.isInteger(m.lo) ? m.lo : -1;
+        if (st.loadout.serverPendingCode !== st.loadout.pendingCode) sendText(encodeSetLoadout(st.loadout.pendingCode));
         // rough clock until the first pong arrives
         const t = now();
         clockTarget = clockOffset = (+m.tick || 0) - t / TICK_MS;
@@ -444,6 +493,11 @@ export function createNet(opts = {}) {
         return;
       }
       case 'pong': onPong(m); return;
+      case 'loadout': {
+        if (Number.isInteger(m.lo)) st.loadout.serverPendingCode = sanitizeLoadoutCode(m.lo);
+        emit('loadout', st.loadout);
+        return;
+      }
       case 'join': {
         if (m.player) st.roster.set(m.player.id, rosterEntry(m.player));
         emit('join', m);
@@ -464,14 +518,19 @@ export function createNet(opts = {}) {
         return;
       }
       case 'spawn': {
+        const re = st.roster.get(m.id);
+        if (re && Number.isInteger(m.lo)) re.lo = sanitizeLoadoutCode(m.lo);
         if (m.id === st.id) {
+          // a new life: the loadout the server activated for it (our pending one, sanitised)
+          setActiveLoadout(Number.isInteger(m.lo) ? m.lo : st.loadout.pendingCode);
           spawnState(pred, +m.x || 0, +m.y || 0, +m.z || 0);
-          resetWeaponState(predW);
+          resetWeaponState(predW, kit);
           for (const e of ring) e.valid = false;
           st.alive = true;
           st.health = 100;
           teleportPending = true;
           snapView();
+          emit('loadout', st.loadout);
         } else {
           const r = remotes.get(m.id);
           if (r) r.pendingTeleport = true;
@@ -670,8 +729,10 @@ export function createNet(opts = {}) {
         stats.lastError = d;
         stats.sumError += d;
         if (d > stats.maxError) stats.maxError = d;
-        if (sameState(e.state, server) && sameWeapon(e.ws, serverW)) return;  // prediction was exact
+        const posSame = sameState(e.state, server);
+        if (posSame && sameWeapon(e.ws, serverW)) return;  // prediction was exact
         stats.corrections++;
+        if (posSame) stats.corrWeapon++;
         stats.corrSum += d; if (d > 0.1) stats.corrBig++; if (d > stats.corrMax) stats.corrMax = d;
         if (d > 0) stats.corrPos++;
         qCorr[qSec]++;
@@ -684,8 +745,8 @@ export function createNet(opts = {}) {
       for (let seq = ack + 1; seq <= last; seq++) {
         const r = ring[seq & RING_MASK];
         if (r.seq !== seq) break;
-        stepPlayer(pred, r.cmd, world);
-        stepWeapon(predW, r.cmd);
+        stepPlayer(pred, r.cmd, world, moveSpeedMult(kit, predW));
+        stepWeapon(predW, r.cmd, kit);
         copyState(r.state, pred); copyWeaponState(r.ws, predW); r.valid = true;
         n++;
       }
@@ -734,7 +795,9 @@ export function createNet(opts = {}) {
     s.tick = tick; s.life = r.life;
     s.x = p.x; s.y = p.y; s.z = p.z; s.yaw = p.yaw; s.pitch = p.pitch; s.alive = p.alive;
     s.crouching = p.crouching; s.sliding = p.sliding; s.onGround = p.onGround; s.ads = p.ads;
-    s.reloading = p.reloading; s.weapon = p.weapon; s.health = p.health;
+    s.reloading = p.reloading; s.weapon = p.weapon; s.gun = p.gun; s.health = p.health;
+    const re = st.roster.get(p.id);
+    s.lo = re ? re.lo : DEFAULT_LOADOUT_CODE;
   }
 
   function removeRemote(id) {
@@ -888,8 +951,8 @@ export function createNet(opts = {}) {
     if (st.alive) {
       copyState(before, pred);
       copyWeaponState(beforeW, predW);
-      stepPlayer(pred, c, world);
-      const fired = stepWeapon(predW, c);
+      stepPlayer(pred, c, world, moveSpeedMult(kit, predW));
+      const fired = stepWeapon(predW, c, kit);
       copyState(e.state, pred); copyWeaponState(e.ws, predW); e.valid = true;
       collectFx(c, fired);
     } else {
@@ -918,11 +981,11 @@ export function createNet(opts = {}) {
 
     // predicted shot: same origin / directions / world ray as the server
     const w = predW.weapon;
-    const def = WEAPONS[w];
-    fx.fired = true; fx.weapon = w;
+    const def = kit.slots[w];
+    fx.fired = true; fx.weapon = w; fx.gun = kit.guns[w];
     stats.predictedShots++;
     const ox = a.x, oy = a.y + eyeHeight(a), oz = a.z;
-    const spread = shotSpread(w, c.buttons);
+    const spread = predW.spread;   // this shot's cone (aim + bloom), set by stepWeapon
     const n = Math.min(def.pellets, fx.shots.length);
     for (let k = 0; k < n; k++) {
       shotDir(dir, c.yaw, c.pitch, spread, c.seq, k);
@@ -970,18 +1033,22 @@ export function createNet(opts = {}) {
     out.vx = pred.vx; out.vy = pred.vy; out.vz = pred.vz;
     out.onGround = pred.onGround; out.crouching = pred.crouching; out.sliding = pred.sliding;
     out.weapon = predW.weapon;
+    out.gun = kit.guns[predW.weapon];
+    out.aim = aimFraction(kit, predW);
     out.reloading = predW.reload > 0;
     return out;
   }
 
   const api = {
-    on, off, connect, close, retryNow,
+    on, off, connect, close, retryNow, setLoadout,
     tick, sampleRemotes, remoteEye, decayError, localView,
     serverTick, renderTick,
     get state() { return st; },
     get stats() { return stats; },
     get pred() { return pred; },
     get predWeapon() { return predW; },
+    get kit() { return kit; },
+    get loadout() { return st.loadout; },
     get serverState() { return server; },
     get timeScale() { return st.timeScale; },
     get interpDelayMs() { return delayTicks * TICK_MS; },

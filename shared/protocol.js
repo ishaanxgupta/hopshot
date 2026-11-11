@@ -49,22 +49,24 @@
 //                        the server never processes more than one cmd per tick on average.
 //   u8   starved         (v2) wrapping counter of server ticks that had no cmd of yours
 //   STATE_BYTES          your full physics state (physics.writeState). This is ALWAYS the
-//                        state right after cmd ackSeq (never includes guessed ticks).          your full physics state (physics.writeState)
-//   WSTATE_BYTES         your full weapon state (weapons.writeWeaponState)
+//                        state right after cmd ackSeq (never includes guessed ticks).
+//   WSTATE_BYTES         your full weapon state (weapons.writeWeaponState; v3: 10 bytes with
+//                        u16 reload, aim and heat)
 //   u8   playerCount     OTHER players (you are not in this list), then playerCount x 13 bytes:
 //     u8  id
 //     i16 x, i16 y, i16 z    feet position * POS_SCALE (1/128 m)
 //     u16 yaw                (yaw mod 2pi) * 65536 / 2pi
 //     i16 pitch              pitch * 32767 / (pi/2)
 //     u8  flags              bit0 alive, bit1 crouching, bit2 sliding, bit3 onGround,
-//                            bit4 ads, bit5 reloading, bits6-7 weapon id
-//     u8  health
+//                            bit4 ads, bit5 reloading, bits6-7 weapon SLOT (0..2)
+//     u8  health | gunB << 7  (v3) bits0-6 health 0..100, bit7 = the slot holds gun B, so
+//                            gun id = slot * 2 + bit7 (weapons.GUNS)
 //   u8   shotCount       tracers fired since the previous snapshot (ALL shooters, including you),
 //                        then shotCount x 9 bytes - one entry per pellet:
 //     u8  shooter id
 //     u8  flags              bits0-1 kind (SHOT.MISS / WORLD / BODY / HEAD),
 //                            bits2-4 impact normal axis (0 +x,1 -x,2 +y,3 -y,4 +z,5 -z,7 none),
-//                            bits5-6 weapon id
+//                            bits5-6 weapon SLOT, bit7 (v3) gun B -> gun id = slot * 2 + bit7
 //     u8  victim id (0 = none)
 //     i16 x, i16 y, i16 z    impact / end point * POS_SCALE
 //   The tracer starts at the shooter's (interpolated) eye; for your own shots draw your
@@ -72,20 +74,33 @@
 //
 // ---------------------------------------------------------------- text frames (JSON)
 // Every text frame is one JSON object with a string field `t`. Max 2048 bytes client->server.
+// LOADOUTS (v3): a loadout travels as its integer code `lo` (weapons.encodeLoadout: one byte
+//   per slot, variant | attachmentMask << 1). The server sanitises every code it receives.
+//   A player's loadout is chosen on join and may be changed at any time; a change is PENDING
+//   and becomes ACTIVE at that player's next spawn (never mid-life). Everyone learns a player's
+//   active loadout from the roster entry (`lo`) and from every 'spawn' event (`lo`); the gun in
+//   hand is also in every snapshot entry (slot + gun B bit), so models/sounds never lag.
+//
 // client -> server:
-//   { t:'join', v:PROTOCOL_VERSION, name:'Bob', room?:'abc' }    first message after connect
+//   { t:'join', v:PROTOCOL_VERSION, name:'Bob', room?:'abc', bots?:n, lo?:<loadout code> }
+//                                                                 first message after connect
+//   { t:'loadout', lo:<loadout code> }    (v3) set the pending loadout (applies at next spawn)
 //   { t:'ping', c:<client ms>, rtt?:<last measured rtt ms> }      ~ every 1 s
 // server -> client:
-//   { t:'welcome', v, id, room, tick, tickRate, snapshotEvery, map,
-//     players:[{ id, name, bot, kills, deaths, ping }], round:{ phase, endsTick } }
+//   { t:'welcome', v, id, room, tick, tickRate, snapshotEvery, map, lo /* your pending code */,
+//     players:[{ id, name, bot, kills, deaths, ping, lo }], round:{ phase, endsTick } }
 //   { t:'pong', c, tick }                 c echoed; tick = server tick (fractional) when sent
-//   { t:'join', player:{ id, name, bot, kills, deaths, ping } }
+//   { t:'join', player:{ id, name, bot, kills, deaths, ping, lo } }
 //   { t:'leave', id }
-//   { t:'kill', killer /* id or 0 for world/suicide */, victim, weapon, headshot,
-//     respawnTicks }
+//   { t:'loadout', lo }                   (v3) reply to a client 'loadout': the sanitised code now
+//                                         pending for you (it becomes active at your next spawn)
+//   { t:'kill', killer /* id or 0 for world/suicide */, victim, weapon /* slot */,
+//     gun /* gun id, v3 */, headshot, respawnTicks }
 //   { t:'hit', victim, damage, headshot, kill }               only to the shooter
 //   { t:'damage', attacker, from:[x,y,z], damage, health }    only to the victim
-//   { t:'spawn', id, x, y, z, yaw }                           broadcast on (re)spawn
+//   { t:'spawn', id, x, y, z, yaw, lo }   broadcast on (re)spawn; lo = (v3) the loadout code that
+//                                         is ACTIVE for this life (for the local player: predict
+//                                         with getKit(lo) from now on)
 //   { t:'round', phase:'playing'|'intermission', endsTick,
 //     winner? /* id */, rows? }                               rows = scoreboard (as 'scores')
 //   { t:'scores', rows:[{ id, kills, deaths, ping }] }       ~ every 1 s
@@ -116,13 +131,17 @@
 //     the exact same float32 rounding and clamping the server applies after decoding, so the
 //     predicted stepPlayer/stepWeapon results match the server bit-for-bit.
 //   - Keep yaw within [-pi, pi] on the client (wrap it in input handling).
+//   - Per cmd: mult = moveSpeedMult(kit, ws); stepPlayer(state, cmd, world, mult);
+//     stepWeapon(ws, cmd, kit) - with kit = getKit(the lo of your latest own 'spawn').
 // ============================================================================================
 
 import { BTN_MASK, PITCH_LIMIT, MAX_DILATION_PERMILLE } from './constants.js';
-import { WEAPONS, WSTATE_BYTES, writeWeaponState, readWeaponState, createWeaponState } from './weapons.js';
+import {
+  SLOT_COUNT, WSTATE_BYTES, writeWeaponState, readWeaponState, createWeaponState, sanitizeLoadoutCode,
+} from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
-export const PROTOCOL_VERSION = 2;   // v2: snapshot header carries input-buffer feedback + dilation
+export const PROTOCOL_VERSION = 3;   // v2: input-buffer feedback + dilation; v3: guns + loadouts
 export const MSG = { INPUT: 1, SNAPSHOT: 2 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
@@ -212,7 +231,7 @@ export function sanitizeCmd(cmd) {
   cmd.pitch = pitch;
   cmd.buttons = (cmd.buttons | 0) & BTN_MASK;
   const w = cmd.weapon | 0;
-  cmd.weapon = w >= 0 && w < WEAPONS.length ? w : 0;
+  cmd.weapon = w >= 0 && w < SLOT_COUNT ? w : 0;
   cmd.seq = cmd.seq >>> 0;
   return cmd;
 }
@@ -322,7 +341,8 @@ export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
 
 /**
  * Write one compact player entry. p = { id, x, y, z, yaw, pitch, alive, crouching, sliding,
- * onGround, ads, reloading, weapon, health }. Returns offset + PLAYER_ENTRY_BYTES.
+ * onGround, ads, reloading, weapon (slot), gun (gun id; only bit0 = gun B is sent), health }.
+ * Returns offset + PLAYER_ENTRY_BYTES.
  */
 export function writePlayerEntry(view, o, p) {
   view.setUint8(o, p.id & 0xff);
@@ -334,18 +354,19 @@ export function writePlayerEntry(view, o, p) {
   view.setUint8(o + 11,
     (p.alive ? 1 : 0) | (p.crouching ? 2 : 0) | (p.sliding ? 4 : 0) | (p.onGround ? 8 : 0) |
     (p.ads ? 16 : 0) | (p.reloading ? 32 : 0) | ((p.weapon & 3) << 6));
-  view.setUint8(o + 12, clampU8(Math.round(p.health)));
+  const hp = clampU8(Math.round(p.health));
+  view.setUint8(o + 12, (hp > 127 ? 127 : hp) | ((p.gun & 1) << 7));
   return o + PLAYER_ENTRY_BYTES;
 }
 
 /**
- * Write one tracer entry. s = { shooter, weapon, kind (SHOT.*), victim (0 = none),
+ * Write one tracer entry. s = { shooter, weapon (slot), gun (gun id), kind (SHOT.*), victim (0 = none),
  * x, y, z (end point), normal: [nx,ny,nz] | null | axis index (number) }.
  */
 export function writeShotEntry(view, o, s) {
   const axis = typeof s.normal === 'number' ? (s.normal & 7) : normalToAxis(s.normal);
   view.setUint8(o, s.shooter & 0xff);
-  view.setUint8(o + 1, (s.kind & 3) | (axis << 2) | ((s.weapon & 3) << 5));
+  view.setUint8(o + 1, (s.kind & 3) | (axis << 2) | ((s.weapon & 3) << 5) | ((s.gun & 1) << 7));
   view.setUint8(o + 2, s.victim & 0xff);
   view.setInt16(o + 3, q16(s.x), true);
   view.setInt16(o + 5, q16(s.y), true);
@@ -377,18 +398,19 @@ export function encodeSnapshot(snap) {
 
 function createRemotePlayer() {
   return { id: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-    onGround: false, ads: false, reloading: false, weapon: 0, health: 0 };
+    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0 };
 }
 function createShot() {
-  return { shooter: 0, weapon: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: null };
+  return { shooter: 0, weapon: 0, gun: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: null };
 }
 
 /**
  * Reusable output object for decodeSnapshot:
  * { tick, ackSeq /* -1 = none *\/, you:{ id, alive, health, respawnTicks, inputBuffer, inputTarget,
  *   timeScale /* permille *\/, starved, state, weapon },
- *   players:[{ id,x,y,z,yaw,pitch,alive,crouching,sliding,onGround,ads,reloading,weapon,health }],
- *   shots:[{ shooter, weapon, kind, victim, x,y,z, normal:[x,y,z]|null }] }
+ *   players:[{ id,x,y,z,yaw,pitch,alive,crouching,sliding,onGround,ads,reloading,weapon,gun,health }],
+ *   shots:[{ shooter, weapon, gun, kind, victim, x,y,z, normal:[x,y,z]|null }] }
+ * weapon = slot (0..2), gun = gun id (slot * 2 + variant, see weapons.GUNS).
  * The arrays/objects are reused by the next decode into the same `out` - copy what you keep
  * (e.g. into your interpolation buffer) or use a ring of several snapshot objects.
  */
@@ -442,7 +464,10 @@ export function decodeSnapshot(data, out = createSnapshot()) {
       p.alive = (f & 1) !== 0; p.crouching = (f & 2) !== 0; p.sliding = (f & 4) !== 0;
       p.onGround = (f & 8) !== 0; p.ads = (f & 16) !== 0; p.reloading = (f & 32) !== 0;
       p.weapon = (f >> 6) & 3;
-      p.health = v.getUint8(o + 12);
+      if (p.weapon >= SLOT_COUNT) p.weapon = 0;
+      const hb = v.getUint8(o + 12);
+      p.health = hb & 0x7f;
+      p.gun = p.weapon * 2 + (hb >> 7);
       out.players.push(p);
       o += PLAYER_ENTRY_BYTES;
     }
@@ -458,6 +483,8 @@ export function decodeSnapshot(data, out = createSnapshot()) {
       s.kind = f & 3;
       s.normal = AXIS_NORMALS[(f >> 2) & 7];
       s.weapon = (f >> 5) & 3;
+      if (s.weapon >= SLOT_COUNT) s.weapon = 0;
+      s.gun = s.weapon * 2 + (f >> 7);
       s.victim = v.getUint8(o + 2);
       s.x = v.getInt16(o + 3, true) / POS_SCALE;
       s.y = v.getInt16(o + 5, true) / POS_SCALE;
@@ -495,13 +522,26 @@ export function decodeText(data, maxBytes = MAX_TEXT_BYTES) {
 }
 
 // Typed constructors for client -> server text messages.
-export function encodeJoin(name, room, bots) {
+export function encodeJoin(name, room, bots, loadoutCode) {
   const m = { t: 'join', v: PROTOCOL_VERSION, name: String(name ?? '') };
   if (room) m.room = String(room);
   // Optional: minimum participants to keep by adding bots (0 = no bots). Only honoured when
   // this join creates a private room; later joiners cannot change it.
   if (Number.isFinite(bots)) m.bots = bots | 0;
+  // Optional (v3): loadout code (weapons.encodeLoadout) for the first life.
+  if (Number.isInteger(loadoutCode)) m.lo = sanitizeLoadoutCode(loadoutCode);
   return JSON.stringify(m);
+}
+/** (v3) Set the pending loadout; it becomes active at the next spawn. */
+export function encodeSetLoadout(loadoutCode) {
+  return JSON.stringify({ t: 'loadout', lo: sanitizeLoadoutCode(loadoutCode | 0) });
+}
+/**
+ * Server-side: a client-supplied loadout code -> canonical code, or `fallback` when it is
+ * missing / not an integer in range (never throws).
+ */
+export function parseLoadoutCode(v, fallback) {
+  return Number.isInteger(v) && v >= 0 && v <= 0xffffff ? sanitizeLoadoutCode(v) : fallback;
 }
 export function encodePing(clientMs, rtt) {
   const m = { t: 'ping', c: clientMs };

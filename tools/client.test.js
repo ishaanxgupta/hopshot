@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { MAP } from '../shared/map.js';
 import { createWorld } from '../shared/physics.js';
-import { WEAPONS } from '../shared/weapons.js';
+import { encodeLoadout, getKit } from '../shared/weapons.js';
 import { TICK_MS } from '../shared/protocol.js';
 import { createNet } from '../client/net.js';
 import { createAutopilot } from '../client/input.js';
@@ -160,11 +160,29 @@ function laggySocket(profile, seed) {
 const VERBOSE = args.includes('--verbose');
 const JERK = 0.08;   // m: horizontal per-tick step changing by more than this (4.8 m/s in one tick) = visible stutter
 
+// Per-client loadouts: different guns in every slot, attachments that change move speed
+// (stock / long barrel / optic while aiming), mag size (ext mag / quick hands) and fire rate
+// (heavy rounds). LOADOUTS_B is switched to mid-run (applies at each client's next spawn).
+const LOADOUTS_A = [
+  { slots: [{ gun: 'vireo', att: ['stock', 'quick', 'extmag'] }, { gun: 'kestrel', att: ['stock', 'quick'] }, { gun: 'squall', att: ['extmag', 'stock'] }] },
+  { slots: [{ gun: 'maul', att: ['optic', 'heavy', 'barrel'] }, { gun: 'halberd', att: ['optic', 'extmag'] }, { gun: 'breaker', att: ['barrel', 'heavy'] }] },
+  { slots: [{ gun: 'maul', att: ['extmag', 'quick'] }, { gun: 'kestrel', att: ['optic', 'heavy', 'barrel'] }, { gun: 'squall', att: ['heavy', 'barrel', 'optic'] }] },
+].map(encodeLoadout);
+const LOADOUTS_B = [
+  { slots: [{ gun: 'maul', att: ['heavy', 'barrel'] }, { gun: 'halberd', att: ['stock', 'quick'] }, { gun: 'breaker', att: ['optic', 'stock'] }] },
+  { slots: [{ gun: 'vireo', att: ['optic', 'barrel', 'extmag'] }, { gun: 'kestrel', att: [] }, { gun: 'squall', att: [] }] },
+  { slots: [{ gun: 'vireo', att: ['heavy', 'quick', 'stock'] }, { gun: 'halberd', att: ['heavy', 'barrel', 'optic'] }, { gun: 'breaker', att: ['extmag', 'quick'] }] },
+].map(encodeLoadout);
+
 class Client {
   constructor(i, room, socketFactory) {
     this.i = i;
     this.room = room;
     this.net = createNet({ world, url: `ws://localhost:${PORT}/ws`, createSocket: socketFactory });
+    this.net.setLoadout(LOADOUTS_A[i % 3]);
+    // loadout timing: the active loadout may only change on our own spawn
+    this.lo = { changedAt: -1, wanted: -1, activeAtChange: -1, midLife: 0, appliedSpawns: 0, wrongSpawns: 0, spawnMagsOk: 0, spawnMagsBad: 0,
+      lastActive: -1, remoteGunOk: 0, remoteGunBad: 0 };
     this.ap = createAutopilot({ seed: 777 + i * 31 });
     this.players = [];
     this.c = {
@@ -185,7 +203,14 @@ class Client {
     n.on('damage', () => { c.damage++; });
     n.on('spawn', (m) => {
       if (this.dead.delete(m.id)) c.respawns++;
-      if (m.id === n.state.id) { c.spawnsMine++; this.ap.setYaw(m.yaw || 0); this.local.last = null; } else c.spawnsOther++;
+      if (m.id === n.state.id) {
+        c.spawnsMine++; this.ap.setYaw(m.yaw || 0); this.local.last = null;
+        const L = n.state.loadout, kit = n.kit;
+        if (this.lo.wanted >= 0) { if (L.activeCode === this.lo.wanted) this.lo.appliedSpawns++; else this.lo.wrongSpawns++; }
+        const w = n.predWeapon;
+        if ([0, 1, 2].every((s) => w.ammo[s] === kit.slots[s].magSize) && kit.code === L.activeCode) this.lo.spawnMagsOk++; else this.lo.spawnMagsBad++;
+        this.lo.lastActive = L.activeCode;
+      } else c.spawnsOther++;
     });
     n.on('shots', (shots) => { c.remoteShotEvents += shots.filter((s) => s.shooter !== n.state.id).length; });
     n.on('close', (e) => { c.closes.push(e); });
@@ -198,6 +223,14 @@ class Client {
     assert.ok(this.net.state.connected, `client ${this.i} failed to connect`);
   }
 
+  /** Switch to another loadout mid-life: it must stay pending until our next spawn. */
+  changeLoadout(code) {
+    this.lo.changedAt = this.c.ticks;
+    this.lo.activeAtChange = this.net.state.loadout.activeCode;
+    this.lo.wanted = this.net.setLoadout(code);
+    this.lo.lastActive = this.lo.activeAtChange;
+  }
+
   /** One 60 Hz tick: interpolate remotes, autopilot -> cmd, predict + send, check continuity. */
   tick() {
     const n = this.net;
@@ -205,10 +238,16 @@ class Client {
     const rt = n.renderTick();
     n.sampleRemotes(rt, this.players);
     this.checkRemotes();
+    // active loadout only ever changes inside our own 'spawn' handler (checked there)
+    if (this.lo.lastActive >= 0 && n.state.loadout.activeCode !== this.lo.lastActive) this.lo.midLife++;
+    for (const r of this.players) {
+      if (!r.alive) continue;
+      if (r.gun === getKit(r.lo).guns[r.weapon]) this.lo.remoteGunOk++; else this.lo.remoteGunBad++;
+    }
     const p = n.pred, w = n.predWeapon;
     const o = this.ap.update({
       world, self: p, alive: n.state.alive, remotes: this.players,
-      weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: WEAPONS[w.weapon].magSize,
+      weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: n.kit.slots[w.weapon].magSize,
     });
     const fx = n.tick(o, rt);
     n.decayError(TICK_MS / 1000);
@@ -372,7 +411,7 @@ function table(rows) {
   }
 }
 
-async function phase(label, secs, room, makeSocket) {
+async function phase(label, secs, room, makeSocket, midHook) {
   const clients = [0, 1, 2].map((i) => new Client(i, room, makeSocket ? makeSocket(i) : undefined));
   for (const c of clients) await c.connect();
   // let clock sync / buffers settle, then measure from a clean slate
@@ -384,7 +423,7 @@ async function phase(label, secs, room, makeSocket) {
     if (r) console.log('  trace', JSON.stringify(r.net.map(({ id, target, depth, dilation, starved, replays, dropCommit, dropTrim, dropped }) => ({ id, target, depth, dilation, starved, replays, dropCommit, dropTrim, dropped }))),
       clients.map((c) => JSON.stringify(c.net.state.quality)).join(' '));
   }, 2000) : null;
-  await run(clients, secs);
+  if (midHook) { await run(clients, secs * 0.3); midHook(clients); await run(clients, secs * 0.7); } else await run(clients, secs);
   if (trace) clearInterval(trace);
   const st = await status();
   const r = st.rooms.find((x) => x.name === room);
@@ -420,7 +459,8 @@ async function main() {
   const wanted = String(args.includes('--profiles') ? args[args.indexOf('--profiles') + 1] : 'p80,p180,p250').split(',').filter(Boolean);
 
   // ---------------- clean run
-  const cleanRun = await phase(`clean local run (${CLEAN_S}s, 3 clients + bots, room ${ROOM})`, CLEAN_S, ROOM, null);
+  const cleanRun = await phase(`clean local run (${CLEAN_S}s, 3 clients + bots, room ${ROOM})`, CLEAN_S, ROOM, null,
+    (cl) => cl.forEach((c, i) => c.changeLoadout(LOADOUTS_B[i % 3])));
   const clean = cleanRun.clients;
   rows.clean = feel(clean, CLEAN_S, cleanRun.serverNet);
   console.log('\nassertions (clean):');
@@ -441,6 +481,18 @@ async function main() {
   check(sumErr / Math.max(1, compared) < 0.01, 'average prediction error after reconciliation < 1 cm');
   const posCorr = clean.reduce((a, c) => a + (c.net.stats.corrPos ?? c.net.stats.corrections), 0);
   check(posCorr === 0, `clean link: prediction bit-exact, 0 corrections from position error (${posCorr})`);
+  const wCorr = clean.reduce((a, c) => a + c.net.stats.corrWeapon, 0);
+  check(wCorr === 0 && corr === 0, `clean link: weapon state (ammo / cooldown / reload / aim / heat) predicted exactly with per-client loadouts (${wCorr} weapon-only corrections, ${corr} total)`);
+  check(clean.every((c, i) => c.lo.spawnMagsBad === 0 && c.lo.spawnMagsOk > 0), 'every own spawn activated the server\'s loadout code and filled the kit\'s magazine sizes');
+  check(clean.every((c) => c.lo.midLife === 0), 'the active loadout never changed mid-life (only in the spawn event)');
+  check(clean.every((c) => c.lo.wrongSpawns === 0), 'every spawn after the mid-run change activated the new loadout');
+  const applied = clean.filter((c) => c.lo.appliedSpawns > 0).length;
+  check(applied >= 2, `the mid-run loadout change applied at the next spawn (${applied}/3 clients respawned with it)`);
+  check(clean.every((c) => c.net.state.loadout.serverPendingCode === c.lo.wanted), 'server acknowledged each client\'s pending loadout (sanitised code echoed)');
+  const rg = clean.reduce((a, c) => [a[0] + c.lo.remoteGunOk, a[1] + c.lo.remoteGunBad], [0, 0]);
+  check(rg[0] > 1000 && rg[1] / Math.max(1, rg[0]) < 0.02, `remote players' gun in hand matches their roster loadout (${rg[0]} ok, ${rg[1]} mismatched samples)`);
+  const remoteGuns = new Set(clean.flatMap((c) => c.net.remotes.map((r) => r.out.gun)));
+  check(remoteGuns.size >= 2, `remote players are seen with different guns (${[...remoteGuns].join(',')})`);
   const QK = ['rttMs', 'jitterMs', 'interpDelayMs', 'timeScale', 'inputBufferTicks', 'corrections10s', 'starved10s'];
   check(clean.every((c) => c.net.state.quality && QK.every((k) => Number.isFinite(c.net.state.quality[k]))),
     'net.state.quality exposes rttMs, jitterMs, interpDelayMs, timeScale, inputBufferTicks, corrections10s, starved10s');

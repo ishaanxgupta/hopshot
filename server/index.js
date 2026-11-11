@@ -228,7 +228,7 @@ function handleText(conn, msg) {
         ws.close(1008, 'room full');
         return;
       }
-      const p = room.addHuman(ws, name);
+      const p = room.addHuman(ws, name, msg.lo);
       if (!p) {
         ws.send(encodeText({ t: 'error', code: 'room_full', message: 'room is full' }));
         ws.close(1008, 'room full');
@@ -237,6 +237,12 @@ function handleText(conn, msg) {
       conn.room = room;
       conn.player = p;
       log(`join ${name}#${p.id} room ${room.name} (${room.humans} humans, ${room.botCount} bots)`);
+      return;
+    }
+    case 'loadout': {
+      // pending loadout (weapons.encodeLoadout code); applied at the player's next spawn
+      if (!conn.player || conn.player.removed || !Number.isInteger(msg.lo)) { conn.bad++; return; }
+      conn.room.setLoadout(conn.player, msg.lo);
       return;
     }
     case 'ping': {

@@ -111,7 +111,8 @@ test('determinism: two runs of the same cmds are bit-identical (current map)', (
     const w2 = createWorld(MAP); // separate world instance: scratch state must not matter
     for (let i = 0; i < 3000; i++) {
       randomInput(ra, ca, ia); randomInput(rb, cb, ib);
-      stepPlayer(a, ca, world); stepPlayer(b, cb, w2);
+      const ma = 0.8 + 0.1 * ca.weapon + ((ca.buttons & BTN.ADS) ? -0.3 : 0), mb = 0.8 + 0.1 * cb.weapon + ((cb.buttons & BTN.ADS) ? -0.3 : 0);
+      stepPlayer(a, ca, world, ma); stepPlayer(b, cb, w2, mb);
       const k = sameState(a, b);
       assert(k === null, `diverged at tick ${i} on field ${k}`);
     }
@@ -363,9 +364,21 @@ test('ground: snappy accel/stop, plain running never exceeds run speed', () => {
   const k = spawned(OPEN, 0, 0, 0);
   run(k, OPEN, cmd(BTN.CROUCH | BTN.FORWARD | BTN.LEFT), 120);
   assert(Math.abs(hs(k) - MOVE.crouchSpeed) < 1e-4 && !k.sliding, `crouch walk ${hs(k)}`);
+  // the speed multiplier comes from the caller (weapons.moveSpeedMult); cmd.weapon is ignored
   const a = spawned(OPEN, 0, 0, 0);
-  run(a, OPEN, cmd(BTN.FORWARD | BTN.ADS, 0, 1), 120);
-  assert(Math.abs(hs(a) - MOVE.runSpeed * 0.95 * 0.5) < 1e-4, `scout ADS speed ${hs(a)}`);
+  for (let i = 0; i < 120; i++) stepPlayer(a, cmd(BTN.FORWARD | BTN.ADS, 0, 1), OPEN, 0.95 * 0.5);
+  assert(Math.abs(hs(a) - MOVE.runSpeed * 0.95 * 0.5) < 1e-4, `aimed sniper speed ${hs(a)}`);
+  const b = spawned(OPEN, 0, 0, 0);
+  run(b, OPEN, cmd(BTN.FORWARD | BTN.ADS, 0, 1), 120);
+  assert(Math.abs(hs(b) - MOVE.runSpeed) < 1e-4, `default multiplier must be 1 (${hs(b)})`);
+  for (const bad of [NaN, -1, 0, Infinity, 'x']) {
+    const c = spawned(OPEN, 0, 0, 0);
+    for (let i = 0; i < 60; i++) stepPlayer(c, cmd(BTN.FORWARD), OPEN, bad);
+    assert(Math.abs(hs(c) - MOVE.runSpeed) < 1e-4, `invalid multiplier ${bad} must act as 1 (${hs(c)})`);
+  }
+  const f = spawned(OPEN, 0, 0, 0);
+  for (let i = 0; i < 120; i++) stepPlayer(f, cmd(BTN.FORWARD), OPEN, 1.1);
+  assert(Math.abs(hs(f) - MOVE.runSpeed * 1.1) < 1e-4, `fast multiplier ${hs(f)}`);
   note(`90% run speed in ${t90} ticks, full stop in ${tStop} ticks`);
 });
 

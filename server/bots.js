@@ -4,7 +4,7 @@
 
 import { BTN } from '../shared/constants.js';
 import { MAP } from '../shared/map.js';
-import { WEAPONS } from '../shared/weapons.js';
+import { encodeLoadout, displayStats } from '../shared/weapons.js';
 import { eyeHeight, hitboxHeight, raycastWorld } from '../shared/physics.js';
 import { createCmd } from '../shared/protocol.js';
 
@@ -26,8 +26,33 @@ function approach(cur, target, maxStep) {
   return wrapAngle(cur + (d > maxStep ? maxStep : d < -maxStep ? -maxStep : d));
 }
 const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+// Sensible per-slot builds bots choose from (gun key + attachment keys). Every gun appears,
+// with builds that suit how bots fight (rifles at range, shotguns close, snipers aimed).
+const BOT_BUILDS = [
+  [ // assault
+    { gun: 'maul', att: [] }, { gun: 'maul', att: ['optic', 'barrel'] }, { gun: 'maul', att: ['extmag', 'heavy'] },
+    { gun: 'maul', att: ['stock', 'quick', 'barrel'] },
+    { gun: 'vireo', att: [] }, { gun: 'vireo', att: ['stock', 'quick'] }, { gun: 'vireo', att: ['optic', 'barrel', 'extmag'] },
+    { gun: 'vireo', att: ['heavy', 'barrel'] },
+  ],
+  [ // sniper
+    { gun: 'kestrel', att: [] }, { gun: 'kestrel', att: ['optic'] }, { gun: 'kestrel', att: ['stock', 'quick'] },
+    { gun: 'halberd', att: [] }, { gun: 'halberd', att: ['extmag', 'quick'] }, { gun: 'halberd', att: ['optic', 'barrel'] },
+  ],
+  [ // shotgun
+    { gun: 'breaker', att: [] }, { gun: 'breaker', att: ['barrel', 'heavy'] }, { gun: 'breaker', att: ['stock', 'quick'] },
+    { gun: 'squall', att: [] }, { gun: 'squall', att: ['extmag', 'stock'] }, { gun: 'squall', att: ['barrel', 'heavy'] },
+  ],
+];
 
 export class Bot {
+  /** A random sensible loadout code (one build per slot from BOT_BUILDS). */
+  static pickLoadout() {
+    return encodeLoadout({ slots: BOT_BUILDS.map((list) => { const b = pick(list); return { gun: b.gun, att: b.att }; }) });
+  }
+
   static pickName(room) {
     const used = new Set(room.players.map((p) => p.name));
     const free = NAMES.filter((n) => !used.has(n));
@@ -54,13 +79,18 @@ export class Bot {
     this.firePulse = false;
   }
 
+  /** Called by the room right before a respawn applies the pending loadout. */
+  beforeSpawn() {
+    if (Math.random() < 0.3) this.room.setLoadout(this.p, Bot.pickLoadout());
+  }
+
   onSpawn(sp) {
     this.yaw = sp.yaw || 0;
     this.pitch = 0;
     this.target = null;
     this.stuck = 0;
     const r = Math.random();
-    this.weapon = r < 0.6 ? 0 : r < 0.8 ? 1 : 2;
+    this.weapon = r < 0.55 ? 0 : r < 0.8 ? 1 : 2;
     this.pickWaypoint();
   }
 
@@ -88,10 +118,10 @@ export class Bot {
     const e = rnd(0.05, 0.12) / this.skill;
     this.errYaw = Math.random() < 0.5 ? -e : e;
     this.errPitch = rnd(-0.5, 0.5) * e;
-    if (this.weapon !== 2) {
-      const dx = q.state.x - this.p.state.x, dz = q.state.z - this.p.state.z;
-      if (dx * dx + dz * dz < 64 && Math.random() < 0.3) this.weapon = 2;
-    }
+    const dx = q.state.x - this.p.state.x, dz = q.state.z - this.p.state.z;
+    const d2 = dx * dx + dz * dz;
+    if (this.weapon !== 2 && d2 < 64 && Math.random() < 0.35) this.weapon = 2;          // close: shotgun
+    else if (this.weapon === 2 && d2 > 400 && Math.random() < 0.6) this.weapon = 0;      // far: rifle
   }
 
   canSee(q) {
@@ -159,12 +189,17 @@ export class Bot {
       this.yaw = approach(this.yaw, wantYaw, TURN_COMBAT);
       this.pitch += Math.max(-TURN_COMBAT, Math.min(TURN_COMBAT, wantPitch - this.pitch));
       const aimed = Math.abs(wrapAngle(wantYaw - this.yaw)) < 0.08;
-      const w = WEAPONS[p.wstate.weapon];
-      if (tick >= this.reactAt && aimed && hd < w.range) {
+      const slot = p.wstate.weapon;
+      const w = p.kit.slots[slot];
+      // shotguns only fire inside a useful distance; snipers wait until fully aimed
+      const reach = slot === 2 ? Math.min(w.range, displayStats(w.gun, w.mask).raw.effectiveRange * 2.2) : w.range;
+      const wantAds = slot === 1 || (slot === 0 && hd > 15);
+      if (wantAds) buttons |= BTN.ADS;
+      const ready = slot !== 1 || p.wstate.aim >= w.adsTicks;
+      if (tick >= this.reactAt && aimed && hd < reach && ready) {
         if (w.auto) buttons |= BTN.FIRE;
         else { this.firePulse = !this.firePulse; if (this.firePulse) buttons |= BTN.FIRE; }
       }
-      if (p.wstate.weapon === 1 && hd > 12) buttons |= BTN.ADS;
       if (tick >= this.strafeUntil) { this.strafe = -this.strafe; this.strafeUntil = tick + Math.round(rnd(25, 70)); }
       buttons |= this.strafe > 0 ? BTN.LEFT : BTN.RIGHT;
       if (hd > 18) buttons |= BTN.FORWARD; else if (hd < 6) buttons |= BTN.BACK;
