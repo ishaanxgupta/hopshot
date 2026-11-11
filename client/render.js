@@ -191,9 +191,20 @@ const P_LEGL = 0, P_LEGR = 1, P_TORSO = 2, P_HEAD = 3, P_VISOR = 4, P_ARML = 5, 
   P_GUN = 7, P_BARREL = 8, P_PACK = 9, P_FLASH = 10;
 const SKIN_TONES = [0xf3d2b3, 0xe0b08a, 0xb98260, 0x8d5b3f, 0xf0c8a0, 0xd9a47a];
 
-export function createRenderer(canvas, map) {
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+// opts = { quality: 'low'|'medium'|'high', touch: bool }. Anti-aliasing is fixed when the WebGL
+// context is created (so a quality change that would toggle it applies on the next page load);
+// everything else in setQuality() takes effect immediately.
+const PIXEL_CAP = { desktop: { low: 1, medium: 1.5, high: 2 }, touch: { low: 0.75, medium: 1, high: 1.5 } };
+const TAG_PX = 0.5;                 // CSS pixels per name-tag texel (cell 320x40 texels -> 160x20 px)
+const TAG_FADE_NEAR = 28, TAG_FADE_FAR = 70;   // metres: fully visible, then fades to nothing
+
+export function createRenderer(canvas, map, opts = {}) {
+  const touch = !!opts.touch;
+  let quality = ['low', 'medium', 'high'].includes(opts.quality) ? opts.quality : (touch ? 'medium' : 'high');
+  const wantAA = quality === 'high' || (!touch && quality === 'medium');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAA, powerPreference: 'high-performance' });
+  const pixelRatio = () => Math.min(window.devicePixelRatio || 1, (touch ? PIXEL_CAP.touch : PIXEL_CAP.desktop)[quality]);
+  renderer.setPixelRatio(pixelRatio());
   renderer.autoClear = false;
   renderer.info.autoReset = false;
 
@@ -230,6 +241,7 @@ export function createRenderer(canvas, map) {
   scene.add(sky);
 
   // ---- skyline blocks outside the walls (one merged mesh) ----
+  let skyline = null;
   {
     const acc = newAcc();
     const tints = [0x9cc4d6, 0x8fb8c4, 0xa8cfc0, 0x9db4d8, 0xb4cfe0, 0x8cb0a4];
@@ -245,6 +257,7 @@ export function createRenderer(canvas, map) {
     const m = new THREE.Mesh(accToGeometry(acc), new THREE.MeshLambertMaterial({ vertexColors: true }));
     m.matrixAutoUpdate = false; m.frustumCulled = false;
     scene.add(m);
+    skyline = m;
   }
 
   // ---- clouds (flat boxes, unfogged, one mesh) ----
@@ -321,7 +334,7 @@ export function createRenderer(canvas, map) {
   const speedSm = new Float32Array(MAXP), phase = new Float32Array(MAXP);
   const crouchSm = new Float32Array(MAXP), slideSm = new Float32Array(MAXP);
   const deadT = new Float32Array(MAXP), flashT = new Float32Array(MAXP), flashRot = new Float32Array(MAXP);
-  const tagScale = new Float32Array(MAXP);
+  const tagVis = new Int8Array(MAXP).fill(-1);   // cached wall-occlusion result per slot (-1 = unknown)
   let slotCount = 0;
 
   const ONE = new THREE.Vector3(1, 1, 1), QID = new THREE.Quaternion();
@@ -354,6 +367,7 @@ export function createRenderer(canvas, map) {
     _col.setRGB(3.2, 2.5, 1.0); chars.setColorAt(i * PARTS + P_FLASH, _col);
     chars.instanceColor.needsUpdate = true;
     tagDirty = true;
+    tagAlpha[i] = 0; tagVis[i] = -1;
   }
   function setWeaponLook(i, w) {
     slotWeapon[i] = w;
@@ -362,8 +376,11 @@ export function createRenderer(canvas, map) {
     chars.instanceColor.needsUpdate = true;
   }
 
-  // ---- name tags: one dynamic quad mesh + one canvas atlas ----
-  const TAG_W = 256, TAG_H = 32, TAG_COLS = 2;
+  // ---- name tags: one dynamic quad mesh + one canvas atlas (one draw call) ----
+  // Each tag is a camera-facing quad sized in SCREEN pixels (so it stays small and constant at any
+  // distance or zoom), anchored just above the head, faded with distance, and hidden when a wall
+  // is between the camera and the player or the player is dead.
+  const TAG_W = 320, TAG_H = 40, TAG_COLS = 2;
   const tagCanvas = document.createElement('canvas');
   tagCanvas.width = TAG_W * TAG_COLS; tagCanvas.height = TAG_H * (MAXP / TAG_COLS);
   const tagCtx = tagCanvas.getContext('2d');
@@ -371,8 +388,11 @@ export function createRenderer(canvas, map) {
   tagTex.colorSpace = THREE.SRGBColorSpace; tagTex.generateMipmaps = false; tagTex.minFilter = THREE.LinearFilter;
   let tagDirty = false;
   const tagPos = new Float32Array(MAXP * 12);
+  const tagCol = new Float32Array(MAXP * 16).fill(1);       // rgba per vertex; a = fade
+  const tagAlpha = new Float32Array(MAXP);
   const tagGeo = new THREE.BufferGeometry();
   tagGeo.setAttribute('position', new THREE.BufferAttribute(tagPos, 3).setUsage(THREE.DynamicDrawUsage));
+  tagGeo.setAttribute('color', new THREE.BufferAttribute(tagCol, 4).setUsage(THREE.DynamicDrawUsage));
   {
     const uv = new Float32Array(MAXP * 8), idx = new Uint16Array(MAXP * 6);
     const rows = MAXP / TAG_COLS;
@@ -385,25 +405,55 @@ export function createRenderer(canvas, map) {
     tagGeo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     tagGeo.setIndex(new THREE.BufferAttribute(idx, 1));
   }
-  const tagMesh = new THREE.Mesh(tagGeo, new THREE.MeshBasicMaterial({ map: tagTex, transparent: true, depthWrite: false, fog: false }));
+  const tagMesh = new THREE.Mesh(tagGeo, new THREE.MeshBasicMaterial({ map: tagTex, vertexColors: true, transparent: true, depthWrite: false, depthTest: false, fog: false }));
   tagMesh.frustumCulled = false; tagMesh.renderOrder = 5;
   scene.add(tagMesh);
 
   function drawTag(i, p) {
     const col = i % TAG_COLS, row = (i / TAG_COLS) | 0, x = col * TAG_W, y = row * TAG_H;
     tagCtx.clearRect(x, y, TAG_W, TAG_H);
-    const name = String(p.name || ('Player ' + p.id)).slice(0, 18);
-    tagCtx.font = '700 20px system-ui, -apple-system, "Segoe UI", sans-serif';
+    const name = String(p.name || ('Player ' + p.id)).slice(0, 16);
+    tagCtx.font = '700 24px system-ui, -apple-system, "Segoe UI", sans-serif';
     tagCtx.textAlign = 'center'; tagCtx.textBaseline = 'middle';
-    const w = Math.min(TAG_W - 8, tagCtx.measureText(name).width + 22);
-    tagCtx.fillStyle = 'rgba(10,16,30,0.55)';
-    tagCtx.beginPath(); tagCtx.roundRect(x + (TAG_W - w) / 2, y + 3, w, TAG_H - 6, 8); tagCtx.fill();
+    const w = Math.min(TAG_W - 6, tagCtx.measureText(name).width + 26);
+    const px = x + (TAG_W - w) / 2, py = y + 3, ph = TAG_H - 6;
+    tagCtx.fillStyle = 'rgba(8,13,26,0.62)';
+    tagCtx.beginPath(); tagCtx.roundRect(px, py, w, ph, 9); tagCtx.fill();
     const h = (Math.abs(p.id) * 0.61803398875) % 1;
-    tagCtx.fillStyle = 'hsl(' + Math.round(h * 360) + ',85%,60%)';
-    tagCtx.fillRect(x + (TAG_W - w) / 2 + 6, y + TAG_H - 7, w - 12, 2);
+    tagCtx.fillStyle = 'hsl(' + Math.round(h * 360) + ',85%,62%)';
+    tagCtx.fillRect(px + 9, py + ph - 3, w - 18, 2);
     tagCtx.fillStyle = '#fff';
-    tagCtx.fillText(name, x + TAG_W / 2, y + TAG_H / 2 - 1, TAG_W - 12);
+    tagCtx.fillText(name, x + TAG_W / 2, py + ph / 2 - 1, TAG_W - 30);
     tagDirty = true;
+  }
+
+  // Is the straight segment (ox,oy,oz)->(tx,ty,tz) free of map boxes? (slab test over the flat box list)
+  function segClear(ox, oy, oz, tx, ty, tz) {
+    const dx = tx - ox, dy = ty - oy, dz = tz - oz;
+    for (let i = 0; i < nBoxes; i++) {
+      const o = i * 6;
+      let t0 = 0, t1 = 1;
+      if (Math.abs(dx) < 1e-9) { if (ox < flatBoxes[o] || ox > flatBoxes[o + 3]) continue; }
+      else {
+        let a = (flatBoxes[o] - ox) / dx, b = (flatBoxes[o + 3] - ox) / dx;
+        if (a > b) { const t = a; a = b; b = t; }
+        if (a > t0) t0 = a; if (b < t1) t1 = b; if (t0 > t1) continue;
+      }
+      if (Math.abs(dy) < 1e-9) { if (oy < flatBoxes[o + 1] || oy > flatBoxes[o + 4]) continue; }
+      else {
+        let a = (flatBoxes[o + 1] - oy) / dy, b = (flatBoxes[o + 4] - oy) / dy;
+        if (a > b) { const t = a; a = b; b = t; }
+        if (a > t0) t0 = a; if (b < t1) t1 = b; if (t0 > t1) continue;
+      }
+      if (Math.abs(dz) < 1e-9) { if (oz < flatBoxes[o + 2] || oz > flatBoxes[o + 5]) continue; }
+      else {
+        let a = (flatBoxes[o + 2] - oz) / dz, b = (flatBoxes[o + 5] - oz) / dz;
+        if (a > b) { const t = a; a = b; b = t; }
+        if (a > t0) t0 = a; if (b < t1) t1 = b; if (t0 > t1) continue;
+      }
+      if (t0 < 0.985) return false;
+    }
+    return true;
   }
 
   // ---- tracers: one dynamic ribbon mesh ----
@@ -487,12 +537,23 @@ export function createRenderer(canvas, map) {
 
   function resize(w, h) {
     W = Math.max(1, w | 0); H = Math.max(1, h | 0);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setPixelRatio(pixelRatio());
     renderer.setSize(W, H, false);
     camera.aspect = W / H; camera.updateProjectionMatrix();
     vmCam.aspect = W / H; vmCam.updateProjectionMatrix();
   }
   function setFov(deg) { baseFov = deg; }
+  let sparkMul = 1;
+  function setQuality(q) {
+    if (!PIXEL_CAP.desktop[q]) return;
+    quality = q;
+    sparkMul = q === 'low' ? 0.4 : q === 'medium' ? 0.7 : 1;
+    skyline.visible = q !== 'low';
+    clouds.visible = q !== 'low';
+    shadows.visible = q !== 'low';
+    resize(W, H);
+  }
+  function getQuality() { return quality; }
 
   function localFire(weaponId) {
     const v = vm[weaponId] || vm[0];
@@ -526,7 +587,7 @@ export function createRenderer(canvas, map) {
   }
   function impact(pos, normal, opts) {
     const flesh = !!(opts && opts.flesh);
-    const n = flesh ? 10 : 8;
+    const n = Math.max(2, Math.round((flesh ? 10 : 8) * sparkMul));
     const nx = normal ? normal[0] : 0, ny = normal ? normal[1] : 1, nz = normal ? normal[2] : 0;
     for (let k = 0; k < n; k++) {
       const i = sp.next; sp.next = (i + 1) % MAXS;
@@ -676,6 +737,7 @@ export function createRenderer(canvas, map) {
     const ce = camera.matrixWorld.elements;
     const camX = ce[12], camY = ce[13], camZ = ce[14];
     rr.set(ce[0], ce[1], ce[2]); ru.set(ce[4], ce[5], ce[6]);
+    const tanHalfFov = Math.tan(camera.fov * Math.PI / 360);
 
     for (let i = 0; i < n; i++) {
       const p = players[i];
@@ -738,20 +800,36 @@ export function createRenderer(canvas, map) {
       _m.compose(_v, QID, _s);
       shadows.setMatrixAt(i, _m);
 
-      // name tag
-      const o = i * 12;
-      const dxc = p.x - camX, dyc = p.y - camY, dzc = p.z - camZ;
-      const dist = Math.hypot(dxc, dyc, dzc);
-      if (!p.alive || dist > 110) {
-        tagPos.fill(0, o, o + 12);
-      } else {
-        const sc = clamp(dist / 16, 0.55, 3.2) * 0.5; // half-height in metres
-        const hw = sc * 4, hh = sc * 0.5 * 1.0;
-        const cx = p.x, cy = p.y + 2.2 - 0.7 * cr - 1.0 * sl + sc * 0.3, cz = p.z;
-        tagPos[o] = cx - rr.x * hw - ru.x * hh; tagPos[o + 1] = cy - rr.y * hw - ru.y * hh; tagPos[o + 2] = cz - rr.z * hw - ru.z * hh;
-        tagPos[o + 3] = cx + rr.x * hw - ru.x * hh; tagPos[o + 4] = cy + rr.y * hw - ru.y * hh; tagPos[o + 5] = cz + rr.z * hw - ru.z * hh;
-        tagPos[o + 6] = cx + rr.x * hw + ru.x * hh; tagPos[o + 7] = cy + rr.y * hw + ru.y * hh; tagPos[o + 8] = cz + rr.z * hw + ru.z * hh;
-        tagPos[o + 9] = cx - rr.x * hw + ru.x * hh; tagPos[o + 10] = cy - rr.y * hw + ru.y * hh; tagPos[o + 11] = cz - rr.z * hw + ru.z * hh;
+      // name tag (constant screen size, distance fade, wall + death hiding)
+      {
+        const o = i * 12, oc = i * 16;
+        const headTop = p.y + 1.8 - 0.7 * cr - 0.9 * sl;
+        const dxc = p.x - camX, dyc = headTop - camY, dzc = p.z - camZ;
+        const dist = Math.hypot(dxc, dyc, dzc);
+        const depth = -(dxc * ce[8] + dyc * ce[9] + dzc * ce[10]);   // distance along the view direction
+        let target = 0;
+        if (p.alive && depth > 0.6 && dist < TAG_FADE_FAR) {
+          target = dist <= TAG_FADE_NEAR ? 1 : 1 - (dist - TAG_FADE_NEAR) / (TAG_FADE_FAR - TAG_FADE_NEAR);
+          if (frameNo % 3 === i % 3 || tagVis[i] < 0) {            // occlusion test every 3rd frame per player
+            tagVis[i] = (segClear(camX, camY, camZ, p.x, headTop + 0.15, p.z) || segClear(camX, camY, camZ, p.x, headTop - 0.2, p.z)) ? 1 : 0;
+          }
+          if (!tagVis[i]) target = 0;
+        } else tagVis[i] = -1;
+        const ka = target > tagAlpha[i] ? 1 - Math.exp(-dt * 18) : 1 - Math.exp(-dt * 10);
+        tagAlpha[i] += (target - tagAlpha[i]) * ka;
+        if (tagAlpha[i] < 0.02) { tagAlpha[i] = 0; tagPos.fill(0, o, o + 12); }
+        else {
+          const wpp = (2 * Math.max(depth, 0.6) * tanHalfFov) / H;     // world metres per CSS pixel at this depth
+          const hw = TAG_W * TAG_PX * 0.5 * wpp, hh = TAG_H * TAG_PX * wpp;
+          // bottom edge sits 6 px above the head, so the tag never overlaps the body
+          const bx = p.x + ru.x * 6 * wpp, by = headTop + 0.1 + ru.y * 6 * wpp, bz = p.z + ru.z * 6 * wpp;
+          tagPos[o] = bx - rr.x * hw;            tagPos[o + 1] = by - rr.y * hw;            tagPos[o + 2] = bz - rr.z * hw;
+          tagPos[o + 3] = bx + rr.x * hw;        tagPos[o + 4] = by + rr.y * hw;            tagPos[o + 5] = bz + rr.z * hw;
+          tagPos[o + 6] = bx + rr.x * hw + ru.x * hh; tagPos[o + 7] = by + rr.y * hw + ru.y * hh; tagPos[o + 8] = bz + rr.z * hw + ru.z * hh;
+          tagPos[o + 9] = bx - rr.x * hw + ru.x * hh; tagPos[o + 10] = by - rr.y * hw + ru.y * hh; tagPos[o + 11] = bz - rr.z * hw + ru.z * hh;
+        }
+        const al = tagAlpha[i];
+        tagCol[oc + 3] = al; tagCol[oc + 7] = al; tagCol[oc + 11] = al; tagCol[oc + 15] = al;
       }
     }
     for (let i = n; i < MAXP; i++) {
@@ -759,11 +837,13 @@ export function createRenderer(canvas, map) {
     }
     // free the leftover slots visually
     tagPos.fill(0, n * 12);
+    for (let i = n; i < MAXP; i++) { tagAlpha[i] = 0; tagVis[i] = -1; }
     chars.count = n * PARTS;
     shadows.count = n;
     chars.instanceMatrix.needsUpdate = true;
     shadows.instanceMatrix.needsUpdate = true;
     tagGeo.attributes.position.needsUpdate = true;
+    tagGeo.attributes.color.needsUpdate = true;
     if (tagDirty) { tagTex.needsUpdate = true; tagDirty = false; }
   }
 
@@ -840,12 +920,14 @@ export function createRenderer(canvas, map) {
     }
   }
 
+  setQuality(quality);
   resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
 
   return {
-    resize, setFov, render, localFire, remoteFire, tracer, impact,
+    resize, setFov, setQuality, getQuality, render, localFire, remoteFire, tracer, impact,
     // optional extras
     getCamera: () => camera,
+    tagDebug: () => Array.from(tagAlpha.subarray(0, slotCount)),
     stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles }),
     renderer,
   };

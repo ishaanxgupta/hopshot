@@ -13,8 +13,21 @@
 //   per sim tick:   const fx = net.tick({ buttons, yaw, pitch, weapon }, renderTick);
 //   per frame:      const rt = net.renderTick(now); net.sampleRemotes(rt, players);
 //                   net.decayError(dt); net.localView(alpha, out);
+//
+// Netcode (protocol v2):
+//   - Remote players are rendered on a clock derived from snapshot ARRIVAL times (de-jittered
+//     with a windowed max), delayed by an adaptive interpolation delay sized from the measured
+//     arrival jitter (INTERP_DELAY_MS .. INTERP_DELAY_MAX_MS, smooth, never runs backwards).
+//     The render tick actually used is still sent with every input (lag compensation).
+//   - Time dilation: the server reports its input-buffer depth for us and a timeScale
+//     (+-MAX_DILATION_PERMILLE). net.tick() applies it internally by occasionally predicting two
+//     ticks in one call or skipping one (only when the input did not change, so no press is
+//     lost); the visual offset of that is smoothed like a correction. main.js needs no change.
+//     Exposed as net.timeScale.
+//   - net.state.quality = { rttMs, jitterMs, interpDelayMs, timeScale, inputBufferTicks,
+//     corrections10s, starved10s } (same object, refreshed ~1/s) for the HUD net-stats line.
 
-import { INTERP_DELAY_MS, BTN, PLAYER } from '../shared/constants.js';
+import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER } from '../shared/constants.js';
 import {
   WEAPONS, createWeaponState, copyWeaponState, resetWeaponState, stepWeapon, shotSpread, shotDir,
 } from '../shared/weapons.js';
@@ -29,7 +42,18 @@ import {
 
 const RING = 256;                          // prediction history (power of two, ~4.3 s)
 const RING_MASK = RING - 1;
-const INTERP_TICKS = INTERP_DELAY_MS / TICK_MS;
+const INTERP_TICKS = INTERP_DELAY_MS / TICK_MS;          // minimum interpolation delay (6 ticks)
+const INTERP_MAX_TICKS = INTERP_DELAY_MAX_MS / TICK_MS;  // maximum (15 ticks)
+const SNAP_INTERVAL_TICKS = 2;             // server snapshot period (SNAPSHOT_EVERY)
+const ARR_BUCKET_TICKS = 120;              // arrival-offset windowed max: 2 buckets of 2 s
+const LATE_N = 90;                         // snapshot lateness samples (~3 s)
+const DELAY_QUANTILE = 0.8;                // cover this fraction of snapshot arrivals
+const DELAY_MARGIN = 0.5;                  // ticks
+const CLOCK_SLEW = 0.06;                   // render clock may run +-6% fast/slow to follow its target
+const REMOTE_SMOOTH_TAU = 0.12;            // s, blend-out after an extrapolation / hold
+const REMOTE_SNAP = 5.0;                   // m, larger recovery jumps are not smoothed
+const REMOTE_JUMP = 0.2;                   // m per tick of sudden departure from the rendered motion
+const REMOTE_FRESH_JUMP = 0.45;            // m per tick: faster than anyone moves (27 m/s)
 const EXTRAP_TICKS = 6;                    // extrapolate remotes at most 100 ms, then hold
 const SAMPLES = 32;                        // per-remote snapshot samples (~1 s at 30 Hz)
 const PING_SAMPLES = 10;
@@ -67,6 +91,9 @@ function createRemote(id) {
   for (let i = 0; i < SAMPLES; i++) samples.push(createSample());
   return {
     id, samples, head: 0, count: 0, life: 0, pendingTeleport: true, lastSeenTick: 0,
+    // recovery smoothing (after extrapolation / hold): error offset + last rendered motion
+    ex: 0, ey: 0, ez: 0, lx: 0, ly: 0, lz: 0, vx: 0, vy: 0, vz: 0, lastRt: 0, lastLife: -1, lastAlive: false, fresh: true,
+    wasExtrap: false, wasHold: false,
     out: { id, name: '', x: 0, y: 0, z: 0, yaw: 0, pitch: 0, crouching: false, sliding: false, alive: false,
       onGround: false, ads: false, reloading: false, weapon: 0, health: 0, life: 0, bot: false },
   };
@@ -155,6 +182,11 @@ export function createNet(opts = {}) {
     rtt: NaN, ping: NaN,
     reconnectAttempt: 0, reconnectAt: 0,
     lastError: null,
+    timeScale: 1,                // server-driven simulation clock scale (see header)
+    quality: {                   // refreshed ~1/s; see header
+      rttMs: NaN, jitterMs: 0, interpDelayMs: INTERP_DELAY_MS, timeScale: 1, inputBufferTicks: 0,
+      corrections10s: 0, starved10s: 0,
+    },
   };
 
   const stats = {
@@ -162,6 +194,11 @@ export function createNet(opts = {}) {
     replays: 0, replayedCmds: 0, maxReplay: 0, snaps: 0, maxVisualError: 0,
     cmdsSent: 0, packetsSent: 0, bytesUp: 0, bytesDown: 0, remoteShots: 0, predictedShots: 0,
     connects: 0,
+    // instrumentation (measurement only)
+    corrSum: 0, corrBig: 0, corrMax: 0, corrPos: 0,   // corrections: summed size, > 10 cm, max, with position error
+    dilationExtra: 0, dilationSkip: 0, remoteBlends: 0,
+    extrapEvents: 0, holdEvents: 0, extrapSamples: 0, holdSamples: 0, remoteSamples: 0,
+    ackDelaySum: 0, ackDelayN: 0, ackDelays: new Float32Array(2048),   // input -> ack delay (ms), ring
   };
 
   // prediction
@@ -172,7 +209,7 @@ export function createNet(opts = {}) {
   const server = createPlayerState();    // last authoritative self state (at ackSeq)
   const serverW = createWeaponState();
   const ring = [];
-  for (let i = 0; i < RING; i++) ring.push({ seq: -1, cmd: createCmd(), state: createPlayerState(), ws: createWeaponState(), valid: false });
+  for (let i = 0; i < RING; i++) ring.push({ seq: -1, sentAt: 0, cmd: createCmd(), state: createPlayerState(), ws: createWeaponState(), valid: false });
   let nextSeq = 1;
   const sendList = [];                   // newest INPUT_REDUNDANCY cmds, oldest first
   let teleportPending = true;            // next reconcile snaps the view (spawn / first state)
@@ -191,6 +228,21 @@ export function createNet(opts = {}) {
   const pingOff = new Float64Array(PING_SAMPLES);
   let pingN = 0, pingHead = 0;
   let clockTarget = 0, clockOffset = 0, clockLast = 0, haveClock = false, havePong = false;
+
+  // render clock from snapshot arrivals
+  let arrMaxCur = -1e12, arrMaxPrev = -1e12, arrBucketAt = -1e12, haveArr = false;
+  const late = new Float32Array(LATE_N);
+  const lateSort = new Float32Array(LATE_N);
+  let lateHead = 0, lateN = 0, lateCount = 0;
+  let delayTarget = INTERP_TICKS, delayTicks = INTERP_TICKS, jitterTicks = 0;
+  let rclk = NaN, rclkAt = 0;
+
+  // time dilation + quality
+  let dilPhase = 0;
+  let lastButtons = -1, lastWeapon = -1;
+  const lastDelta = { x: 0, y: 0, z: 0 };
+  const qCorr = new Uint16Array(10), qStarved = new Uint16Array(10);
+  let qSec = 0, qSecAt = 0, lastStarvedCounter = -1;
 
   // connection
   let ws = null;
@@ -333,6 +385,10 @@ export function createNet(opts = {}) {
     teleportPending = true;
     err.x = err.y = err.z = 0;
     pingN = 0; pingHead = 0; havePong = false; haveClock = false;
+    arrMaxCur = arrMaxPrev = arrBucketAt = -1e12; haveArr = false;
+    lateHead = 0; lateN = 0; lateCount = 0; delayTarget = delayTicks = INTERP_TICKS; jitterTicks = 0; rclk = NaN;
+    dilPhase = 0; st.timeScale = 1; lastButtons = -1; lastWeapon = -1;
+    qCorr.fill(0); qStarved.fill(0); lastStarvedCounter = -1;
   }
 
   function rosterEntry(p) {
@@ -478,7 +534,69 @@ export function createNet(opts = {}) {
     if (t > clockLast) updateClock(t);
     return t / TICK_MS + clockOffset;
   }
-  function renderTick(t = now()) { return serverTick(t) - INTERP_TICKS; }
+  /**
+   * Render tick for remote players: newest-snapshot clock (de-jittered from arrival times) minus
+   * the adaptive interpolation delay. Slews smoothly (+-CLOCK_SLEW) and never runs backwards.
+   */
+  function renderTick(t = now()) {
+    if (!haveArr) return serverTick(t) - INTERP_TICKS;
+    const base = arrMaxCur > arrMaxPrev ? arrMaxCur : arrMaxPrev;
+    const target = t / TICK_MS + base - delayTicks;
+    if (rclk !== rclk) { rclk = target; rclkAt = t; return rclk; }
+    if (t <= rclkAt) return rclk;
+    const dt = (t - rclkAt) / TICK_MS;
+    rclkAt = t;
+    let next = rclk + dt;
+    const e = target - next;
+    if (e > 30 || e < -30) next = target;                       // way off (stall / resync): jump
+    else { const m = dt * CLOCK_SLEW; next += e > m ? m : e < -m ? -m : e; }
+    if (next > rclk) rclk = next;
+    return rclk;
+  }
+
+  /** Snapshot arrival: update the arrival-offset window, lateness samples and the delay target. */
+  function onArrival(tick, t) {
+    const o = tick - t / TICK_MS;
+    const tt = t / TICK_MS;
+    if (tt - arrBucketAt >= ARR_BUCKET_TICKS) { arrMaxPrev = arrMaxCur; arrMaxCur = o; arrBucketAt = tt; }
+    else if (o > arrMaxCur) arrMaxCur = o;
+    haveArr = true;
+    const base = arrMaxCur > arrMaxPrev ? arrMaxCur : arrMaxPrev;
+    late[lateHead] = base - o;
+    lateHead = (lateHead + 1) % LATE_N;
+    if (lateN < LATE_N) lateN++;
+    if ((++lateCount & 7) === 0 && lateN >= 8) {
+      const a = lateSort.subarray(0, lateN);
+      a.set(late.subarray(0, lateN));
+      a.sort();
+      const q = a[Math.min(lateN - 1, Math.floor(lateN * DELAY_QUANTILE))];
+      jitterTicks = a[Math.min(lateN - 1, Math.floor(lateN * 0.9))];
+      let d = SNAP_INTERVAL_TICKS + q + DELAY_MARGIN;
+      delayTarget = d < INTERP_TICKS ? INTERP_TICKS : d > INTERP_MAX_TICKS ? INTERP_MAX_TICKS : d;
+    }
+    // smooth delay changes: grow quickly (0.25 tick per snapshot), shrink slowly
+    const dd = delayTarget - delayTicks;
+    delayTicks += dd > 0 ? Math.min(dd, 0.25) : Math.max(dd, -0.02);
+  }
+
+  function updateQuality(t, you) {
+    if (t - qSecAt < 1000) return;
+    qSecAt = t;
+    const q = st.quality;
+    let c = 0, sv = 0;
+    for (let i = 0; i < 10; i++) { c += qCorr[i]; sv += qStarved[i]; }
+    q.corrections10s = c; q.starved10s = sv;
+    qSec = (qSec + 1) % 10; qCorr[qSec] = 0; qStarved[qSec] = 0;
+    // displayed RTT: median of the recent pings (TCP stalls inflate single samples)
+    if (pingN > 0) {
+      const a = Array.from(pingRtt.subarray(0, pingN)).sort((x, y) => x - y);
+      q.rttMs = Math.round(a[a.length >> 1]);
+    }
+    q.jitterMs = Math.round(jitterTicks * TICK_MS);
+    q.interpDelayMs = Math.round(delayTicks * TICK_MS);
+    q.timeScale = st.timeScale;
+    q.inputBufferTicks = Math.round(you.inputBuffer * 10) / 10;
+  }
 
   // ------------------------------------------------------------------ snapshots
   function onSnapshot(data) {
@@ -487,13 +605,31 @@ export function createNet(opts = {}) {
     if (s.tick <= st.lastSnapTick) return;
     st.lastSnapTick = s.tick;
     stats.snapshots++;
+    const tArr = now();
+    onArrival(s.tick, tArr);
     const you = s.you;
+    // server-driven time dilation (bounded here too)
+    const ts = you.timeScale > MAX_DILATION_PERMILLE ? MAX_DILATION_PERMILLE : you.timeScale < -MAX_DILATION_PERMILLE ? -MAX_DILATION_PERMILLE : you.timeScale;
+    st.timeScale = 1 + ts / 1000;
+    if (lastStarvedCounter >= 0) qStarved[qSec] += (you.starved - lastStarvedCounter) & 0xff;
+    lastStarvedCounter = you.starved;
+    updateQuality(tArr, you);
     if (!st.id) st.id = you.id;
     st.health = you.health;
     st.respawnAtTick = s.tick + you.respawnTicks;
     copyState(server, you.state);
     copyWeaponState(serverW, you.weapon);
-    if (s.ackSeq >= 0) st.ackSeq = s.ackSeq;
+    if (s.ackSeq >= 0) {
+      if (s.ackSeq > st.ackSeq) {
+        const e = ring[s.ackSeq & RING_MASK];
+        if (e.seq === s.ackSeq && e.sentAt > 0) {
+          const d = now() - e.sentAt;
+          stats.ackDelays[stats.ackDelayN & 2047] = d;
+          stats.ackDelaySum += d; stats.ackDelayN++;
+        }
+      }
+      st.ackSeq = s.ackSeq;
+    }
 
     if (!you.alive) {
       st.alive = false;
@@ -536,6 +672,9 @@ export function createNet(opts = {}) {
         if (d > stats.maxError) stats.maxError = d;
         if (sameState(e.state, server) && sameWeapon(e.ws, serverW)) return;  // prediction was exact
         stats.corrections++;
+        stats.corrSum += d; if (d > 0.1) stats.corrBig++; if (d > stats.corrMax) stats.corrMax = d;
+        if (d > 0) stats.corrPos++;
+        qCorr[qSec]++;
       }
       // rewind to the authoritative state and replay everything the server has not seen yet
       copyState(pred, server);
@@ -617,12 +756,55 @@ export function createNet(opts = {}) {
       const r = remoteList[i];
       if (r.count === 0) continue;
       const o = interpolate(r, rt);
+      const nt = sampleAt(r, 0).tick;
+      const ex = rt > nt, ho = rt > nt + EXTRAP_TICKS;
+      stats.remoteSamples++;
+      if (ex) stats.extrapSamples++;
+      if (ho) stats.holdSamples++;
+      if (ex && !r.wasExtrap) stats.extrapEvents++;
+      if (ho && !r.wasHold) stats.holdEvents++;
+      smoothRemote(r, o, rt, ex);
+      r.wasExtrap = ex; r.wasHold = ho;
       const e = st.roster.get(r.id);
       o.name = e ? e.name : '';
       o.bot = e ? e.bot : false;
       if (out) out.push(o);
     }
     return out;
+  }
+
+  /**
+   * After an extrapolation / hold ends (late snapshots arrived, e.g. a TCP burst) the
+   * interpolated position jumps to where the player really was. Blend that jump out instead
+   * of snapping: continue from the rendered position + motion and decay the offset.
+   */
+  function smoothRemote(r, o, rt, extrapolating) {
+    const drt = rt - r.lastRt;
+    if (drt <= 0 && drt > -1 && r.lastLife === o.life) { o.x += r.ex; o.y += r.ey; o.z += r.ez; return; }  // same frame again
+    const same = r.lastLife === o.life && o.alive && r.lastAlive && drt > 0 && drt < 30;
+    const x = o.x, y = o.y, z = o.z;    // raw (interpolated / extrapolated) position
+    if (!same) { r.ex = r.ey = r.ez = 0; r.vx = r.vy = r.vz = 0; r.fresh = true; }
+    else {
+      const k = Math.exp(-(drt * TICK_MS / 1000) / REMOTE_SMOOTH_TAU);
+      r.ex *= k; r.ey *= k; r.ez *= k;
+      if (Math.abs(r.ex) + Math.abs(r.ey) + Math.abs(r.ez) < 1e-4) r.ex = r.ey = r.ez = 0;
+      // departure of the RAW position from its own recent motion: a big one is a network
+      // artefact (end of an extrapolation/hold, or the server correcting a stalled player's
+      // guessed path), not movement. Absorb it into the offset and blend it out.
+      const jx = r.lx + r.vx * drt - x, jy = r.ly + r.vy * drt - y, jz = r.lz + r.vz * drt - z;
+      const j2 = jx * jx + jy * jy + jz * jz;
+      const lim = REMOTE_JUMP * drt;
+      const fl = REMOTE_FRESH_JUMP * drt;   // no motion reference yet: only an implausible step
+      const jump = r.fresh ? j2 > fl * fl : (j2 > lim * lim || (r.wasExtrap && !extrapolating));
+      if (jump && j2 < REMOTE_SNAP * REMOTE_SNAP) {
+        r.ex += jx; r.ey += jy; r.ez += jz; stats.remoteBlends++;
+        r.fresh = true;                      // re-measure the motion before testing again
+      } else { r.vx = (x - r.lx) / drt; r.vy = (y - r.ly) / drt; r.vz = (z - r.lz) / drt; r.fresh = false; }
+      const e2 = r.ex * r.ex + r.ey * r.ey + r.ez * r.ez;
+      if (e2 > REMOTE_SNAP * REMOTE_SNAP) r.ex = r.ey = r.ez = 0;
+      o.x += r.ex; o.y += r.ey; o.z += r.ez;
+    }
+    r.lx = x; r.ly = y; r.lz = z; r.lastRt = rt; r.lastLife = o.life; r.lastAlive = o.alive;
   }
 
   /** Interpolated eye position of a remote at the last sampled render tick -> out [x,y,z]. */
@@ -643,20 +825,66 @@ export function createNet(opts = {}) {
   function tick(input, rt) {
     if (!st.connected || !isOpen()) return null;
     if (!Number.isFinite(rt)) rt = renderTick();
+
+    fx.alive = st.alive; fx.fired = false; fx.shotCount = 0; fx.jumped = false; fx.landed = false;
+    fx.landSpeed = 0; fx.slideStart = false; fx.slideBoost = false; fx.reloadStart = false; fx.switched = false; fx.empty = false; fx.groundMove = 0;
+
+    // Time dilation, applied in whole ticks: phase accumulates (timeScale - 1) per call.
+    dilPhase += st.timeScale - 1;
+    if (dilPhase > 2) dilPhase = 2; else if (dilPhase < -2) dilPhase = -2;
+    if (dilPhase <= -1 && canSkip(input)) {
+      // slow down: predict nothing this call. Keep the rendered view moving (decaying offset).
+      dilPhase += 1;
+      stats.dilationSkip++;
+      prevView.x = pred.x - lastDelta.x; prevView.y = pred.y - lastDelta.y; prevView.z = pred.z - lastDelta.z;
+      prevView.eye = eyeHeight(pred);
+      err.x += lastDelta.x; err.y += lastDelta.y; err.z += lastDelta.z;
+      fx.seq = nextSeq - 1;
+      return fx;
+    }
+
+    // render interpolation base
+    prevView.x = pred.x; prevView.y = pred.y; prevView.z = pred.z; prevView.eye = eyeHeight(pred);
+    const c = stepOnce(input);
+    if (dilPhase >= 1) {
+      // speed up: a second tick with the same input; the extra displacement is smoothed out
+      dilPhase -= 1;
+      stats.dilationExtra++;
+      const mx = pred.x, my = pred.y, mz = pred.z;
+      stepOnce(input);
+      const dx = mx - pred.x, dy = my - pred.y, dz = mz - pred.z;
+      if (st.alive) { err.x += dx; err.y += dy; err.z += dz; prevView.x -= dx; prevView.y -= dy; prevView.z -= dz; }
+    } else {
+      lastDelta.x = pred.x - prevView.x; lastDelta.y = pred.y - prevView.y; lastDelta.z = pred.z - prevView.z;
+    }
+    lastButtons = c.buttons; lastWeapon = c.weapon;
+
+    // send newest cmds (redundancy covers packet loss)
+    const pkt = encodeInput(sendList, rt);
+    if (pkt) {
+      ws.send(pkt);
+      stats.packetsSent++; stats.bytesUp += pkt.byteLength;
+    }
+    return fx;
+  }
+
+  /** Skipping a tick is only allowed when it cannot lose a press/release or a weapon switch. */
+  function canSkip(input) {
+    if (!st.alive) return true;
+    return ((input.buttons | 0) & BTN_MASK_NET) === lastButtons && (input.weapon | 0) === lastWeapon;
+  }
+
+  /** Allocate the next cmd from input, predict it (live: side effects into fx), queue it to send. */
+  function stepOnce(input) {
     const seq = nextSeq++;
     st.lastSeq = seq;
     const e = ring[seq & RING_MASK];
     e.seq = seq;
+    e.sentAt = now();
     const c = e.cmd;
     c.seq = seq; c.buttons = input.buttons | 0; c.yaw = +input.yaw || 0; c.pitch = +input.pitch || 0; c.weapon = input.weapon | 0;
     if (sanitizeCmd(c) === null) { c.yaw = 0; c.pitch = 0; sanitizeCmd(c); }
-
-    // render interpolation base
-    prevView.x = pred.x; prevView.y = pred.y; prevView.z = pred.z; prevView.eye = eyeHeight(pred);
-
-    fx.seq = seq; fx.alive = st.alive; fx.fired = false; fx.shotCount = 0; fx.jumped = false; fx.landed = false;
-    fx.landSpeed = 0; fx.slideStart = false; fx.slideBoost = false; fx.reloadStart = false; fx.switched = false; fx.empty = false; fx.groundMove = 0;
-
+    fx.seq = seq;
     if (st.alive) {
       copyState(before, pred);
       copyWeaponState(beforeW, predW);
@@ -667,16 +895,10 @@ export function createNet(opts = {}) {
     } else {
       e.valid = false;
     }
-
-    // send newest cmds (redundancy covers packet loss)
     if (sendList.length >= INPUT_REDUNDANCY) sendList.shift();
     sendList.push(c);
-    const pkt = encodeInput(sendList, rt);
-    if (pkt) {
-      ws.send(pkt);
-      stats.packetsSent++; stats.cmdsSent++; stats.bytesUp += pkt.byteLength;
-    }
-    return fx;
+    stats.cmdsSent++;
+    return c;
   }
 
   function collectFx(c, fired) {
@@ -761,6 +983,8 @@ export function createNet(opts = {}) {
     get pred() { return pred; },
     get predWeapon() { return predW; },
     get serverState() { return server; },
+    get timeScale() { return st.timeScale; },
+    get interpDelayMs() { return delayTicks * TICK_MS; },
     get errorOffset() { return err; },
     get remoteCount() { return remoteList.length; },
     get remotes() { return remoteList; },

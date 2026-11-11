@@ -2,7 +2,11 @@
 // interpolation, and all renderer / HUD / audio wiring.
 //
 // URL params: ?room=NAME (private room), ?name=NAME, ?autoplay=1 (synthetic input, no pointer
-// lock needed - for automated browsers). Debug surface: window.__hopshot.
+// lock needed - for automated browsers), ?touch=1 (force the on-screen touch controls, e.g. to
+// drive them with a mouse on a desktop; ?touch=0 forces them off). Debug surface: window.__hopshot.
+//
+// Layout of this file: settings -> modules -> menu flow -> server wake/probe -> game events ->
+// simulation (simTick) -> frame loop (runFrame: assists, sim, render, HUD) -> debug surface.
 
 import { TICK_RATE, BTN, RESPAWN_MS } from '../shared/constants.js';
 import { WEAPONS } from '../shared/weapons.js';
@@ -12,7 +16,7 @@ import { TICK_MS, SHOT } from '../shared/protocol.js';
 import { createRenderer } from './render.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
-import { createInput, createAutopilot, wrapAngle } from './input.js';
+import { createInput, createAutopilot, wrapAngle, detectTouch } from './input.js';
 import { createNet } from './net.js';
 
 const MAX_CATCHUP_TICKS = 6;           // at most this many sim ticks per frame
@@ -35,20 +39,50 @@ function save(key, v) {
 }
 function num(v, def, lo, hi) { v = +v; return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def; }
 
+const IS_TOUCH = detectTouch();
+const FORCED_TOUCH = params.get('touch') === '1' || params.get('touch') === 'true';
 const stored = load('hopshot.settings', {}) || {};
-const settings = {
-  sensitivity: num(stored.sensitivity, 1, 0.05, 10),
-  fov: num(stored.fov, 90, 50, 130),
-  volume: num(stored.volume, 0.7, 0, 1),
+const DEFAULTS = {
+  sensitivity: 1, adsSens: 1, invertY: false, fov: 90, volume: 0.7,
+  quality: IS_TOUCH ? 'medium' : 'high',
+  showStats: !IS_TOUCH,
+  crosshairColor: '#ffffff', crosshairSize: 1,
+  stickSide: 'left', btnScale: 1, aimAssist: IS_TOUCH, autoFire: IS_TOUCH,
 };
+const bool = (v, def) => (typeof v === 'boolean' ? v : def);
+const pick = (v, list, def) => (list.includes(v) ? v : def);
+// Validate a (possibly partial or hostile) settings object against `base`; missing fields keep base.
+function sanitize(s, base) {
+  s = s && typeof s === 'object' ? s : {};
+  return {
+    sensitivity: num(s.sensitivity, base.sensitivity, 0.05, 10),
+    adsSens: num(s.adsSens, base.adsSens, 0.2, 2),
+    invertY: bool(s.invertY, base.invertY),
+    fov: num(s.fov, base.fov, 50, 130),
+    volume: num(s.volume, base.volume, 0, 1),
+    quality: pick(s.quality, ['low', 'medium', 'high'], base.quality),
+    showStats: bool(s.showStats, base.showStats),
+    crosshairColor: typeof s.crosshairColor === 'string' && /^#[0-9a-f]{6}$/i.test(s.crosshairColor) ? s.crosshairColor.toLowerCase() : base.crosshairColor,
+    crosshairSize: num(s.crosshairSize, base.crosshairSize, 0.5, 3),
+    stickSide: pick(s.stickSide, ['left', 'right'], base.stickSide),
+    btnScale: num(s.btnScale, base.btnScale, 0.8, 1.6),
+    aimAssist: bool(s.aimAssist, base.aimAssist),
+    autoFire: bool(s.autoFire, base.autoFire),
+  };
+}
+const settings = sanitize(stored, DEFAULTS);
 let playerName = String(params.get('name') || load('hopshot.name', '') || (AUTOPLAY ? 'Autoplay' : '')).slice(0, 16);
 
 // ------------------------------------------------------------------ modules
 const canvas = document.getElementById('game');
 const hudRoot = document.getElementById('hud');
 const world = createWorld(MAP);
-const renderer = createRenderer(canvas, MAP);
-const hud = createHud(hudRoot);
+if (IS_TOUCH) document.documentElement.classList.add('touch');
+const renderer = createRenderer(canvas, MAP, { quality: settings.quality, touch: IS_TOUCH });
+const hud = createHud(hudRoot, {
+  touch: IS_TOUCH,
+  onScoreboardClose() { scoreboardHeld = false; input.setScoreboardActive(false); input.state.scoreboard = false; },
+});
 const audio = createAudio();
 // Game server address. Defaults to the host that served this page; ?server=https://host or a
 // global HOPSHOT_SERVER lets a separately hosted page point at the game server.
@@ -61,25 +95,31 @@ let menuOpen = false;
 let scoreboardHeld = false;
 
 const input = createInput(canvas, {
+  touch: IS_TOUCH,
   onLockChange(locked) {
     if (locked) { hideMenu(); return; }
     if (!AUTOPLAY) showMenu();
   },
   onLockError() { /* we keep playing unlocked; a canvas click retries */ },
   onScoreboard(held) { scoreboardHeld = held; if (!held) hud.setScoreboard(false); },
-  onEscape() { if (!AUTOPLAY && !menuOpen) showMenu(); },
+  onEscape() { if (!AUTOPLAY && !menuOpen) showMenu(); },       // Esc key, or the on-screen menu button
+  onGesture() { audio.unlock(); if (net.state.status === 'reconnecting') net.retryNow(); },
 });
-input.sensitivity = settings.sensitivity;
 
 function applySettings() {
   renderer.setFov(settings.fov);
+  renderer.setQuality(settings.quality);
   audio.setVolume(settings.volume);
   input.sensitivity = settings.sensitivity;
+  input.invertY = settings.invertY;
+  input.configureTouch({ side: settings.stickSide, scale: settings.btnScale });
+  hud.setPrefs(settings);
 }
 applySettings();
 
 const onResize = () => renderer.resize(window.innerWidth, window.innerHeight);
 window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', () => setTimeout(onResize, 200));
 onResize();
 
 // ------------------------------------------------------------------ private rooms / invites
@@ -124,31 +164,47 @@ if (ROOM && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
 }
 
 // ------------------------------------------------------------------ menu flow
+let menuShown = 0;
 function showMenu() {
   menuOpen = true;
   // Refresh the server line when the menu reopens (it is not polled while idle).
   if (server.state === 'online' && !server.pending && !net.state.connected && performance.now() - server.checkedAt > 15000) probeSoon(0);
   input.enabled = false;
+  scoreboardHeld = false;
+  input.setScoreboardActive(false);
   hud.showMenu({
     defaultName: playerName,
     settings: { ...settings },
     room: roomMenu,
+    inGame: started,
+    tab: menuShown++ === 0 && ROOM ? 'friends' : undefined,
     onPlay(name) {
       playerName = String(name || 'Player').slice(0, 16);
       save('hopshot.name', playerName);
       audio.unlock();
       input.requestLock().then((ok) => { lockHint = !ok; });
       hideMenu();
+      if (IS_TOUCH && !FORCED_TOUCH) goFullscreen();
       if (!started) { started = true; net.connect(playerName, ROOM, { bots: ROOM_BOTS }); }
     },
     onSettings(s) {
-      settings.sensitivity = num(s.sensitivity, settings.sensitivity, 0.05, 10);
-      settings.fov = num(s.fov, settings.fov, 50, 130);
-      settings.volume = num(s.volume, settings.volume, 0, 1);
+      Object.assign(settings, sanitize(s, settings));
       applySettings();
       save('hopshot.settings', settings);
     },
   });
+}
+// Phones: hide the browser chrome and pin landscape when the browser allows it (both can be refused).
+function goFullscreen() {
+  try {
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (req && !document.fullscreenElement && !document.webkitFullscreenElement) {
+      const r = req.call(el, { navigationUI: 'hide' });
+      const lock = () => { try { const o = screen.orientation; if (o && o.lock) o.lock('landscape').catch(() => {}); } catch { /* unsupported */ } };
+      if (r && r.then) r.then(lock, () => {}); else lock();
+    }
+  } catch { /* unsupported */ }
 }
 function hideMenu() {
   menuOpen = false;
@@ -157,6 +213,7 @@ function hideMenu() {
 }
 
 canvas.addEventListener('click', () => {
+  if (IS_TOUCH) return;     // touch: the overlay handles taps, there is no pointer lock
   audio.unlock();
   if (net.state.status === 'reconnecting') net.retryNow();
   if (!AUTOPLAY && !menuOpen && !input.locked) input.requestLock().then((ok) => { lockHint = !ok; });
@@ -429,6 +486,16 @@ function runFrame() {
   curRenderTick = connected ? net.renderTick(t) : 0;
   net.sampleRemotes(curRenderTick, frame.players);
 
+  // touch assists: gentle aim pull + auto-fire (client-side input shaping only)
+  if (input.touch && !AUTOPLAY) {
+    if (connected && input.enabled) {
+      const pw = net.predWeapon;
+      input.applyAssist(dt, { world, self: net.pred, alive: net.state.alive, remotes: frame.players,
+        weapon: pw.weapon, ammo: pw.ammo[pw.weapon], reloading: pw.reload > 0, ads: local.ads,
+        aimAssist: settings.aimAssist, autoFire: settings.autoFire });
+    } else { input.state.autoFire = false; input.state.assistSlow = 1; }
+  }
+
   // fixed-step simulation
   if (connected) {
     stepAcc += dtMs;
@@ -450,7 +517,7 @@ function runFrame() {
   const w = WEAPONS[local.weapon] || WEAPONS[0];
   // keep the on-screen sensitivity constant while zoomed
   const zoom = Math.tan((w.adsFov * Math.PI) / 360) / Math.tan((settings.fov * Math.PI) / 360);
-  input.adsScale = 1 + (zoom - 1) * local.ads;
+  input.adsScale = 1 + (zoom * settings.adsSens - 1) * local.ads;
 
   frame.dt = dt;
   frame.time = time;
@@ -486,8 +553,10 @@ function updateHud(t) {
   hudState.respawnIn = s.alive ? 0 : Math.max(0, Math.min(RESPAWN_MS / 1000, (s.respawnAtTick - st) / TICK_RATE));
   hudState.ping = Number.isFinite(s.ping) ? s.ping : null;
   hudState.fps = fps;
+  hudState.quality = s.quality || null;
   hudState.players = s.connected ? s.roster.size : null;
   hud.update(hudState);
+  hud.setInGame(started && !menuOpen);
 
   if (scoreboardHeld && !menuOpen && t >= sbNext) { sbNext = t + 250; hud.setScoreboard(true, scoreRows()); }
 
@@ -500,7 +569,7 @@ function updateHud(t) {
     const txt = `Disconnected - reconnecting in ${left}s (click to retry)`;
     if (txt !== statusText) setStatus(txt);
   } else if (s.connected) {
-    const want = lockHint && !input.locked && !menuOpen && !AUTOPLAY ? 'Click to capture the mouse' : '';
+    const want = lockHint && !IS_TOUCH && !input.locked && !menuOpen && !AUTOPLAY ? 'Click to capture the mouse' : '';
     if (want !== statusText) setStatus(want);
   }
 }
@@ -538,6 +607,12 @@ window.__hopshot = {
       avgReplay: s.replays ? r3(s.replayedCmds / s.replays) : 0, visualSnaps: s.snaps, maxVisualError: r3(s.maxVisualError) };
   },
   get fps() { return Math.round(fps); },
+  get isTouch() { return IS_TOUCH; },
+  get touch() { return input.touchDebug(); },
+  get settings() { return { ...settings }; },
+  get quality() { return renderer.getQuality(); },
+  get tags() { return renderer.tagDebug(); },
+  renderer,
   get counters() { return { ...counters, predictedShots: net.stats.predictedShots, frameErrors: errors }; },
   get round() { return { ...net.state.round }; },
   net, input,

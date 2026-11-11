@@ -1,14 +1,29 @@
 // One game room: 60 Hz authoritative simulation, cmd jitter buffers, lag-compensated hitscan,
 // FFA rules, rounds, 30 Hz per-client snapshots and JSON events.
+//
+// Input path (netcode, protocol v2):
+//   - Per-player adaptive jitter buffer. Arrival lateness of every input packet is measured
+//     (against the least-delayed arrival of the last ~1 s; packets released in a TCP burst are
+//     excluded) and the buffer target is ~p90 lateness + 1 tick. The server never stalls or
+//     speeds up the queue itself: it tells the client (snapshot timeScale, +-3%) to run its
+//     fixed-step clock slightly faster/slower so the smoothed depth settles on the target.
+//   - Starvation (e.g. a TCP retransmission stall) is SPECULATIVE: the player keeps moving
+//     on a guess (last movement buttons), and when the real cmds arrive the server rewinds
+//     that player to the last real state and replays the real cmds for the guessed ticks.
+//     The authoritative timeline is therefore exactly "one real cmd per tick", the client's
+//     prediction stays bit-exact, and the self state in snapshots is always the state right
+//     after ackSeq. Only very long stalls (> MAX_SPEC ticks) commit the guess.
+//   - No hard drops in normal operation; a large sustained surplus is trimmed (latency cap)
+//     and nobody can speed-hack: at most one cmd per tick on average is ever simulated.
 
 import { performance } from 'node:perf_hooks';
 import {
   TICK_RATE, SNAPSHOT_EVERY, MAX_PLAYERS, MAX_REWIND_MS, RESPAWN_MS, ROUND_MS, INTERMISSION_MS,
-  MAX_HEALTH, REGEN_DELAY_MS, REGEN_PER_SEC, BTN, DT,
+  MAX_HEALTH, REGEN_DELAY_MS, REGEN_PER_SEC, BTN, DT, MAX_DILATION_PERMILLE,
 } from '../shared/constants.js';
 import { MAP } from '../shared/map.js';
 import {
-  createPlayerState, spawnState, stepPlayer, eyeHeight, hitboxHeight, raycastWorld, raycastPlayer,
+  createPlayerState, copyState, spawnState, stepPlayer, eyeHeight, hitboxHeight, raycastWorld, raycastPlayer,
 } from '../shared/physics.js';
 import {
   WEAPONS, createWeaponState, resetWeaponState, stepWeapon, shotSpread, shotDir,
@@ -22,14 +37,21 @@ import { Bot } from './bots.js';
 const TICK_MS = 1000 / TICK_RATE;
 const msToTicks = (ms) => Math.round(ms / TICK_MS);
 
-const HIST = 64;                                   // per-player position history (~1.07 s)
-const MAX_REWIND_TICKS = MAX_REWIND_MS / TICK_MS;  // 18 at 60 Hz
-const QUEUE_CAP = 32;                              // ring capacity
-const QUEUE_HARD_MAX = 10;                         // more queued than this -> trim immediately
-const QUEUE_HARD_KEEP = 4;                         //   ... down to this many
-const QUEUE_WINDOW = 60;                           // ticks over which the min queue length is tracked
-const QUEUE_SPARE = 1;                             // keep this many spare cmds over a window
-const REPEAT_TICKS = 6;                            // repeat last movement this long when starved
+const HIST = 128;                                  // per-player position history (~2.1 s)
+const MAX_REWIND_TICKS = MAX_REWIND_MS / TICK_MS;  // 36 at 60 Hz
+const QUEUE_CAP = 64;                              // ring capacity (overflow drops the oldest)
+const QUEUE_WINDOW = 60;                           // ticks over which the min queue depth is tracked
+const TRIM_EXCESS = 4;                             // window min > target + this -> trim (latency cap)
+const MAX_SPEC = 30;                               // speculate at most this many ticks, then commit
+const GUESS_MOVE_TICKS = 12;                       // guessed ticks repeat movement this long, then idle
+const LAT_N = 128;                                 // arrival lateness samples kept per player
+const TARGET_MIN = 2, TARGET_MAX = 10;             // jitter buffer target bounds (ticks)
+const TARGET_MARGIN = 1.25;                        // ticks above p90 lateness
+const DEPTH_ALPHA = 1 / 30;                        // depth EWMA (per tick)
+const DILATION_GAIN = 12;                          // permille per tick of depth error
+const DILATION_DEADBAND = 0.25;                    // ticks
+const BURST_GAP = 0.15;                            // ticks: arrivals closer than this are a burst tail
+const ARR_LEAK = 0.04;                             // leaky-min rise per tick (> max dilation)
 const MOVE_BUTTONS = BTN.FORWARD | BTN.BACK | BTN.LEFT | BTN.RIGHT | BTN.JUMP | BTN.CROUCH | BTN.ADS;
 const SLOW_CLIENT_BYTES = 64 * 1024;               // skip snapshots while more than this is queued
 const DEAD_CLIENT_BYTES = 1024 * 1024;             // terminate above this
@@ -80,6 +102,7 @@ export class Room {
     this.selfBlock = new Uint8Array(SNAP_SELF_BYTES);
     this.selfView = new DataView(this.selfBlock.buffer);
     this.shotScratch = { shooter: 0, weapon: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: 7 };
+    this.latSort = new Float32Array(LAT_N);
 
     // Fixed-step loop
     this.timer = null;
@@ -143,6 +166,10 @@ export class Room {
     this.tickTimesN = 0; this.tickTimesHead = 0; this.tickMax = 0; this.overruns = 0;
     this.catchUpDrops = 0; this.snapshotsSkipped = 0; this.bytesOut = 0;
     this.createdAt = performance.now();
+    for (const p of this.players) {
+      p.starvedTotal = 0; p.cmdsDropped = 0; p.dropCommit = 0; p.dropTrim = 0; p.dropAlive = 0; p.specReplays = 0; p.specCommits = 0;
+      p.shotsFired = 0; p.rewindClamped = 0; p.maxRewind = 0;
+    }
   }
 
   /** Current server time in fractional ticks (for pong / clock sync). */
@@ -178,13 +205,22 @@ export class Room {
       kills: 0, deaths: 0, ping: 0,
       // cmd jitter buffer
       queue, qHead: 0, qLen: 0, lastQueuedSeq: -1, ackSeq: -1,
-      lastCmd: createCmd(), starved: 0, qMin: 1e9, qWindow: 0, cmdsDropped: 0,
+      lastCmd: createCmd(), guess: createCmd(), starved: 0, qMin: 1e9, qWindow: 0,
+      // speculation while starved: state after the last real cmd + number of guessed ticks
+      specBase: createPlayerState(), specN: 0, commitN: 0, commitTick: 0,
+      // adaptive target + dilation
+      lat: new Float32Array(LAT_N), latHead: 0, latN: 0, lastArrAt: -1e9,
+      arrMinCur: 1e9, arrBucketAt: 0,
+      target: 2, depthAvg: 2, dilation: 0, starvedCounter: 0,
+      // net stats (/status)
+      starvedTotal: 0, cmdsDropped: 0, dropCommit: 0, dropTrim: 0, dropAlive: 0, specReplays: 0, specCommits: 0, rewindClamped: 0, shotsFired: 0, maxRewind: 0,
       // lag-compensation history
       hist: new Float32Array(HIST * 4), histTick: new Int32Array(HIST).fill(-1), histAlive: new Uint8Array(HIST),
       // reused snapshot views
       entry: { id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
         onGround: false, ads: false, reloading: false, weapon: 0, health: 0 },
-      you: { id, alive: false, health: 0, respawnTicks: 0, state: null, weapon: null },
+      you: { id, alive: false, health: 0, respawnTicks: 0, state: null, weapon: null,
+        inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0 },
       index: 0, removed: false,
     };
     p.you.state = p.state;
@@ -275,11 +311,49 @@ export class Room {
    * Seqs at or below the newest already queued/processed are ignored (redundant copies).
    */
   ingestInput(p, pkt) {
+    let first = -1;
     for (let i = 0; i < pkt.count; i++) {
       const c = pkt.cmds[i];
       if (c.seq <= p.lastQueuedSeq) continue;
       this.pushCmd(p, c, pkt.renderTick - (pkt.count - 1 - i));
+      if (first < 0) first = c.seq;
     }
+    // the OLDEST new cmd is the on-schedule one (a dilated client sends two cmds now and then)
+    if (first >= 0) this.measureArrival(p, this.currentTick(), first);
+  }
+
+  /**
+   * Arrival lateness of cmd `seq` arriving at server time T (fractional ticks): T - seq against
+   * the least-delayed recent arrival (a "leaky" minimum that may rise ARR_LEAK ticks per tick, so
+   * it follows a client whose clock was slowed down by dilation without inflating lateness).
+   * Packets that arrive right behind the previous one (a TCP burst after head-of-line blocking)
+   * are not jitter samples.
+   */
+  measureArrival(p, T, seq) {
+    const d = T - seq;
+    let base = p.arrMinCur + ARR_LEAK * (T - p.arrBucketAt);
+    if (!(d > base)) base = d;            // also initialises (arrMinCur starts huge)
+    p.arrMinCur = base; p.arrBucketAt = T;
+    const burst = T - p.lastArrAt < BURST_GAP;
+    p.lastArrAt = T;
+    if (burst) return;
+    p.lat[p.latHead] = d - base;
+    p.latHead = (p.latHead + 1) % LAT_N;
+    if (p.latN < LAT_N) p.latN++;
+  }
+
+  /** Recompute the buffer target from the lateness samples (p90 + margin). */
+  updateTarget(p) {
+    const n = p.latN;
+    if (n < 16) return;
+    const a = this.latSort.subarray(0, n);
+    a.set(p.lat.subarray(0, n));
+    a.sort();
+    const q = a[Math.min(n - 1, Math.floor(n * 0.9))];
+    let t = q + TARGET_MARGIN;
+    t = t < TARGET_MIN ? TARGET_MIN : t > TARGET_MAX ? TARGET_MAX : t;
+    // rise quickly, fall slowly (do not chase every quiet second)
+    p.target = t > p.target ? t : p.target + (t - p.target) * 0.1;
   }
 
   pushCmd(p, c, rt) {
@@ -296,34 +370,121 @@ export class Room {
     this.pushCmd(p, cmd, this.tick);
   }
 
-  /** Pop the cmd for this tick. Returns the queue entry (real) or p.lastCmd (synthesised). */
-  takeCmd(p) {
-    // Latency control: hard cap, plus slow trimming of spare cmds that stayed queued all window.
-    if (p.qLen > QUEUE_HARD_MAX) {
-      const drop = p.qLen - QUEUE_HARD_KEEP;
-      p.qHead = (p.qHead + drop) % QUEUE_CAP; p.qLen -= drop; p.cmdsDropped += drop;
+  popCmd(p) {
+    const c = p.queue[p.qHead];
+    p.qHead = (p.qHead + 1) % QUEUE_CAP; p.qLen--;
+    return c;
+  }
+
+  dropOldest(p, n) {
+    if (n <= 0) return;
+    if (n > p.qLen) n = p.qLen;
+    p.qHead = (p.qHead + n) % QUEUE_CAP; p.qLen -= n; p.cmdsDropped += n;
+    if (p.alive) p.dropAlive += n;
+  }
+
+  /** Simulate one real cmd for p. `late` = ticks this cmd is processed behind schedule (replay). */
+  runCmd(p, c, late) {
+    if (p.alive) {
+      stepPlayer(p.state, c, this.world);
+      if (stepWeapon(p.wstate, c)) this.fire(p, c, c.rt, late);
+      if (p.alive && p.state.y < MAP.killY) this.kill(p, null, 0, false);
     }
-    if (p.qLen < p.qMin) p.qMin = p.qLen;
-    if (++p.qWindow >= QUEUE_WINDOW) {
-      if (p.qMin > QUEUE_SPARE && p.qMin !== 1e9) {
-        const drop = Math.min(p.qMin - QUEUE_SPARE, 2);
-        p.qHead = (p.qHead + drop) % QUEUE_CAP; p.qLen -= drop; p.cmdsDropped += drop;
+    p.ackSeq = c.seq;
+    const last = p.lastCmd;
+    last.seq = c.seq; last.buttons = c.buttons; last.yaw = c.yaw; last.pitch = c.pitch; last.weapon = c.weapon;
+  }
+
+  /** One guessed tick while starved: last movement buttons for a while, then idle. Never fires. */
+  guessStep(p, i) {
+    const g = p.guess, last = p.lastCmd;
+    g.seq = last.seq; g.yaw = last.yaw; g.pitch = last.pitch; g.weapon = last.weapon;
+    g.buttons = i <= GUESS_MOVE_TICKS ? (last.buttons & MOVE_BUTTONS) : 0;
+    stepPlayer(p.state, g, this.world);
+  }
+
+  /** This tick's input for player p (see the header comment). */
+  consume(p) {
+    // Depth sample for the dilation controller: real cmds available minus ticks we owe (guessed).
+    // Skipped while a long stall is in progress (that is TCP, not clock drift or jitter).
+    if (p.specN <= 2 && p.lastQueuedSeq >= 0) this.sampleDepth(p, p.qLen - p.specN);
+    // 1. real cmds arrived for ticks we guessed: rewind to the last real state and replay them
+    if (p.specN > 0 && p.qLen > 0) {
+      const n = p.specN;
+      p.specN = 0;
+      copyState(p.state, p.specBase);
+      const k = n < p.qLen ? n : p.qLen;
+      for (let i = 0; i < k; i++) this.runCmd(p, this.popCmd(p), n - i);
+      p.specReplays++;
+      if (n > k && p.alive) {   // still short: guess the rest again from the new real state
+        copyState(p.specBase, p.state);
+        p.specN = n - k;
+        for (let i = 1; i <= p.specN; i++) this.guessStep(p, i);
       }
-      p.qWindow = 0; p.qMin = 1e9;
+    } else if (p.qLen > 0 && p.commitN > 0) {
+      // first cmds after a committed (too long) stall: drop the backlog that the guess replaced
+      if (this.tick - p.commitTick < TICK_RATE) {
+        const n = Math.min(p.commitN, p.qLen - Math.ceil(p.target));
+        if (n > 0) { this.dropOldest(p, n); p.commitN -= n; p.dropCommit += n; }
+      }
+      if (this.tick - p.commitTick >= TICK_RATE || p.commitN <= 0) p.commitN = 0;
     }
 
-    const last = p.lastCmd;
+    // 2. this tick
     if (p.qLen > 0) {
-      const c = p.queue[p.qHead];
-      p.qHead = (p.qHead + 1) % QUEUE_CAP; p.qLen--;
       p.starved = 0;
-      last.seq = c.seq; last.buttons = c.buttons; last.yaw = c.yaw; last.pitch = c.pitch; last.weapon = c.weapon;
-      return c;
+      this.runCmd(p, this.popCmd(p), 0);
+      return;
     }
-    // Starved: repeat movement for a few ticks, then idle. Never fires, never reloads.
     p.starved++;
-    last.buttons = p.starved <= REPEAT_TICKS ? (last.buttons & MOVE_BUTTONS) : 0;
-    return null;
+    p.starvedCounter = (p.starvedCounter + 1) & 0xff;
+    if (p.lastQueuedSeq < 0) return;                      // nothing received yet
+    if (!p.alive) {
+      // dead: nothing to simulate, but this tick happened without a cmd. If a burst brings the
+      // missing cmds later, the surplus is dropped (they are worthless now) instead of adding
+      // permanent input delay.
+      if (p.commitN < TICK_RATE) p.commitN++;
+      p.commitTick = this.tick;
+      return;
+    }
+    p.starvedTotal++;
+    if (p.specN === 0) copyState(p.specBase, p.state);
+    if (p.specN < MAX_SPEC) {
+      p.specN++;
+      this.guessStep(p, p.specN);
+    } else {
+      // stalled too long: the guesses become authoritative (the client will get one correction)
+      p.specCommits++;
+      p.commitN += p.specN; p.commitTick = this.tick;
+      p.specN = 0;
+      this.guessStep(p, MAX_SPEC + 1);
+    }
+  }
+
+  sampleDepth(p, depth) {
+    p.depthAvg += (depth - p.depthAvg) * DEPTH_ALPHA;
+    if (depth < p.qMin) p.qMin = depth;
+  }
+
+  /** Once per QUEUE_WINDOW ticks: target from jitter, dilation from depth error, latency cap. */
+  netControl(p) {
+    this.updateTarget(p);
+    const err = p.target - p.depthAvg;
+    let dil = 0;
+    if (err > DILATION_DEADBAND || err < -DILATION_DEADBAND) {
+      dil = Math.round((err - (err > 0 ? DILATION_DEADBAND : -DILATION_DEADBAND)) * DILATION_GAIN);
+      if (dil > MAX_DILATION_PERMILLE) dil = MAX_DILATION_PERMILLE;
+      else if (dil < -MAX_DILATION_PERMILLE) dil = -MAX_DILATION_PERMILLE;
+    }
+    p.dilation = dil;
+    // latency cap: a large surplus that persisted for the whole window (client ignoring the
+    // dilation, or a clock running fast) is trimmed. Never happens to a cooperating client.
+    if (p.qMin !== 1e9 && p.qMin > p.target + TRIM_EXCESS && p.specN === 0) {
+      const n = Math.floor(p.qMin - p.target - 1);
+      this.dropOldest(p, n); p.dropTrim += n;
+      p.depthAvg = p.target;
+    }
+    p.qMin = 1e9;
   }
 
   // ------------------------------------------------------------------ simulation
@@ -338,19 +499,12 @@ export class Room {
       if (p.botBrain) p.botBrain.think(tick);
     }
 
-    // one cmd per player
+    // one cmd per player (or a guess + later replay, see consume)
+    const control = tick % QUEUE_WINDOW === 0;
     for (let i = 0; i < players.length; i++) {
       const p = players[i];
-      const real = this.takeCmd(p);
-      const cmd = real || p.lastCmd;
-      if (p.alive) {
-        stepPlayer(p.state, cmd, this.world);
-        if (real) {
-          if (stepWeapon(p.wstate, cmd)) this.fire(p, cmd, real.rt);
-        }
-        if (p.alive && p.state.y < MAP.killY) this.kill(p, null, 0, false);
-      }
-      if (real) p.ackSeq = real.seq;
+      this.consume(p);
+      if (control && p.ws) this.netControl(p);
     }
 
     // respawn / regen
@@ -412,7 +566,7 @@ export class Room {
     }
   }
 
-  fire(p, cmd, renderTick) {
+  fire(p, cmd, renderTick, late = 0) {
     const w = WEAPONS[p.wstate.weapon];
     const st = p.state;
     const ox = st.x, oy = st.y + eyeHeight(st), oz = st.z;
@@ -420,11 +574,15 @@ export class Room {
 
     // Rewind other players to the time the shooter was looking at.
     // History exists up to tick-1 for everyone (this tick's moves are not final yet).
+    // A cmd replayed after a stall (late > 0) is honoured as if it had arrived on time.
     let r = renderTick;
     const newest = this.tick - 1;
-    const oldest = this.tick - MAX_REWIND_TICKS;
+    const oldest = this.tick - MAX_REWIND_TICKS - late;
     if (!(r <= newest)) r = newest;     // also handles NaN
-    if (r < oldest) r = oldest;
+    p.shotsFired++;
+    if (r < oldest) { r = oldest; p.rewindClamped++; }
+    const rw = this.tick - r - late;
+    if (rw > p.maxRewind) p.maxRewind = rw;
     const players = this.players;
     for (let i = 0; i < players.length; i++) {
       const q = players[i];
@@ -499,6 +657,9 @@ export class Room {
 
   kill(victim, killer, weapon, headshot) {
     victim.alive = false;
+    if (victim.specN > 0) {          // guessed ticks are final now; drop their late cmds later
+      victim.commitN += victim.specN; victim.commitTick = this.tick; victim.specN = 0;
+    }
     victim.health = 0;
     victim.deaths++;
     victim.respawnAt = this.tick + msToTicks(RESPAWN_MS);
@@ -537,6 +698,7 @@ export class Room {
   respawn(p) {
     const sp = this.pickSpawn(p);
     spawnState(p.state, sp.pos[0], sp.pos[1], sp.pos[2]);
+    p.specN = 0;
     resetWeaponState(p.wstate);
     p.alive = true;
     p.health = MAX_HEALTH;
@@ -625,6 +787,10 @@ export class Room {
       you.alive = p.alive;
       you.health = p.health;
       you.respawnTicks = p.alive ? 0 : Math.max(0, p.respawnAt - this.tick);
+      // the self state is always the state right after ackSeq (never a guessed tick)
+      you.state = p.specN > 0 ? p.specBase : p.state;
+      you.inputBuffer = p.depthAvg; you.inputTarget = p.target; you.timeScale = p.dilation;
+      you.starved = p.starvedCounter;
       writeSnapshotSelf(this.selfView, 0, this.tick, p.ackSeq, you);
       // ws may keep a reference to the buffer while the socket is busy, so each client gets
       // its own (pooled, small) Buffer; all encoding work above is shared.
@@ -666,6 +832,11 @@ export class Room {
       tickMs: this.timingStats(), overruns: this.overruns, catchUpDrops: this.catchUpDrops,
       snapshotsSkipped: this.snapshotsSkipped, bytesOutPerSec: Math.round(this.bytesOut / secs),
       cmdsDropped: this.players.reduce((s, p) => s + p.cmdsDropped, 0),
+      net: this.players.filter((p) => !p.bot).map((p) => ({
+        id: p.id, starved: p.starvedTotal, dropped: p.cmdsDropped, dropCommit: p.dropCommit, dropTrim: p.dropTrim, dropAlive: p.dropAlive, replays: p.specReplays, commits: p.specCommits,
+        target: Math.round(p.target * 100) / 100, depth: Math.round(p.depthAvg * 100) / 100, dilation: p.dilation,
+        shots: p.shotsFired, rewindClamped: p.rewindClamped, maxRewindMs: Math.round(p.maxRewind * TICK_MS),
+      })),
     };
   }
 }

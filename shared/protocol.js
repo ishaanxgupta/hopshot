@@ -41,7 +41,15 @@
 //   u8   youFlags        bit0 alive, bit1 hasAck (ackSeq is valid)
 //   u8   health         0..100 (rounded)
 //   u16  respawnTicks    ticks until respawn while dead, else 0
-//   STATE_BYTES          your full physics state (physics.writeState)
+//   u8   inputBuffer     (v2) server-side input jitter buffer depth for you, smoothed, 1/8 ticks
+//   u8   inputTarget     (v2) the depth the server is steering you to, 1/8 ticks
+//   i8   timeScale       (v2) server-driven time dilation for your simulation, in 1/1000:
+//                        run your fixed-step clock at (1 + timeScale/1000) x real time.
+//                        Always within +-MAX_DILATION_PERMILLE; it only moves queue depth,
+//                        the server never processes more than one cmd per tick on average.
+//   u8   starved         (v2) wrapping counter of server ticks that had no cmd of yours
+//   STATE_BYTES          your full physics state (physics.writeState). This is ALWAYS the
+//                        state right after cmd ackSeq (never includes guessed ticks).          your full physics state (physics.writeState)
 //   WSTATE_BYTES         your full weapon state (weapons.writeWeaponState)
 //   u8   playerCount     OTHER players (you are not in this list), then playerCount x 13 bytes:
 //     u8  id
@@ -83,7 +91,13 @@
 //   { t:'scores', rows:[{ id, kills, deaths, ping }] }       ~ every 1 s
 //   { t:'error', code, message }                              e.g. room_full, bad_version
 //
-// CLOCK SYNC (client side)
+// CLOCK SYNC (client side; client/net.js implements all of this)
+//   v2: the render clock for remote players is derived from SNAPSHOT ARRIVAL TIMES, not from
+//   the ping clock: base = max over a few seconds of (snapshot.tick - arrivalMs / TICK_MS)
+//   (the least-delayed arrival), renderTick = nowMs / TICK_MS + base - delayTicks, where
+//   delayTicks covers the measured arrival jitter. This is immune to asymmetric routes and
+//   keeps the buffer from running dry at any ping. The ping clock below is only used for
+//   serverTick() (timers) and the displayed RTT.
 //   - Send {t:'ping', c: performance.now(), rtt} about once a second (and 3-5 times quickly at
 //     start). On pong: rtt = now - c;  sample = pong.tick + (rtt / 2) / TICK_MS - now / TICK_MS
 //     is the offset "serverTick - clientMs/TICK_MS". Keep the sample with the lowest rtt over
@@ -104,11 +118,11 @@
 //   - Keep yaw within [-pi, pi] on the client (wrap it in input handling).
 // ============================================================================================
 
-import { BTN_MASK, PITCH_LIMIT } from './constants.js';
+import { BTN_MASK, PITCH_LIMIT, MAX_DILATION_PERMILLE } from './constants.js';
 import { WEAPONS, WSTATE_BYTES, writeWeaponState, readWeaponState, createWeaponState } from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;   // v2: snapshot header carries input-buffer feedback + dilation
 export const MSG = { INPUT: 1, SNAPSHOT: 2 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
@@ -122,7 +136,7 @@ export const INPUT_CMD_BYTES = 11;
 export const INPUT_MAX_BYTES = INPUT_HEADER_BYTES + INPUT_CMD_BYTES * INPUT_MAX_CMDS;
 export const MAX_TEXT_BYTES = 2048;
 
-export const SNAP_HEADER_BYTES = 14;   // type..respawnTicks
+export const SNAP_HEADER_BYTES = 18;   // type..starved
 export const SNAP_SELF_BYTES = SNAP_HEADER_BYTES + STATE_BYTES + WSTATE_BYTES;
 export const PLAYER_ENTRY_BYTES = 13;
 export const SHOT_ENTRY_BYTES = 9;
@@ -283,7 +297,8 @@ export function decodeInput(data, out = createInputPacket()) {
 // Low-level writers (used by the server's zero-garbage snapshot builder and by encodeSnapshot).
 
 /**
- * Write header + self block at `offset`. you = { id, alive, health, respawnTicks, state, weapon }.
+ * Write header + self block at `offset`. you = { id, alive, health, respawnTicks, state, weapon,
+ * inputBuffer, inputTarget (ticks, fractional), timeScale (permille), starved (counter) }.
  * ackSeq < 0 or null means "no cmd processed yet". Returns new offset (offset + SNAP_SELF_BYTES).
  */
 export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
@@ -295,6 +310,11 @@ export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
   view.setUint8(offset + 10, (you.alive ? 1 : 0) | (hasAck ? 2 : 0));
   view.setUint8(offset + 11, clampU8(Math.round(you.health)));
   view.setUint16(offset + 12, Math.max(0, Math.min(65535, you.respawnTicks | 0)), true);
+  view.setUint8(offset + 14, clampU8(Math.round((+you.inputBuffer || 0) * 8)));
+  view.setUint8(offset + 15, clampU8(Math.round((+you.inputTarget || 0) * 8)));
+  const ts = Math.round(+you.timeScale || 0);
+  view.setInt8(offset + 16, ts > MAX_DILATION_PERMILLE ? MAX_DILATION_PERMILLE : ts < -MAX_DILATION_PERMILLE ? -MAX_DILATION_PERMILLE : ts);
+  view.setUint8(offset + 17, (you.starved | 0) & 0xff);
   let o = writeState(view, offset + SNAP_HEADER_BYTES, you.state);
   o = writeWeaponState(view, o, you.weapon);
   return o;
@@ -365,7 +385,8 @@ function createShot() {
 
 /**
  * Reusable output object for decodeSnapshot:
- * { tick, ackSeq /* -1 = none *\/, you:{ id, alive, health, respawnTicks, state, weapon },
+ * { tick, ackSeq /* -1 = none *\/, you:{ id, alive, health, respawnTicks, inputBuffer, inputTarget,
+ *   timeScale /* permille *\/, starved, state, weapon },
  *   players:[{ id,x,y,z,yaw,pitch,alive,crouching,sliding,onGround,ads,reloading,weapon,health }],
  *   shots:[{ shooter, weapon, kind, victim, x,y,z, normal:[x,y,z]|null }] }
  * The arrays/objects are reused by the next decode into the same `out` - copy what you keep
@@ -374,7 +395,8 @@ function createShot() {
 export function createSnapshot() {
   return {
     tick: 0, ackSeq: -1,
-    you: { id: 0, alive: false, health: 0, respawnTicks: 0, state: createPlayerState(), weapon: createWeaponState() },
+    you: { id: 0, alive: false, health: 0, respawnTicks: 0, inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0,
+      state: createPlayerState(), weapon: createWeaponState() },
     players: [], shots: [],
     _pp: [], _sp: [],
   };
@@ -396,6 +418,10 @@ export function decodeSnapshot(data, out = createSnapshot()) {
     you.alive = (flags & 1) !== 0;
     you.health = v.getUint8(11);
     you.respawnTicks = v.getUint16(12, true);
+    you.inputBuffer = v.getUint8(14) / 8;
+    you.inputTarget = v.getUint8(15) / 8;
+    you.timeScale = v.getInt8(16);
+    you.starved = v.getUint8(17);
     let o = readState(v, SNAP_HEADER_BYTES, you.state);
     o = readWeaponState(v, o, you.weapon);
     if (o !== SNAP_SELF_BYTES) return null;

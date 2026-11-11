@@ -2,8 +2,10 @@
 // Headless end-to-end test of the client core (client/net.js + the autopilot from client/input.js)
 // against the real server.
 //
-//   node tools/client.test.js [--clean 20] [--lag 10] [--lat 40] [--jit 10] [--loss 0.02]
-//   (--lat/--jit are ONE-WAY ms applied in each direction; the default is ~80 +- 20 ms RTT)
+//   node tools/client.test.js [--port 3103] [--clean 20] [--lag 20] [--profiles p80,p180,p250] [--json out.json]
+//   profiles (see PROFILES): p80 = 80 ms RTT +-10; p180 = 180 +-40 with 2.5% TCP stalls;
+//   p250 = 250 +-60 with 3% TCP stalls. Stalls are modelled the way TCP delivers a loss:
+//   head-of-line blocking until the retransmission, then an in-order burst.
 //
 // 1. Starts `node server/index.js` on port 3103 (private room) as a child process.
 // 2. Clean run: 3 headless clients built on createNet(), driven by createAutopilot() (wander,
@@ -11,8 +13,9 @@
 //    like client/main.js. Asserts prediction stays exact after reconciliation, remote
 //    interpolation is continuous while alive, clients see each other and bots, shots / kills /
 //    respawns flow, and a clean disconnect leaves the server with no room.
-// 3. Lag run: same with artificial latency + jitter + loss injected in the client's socket
-//    (send and receive), reporting the correction statistics.
+// 3. Profile runs: same with a TCP-like link model injected in the client's socket (send and
+//    receive), then a "feel" table: corrections/s and size, server starved ticks / dropped cmds,
+//    remote stutter (per-tick step outliers, extrapolate / hold events), input-to-ack delay.
 // The server child is always killed; nothing is left listening.
 
 import { spawn } from 'node:child_process';
@@ -26,12 +29,12 @@ import { TICK_MS } from '../shared/protocol.js';
 import { createNet } from '../client/net.js';
 import { createAutopilot } from '../client/input.js';
 
-const PORT = 3103;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
+const PORT = args.includes('--port') ? parseInt(args[args.indexOf('--port') + 1], 10) : 3103;
 const opt = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? parseFloat(args[i + 1]) : d; };
 const CLEAN_S = opt('clean', 20);
-const LAG_S = opt('lag', 10);
+const LAG_S = opt('lag', 20);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const world = createWorld(MAP);
 
@@ -42,9 +45,11 @@ async function startServer() {
     env: { ...process.env, PORT: String(PORT), BOTS: '4' }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});
-  server.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
+  let inUse = false;
+  server.stderr.on('data', (d) => { if (/EADDRINUSE/.test(String(d))) inUse = true; process.stderr.write(`[server] ${d}`); });
   for (let i = 0; i < 100; i++) {
-    try { const r = await fetch(`http://localhost:${PORT}/status`); if (r.ok) return; } catch { /* not yet */ }
+    if (inUse || server.exitCode !== null) throw new Error(`our server child could not listen (port ${PORT} in use? pick another with --port)`);
+    try { const r = await fetch(`http://localhost:${PORT}/status`); if (r.ok) { await sleep(300); if (!inUse && server.exitCode === null) return; } } catch { /* not yet */ }
     await sleep(100);
   }
   throw new Error('server did not start');
@@ -56,7 +61,7 @@ process.on('exit', killServer);
 process.on('SIGINT', () => { killServer(); process.exit(130); });
 const status = () => fetch(`http://localhost:${PORT}/status`).then((r) => r.json());
 
-// ------------------------------------------------------------------ lossy / laggy socket
+// ------------------------------------------------------------------ realistic TCP-like link
 function prng(seed) {
   let s = seed >>> 0;
   return () => {
@@ -68,50 +73,93 @@ function prng(seed) {
 }
 
 /**
- * WebSocket wrapper adding one-way latency +- jitter in both directions (order preserved, as
- * on a real TCP stream) and dropping a fraction of BINARY frames (inputs / snapshots), which is
- * how a lossy link looks to the game: lost inputs are covered by redundancy, lost snapshots by
- * interpolation.
+ * Link profiles. rtt / jitter are ROUND-TRIP figures; each direction gets rtt/2 +- jitter/2
+ * (uniform), independently. `stall` is the per-message probability of a lost TCP segment.
+ * WebSocket runs over TCP, so a loss never drops a message: the segment is retransmitted
+ * (fast retransmit ~1 RTT later, sometimes an RTO >= 200 ms) and every later message waits
+ * behind it (head-of-line blocking), then everything is released in order in one burst.
  */
-function laggySocket({ latency, jitter, loss, seed }) {
+export const PROFILES = {
+  clean: null,
+  p80: { rtt: 80, jitter: 10, stall: 0 },
+  p180: { rtt: 180, jitter: 40, stall: 0.025 },
+  p250: { rtt: 250, jitter: 60, stall: 0.03 },
+  // diagnostics (not in the default set): jitter without stalls, and asymmetric routes
+  p180j: { rtt: 180, jitter: 40, stall: 0 },
+  asym: { rtt: 180, jitter: 40, stall: 0.025, upShare: 0.75 },
+};
+
+function tcpDirection(rnd, { rtt, jitter, stall }, share = 0.5) {
+  const oneWay = rtt * share, j = jitter * share;
+  let last = 0;
+  const counts = { msgs: 0, stalls: 0, stalledMs: 0 };
+  /** delivery time for a message handed to the socket at time t (in-order, HOL-blocking). */
+  const at = (t) => {
+    counts.msgs++;
+    let extra = 0;
+    if (stall > 0 && rnd() < stall) {
+      // time until the retransmission goes out: fast retransmit after ~1 RTT + dupack wait,
+      // 15% of the time a retransmission timeout instead
+      extra = rnd() < 0.15 ? Math.max(200, rtt * 1.5) + rnd() * rtt * 0.5 : rtt * (1 + 0.3 * rnd()) + 20;
+      counts.stalls++; counts.stalledMs += extra;
+    }
+    const d = Math.max(last, t + extra + oneWay + (rnd() * 2 - 1) * j);
+    last = d;
+    return d;
+  };
+  return { at, counts };
+}
+
+/**
+ * Strict FIFO delivery: items are released in the order they were queued, each no earlier than
+ * its delivery time (separate setTimeouts with close expiry times can fire out of order in Node,
+ * which a TCP stream never does).
+ */
+function fifo(deliver) {
+  const q = [];
+  let timer = null;
+  const pump = () => {
+    timer = null;
+    const t = performance.now();
+    while (q.length && q[0].at <= t + 0.5) deliver(q.shift().data);
+    if (q.length) timer = setTimeout(pump, Math.max(0, q[0].at - performance.now()));
+  };
+  return {
+    push(at, data) { q.push({ at, data }); if (!timer) timer = setTimeout(pump, Math.max(0, q[0].at - performance.now())); },
+    get pending() { return q.length; },
+  };
+}
+
+/** WebSocket wrapper applying an independent TCP-like link model in each direction. */
+function laggySocket(profile, seed) {
   const rnd = prng(seed);
-  const counts = { upDropped: 0, downDropped: 0, up: 0, down: 0 };
+  const us = profile.upShare ?? 0.5;
+  const up = tcpDirection(rnd, profile, us), down = tcpDirection(rnd, profile, 1 - us);
   const factory = (url) => {
     const real = new WebSocket(url);
     real.binaryType = 'arraybuffer';
-    let lastUp = 0, lastDown = 0;
-    const delay = (last) => {
-      const t = performance.now();
-      const at = Math.max(last, t + latency + (rnd() * 2 - 1) * jitter);
-      return at;
-    };
+    let lastDown = 0;
     const fake = {
       binaryType: 'arraybuffer', onopen: null, onmessage: null, onclose: null, onerror: null,
       get readyState() { return real.readyState; },
-      send(d) {
-        counts.up++;
-        if (typeof d !== 'string' && rnd() < loss) { counts.upDropped++; return; }
-        lastUp = delay(lastUp);
-        setTimeout(() => { if (real.readyState === 1) real.send(d); }, lastUp - performance.now());
-      },
+      send(d) { upQ.push(up.at(performance.now()), d); },
       close(code, reason) { real.close(code, reason); },
     };
-    real.onopen = (e) => setTimeout(() => fake.onopen && fake.onopen(e), latency);
-    real.onmessage = (e) => {
-      counts.down++;
-      if (typeof e.data !== 'string' && rnd() < loss) { counts.downDropped++; return; }
-      lastDown = delay(lastDown);
-      const data = e.data;
-      setTimeout(() => fake.onmessage && fake.onmessage({ data }), lastDown - performance.now());
-    };
+    const upQ = fifo((d) => { if (real.readyState === 1) real.send(d); });
+    const downQ = fifo((data) => { if (fake.onmessage) fake.onmessage({ data }); });
+    real.onopen = (e) => setTimeout(() => fake.onopen && fake.onopen(e), profile.rtt * (1 - us));
+    real.onmessage = (e) => { lastDown = down.at(performance.now()); downQ.push(lastDown, e.data); };
     real.onerror = (e) => fake.onerror && fake.onerror(e);
     real.onclose = (e) => setTimeout(() => fake.onclose && fake.onclose({ code: e.code, reason: e.reason }), Math.max(0, lastDown - performance.now()) + 1);
     return fake;
   };
-  return { factory, counts };
+  return { factory, up: up.counts, down: down.counts };
 }
 
 // ------------------------------------------------------------------ headless client
+const VERBOSE = args.includes('--verbose');
+const JERK = 0.08;   // m: horizontal per-tick step changing by more than this (4.8 m/s in one tick) = visible stutter
+
 class Client {
   constructor(i, room, socketFactory) {
     this.i = i;
@@ -124,8 +172,9 @@ class Client {
       fired: 0, pellets: 0, jumps: 0, slides: 0, boosts: 0, lands: 0, reloads: 0, switches: 0, ticks: 0,
       closes: [], welcome: 0, rounds: 0, respawns: 0,
     };
-    this.cont = { samples: 0, maxStep: 0, teleports: 0, worst: null };
-    this.local = { maxStep: 0, steps: 0, last: null, view: {} };
+    this.cont = { samples: 0, maxStep: 0, teleports: 0, jerks: 0, worst: null };
+    this.local = { maxStep: 0, steps: 0, last: null, lastStep: -1, jerks: 0, view: {} };
+    this.q = { n: 0, interp: 0, scale: 0, buf: 0, jitter: 0, scaleMin: 1, scaleMax: 1 };
     this.prevRemote = new Map();
     this.maxSpeed = 0;
     const n = this.net, c = this.c;
@@ -176,12 +225,22 @@ class Client {
     }
     // rendered local position (alpha = 1 at tick boundaries) must move smoothly too
     const v = n.localView(1, this.local.view);
-    if (v.alive && this.local.last) {
-      const d = Math.hypot(v.x - this.local.last[0], v.y - this.local.last[1], v.z - this.local.last[2]);
-      this.local.steps++;
-      if (d > this.local.maxStep) this.local.maxStep = d;
+    const L = this.local;
+    if (v.alive && L.last) {
+      const d = Math.hypot(v.x - L.last[0], v.y - L.last[1], v.z - L.last[2]);
+      const h = Math.hypot(v.x - L.last[0], v.z - L.last[2]);
+      L.steps++;
+      if (d > L.maxStep) L.maxStep = d;
+      if (L.lastStep >= 0 && Math.abs(h - L.lastStep) > JERK) L.jerks++;
+      L.lastStep = h;
+    } else L.lastStep = -1;
+    L.last = v.alive ? [v.x, v.y, v.z] : null;
+    const q = n.state.quality;
+    if (q && (this.c.ticks % 30) === 0) {
+      const Q = this.q;
+      Q.n++; Q.interp += q.interpDelayMs; Q.scale += q.timeScale; Q.buf += q.inputBufferTicks; Q.jitter += q.jitterMs;
+      Q.scaleMin = Math.min(Q.scaleMin, q.timeScale); Q.scaleMax = Math.max(Q.scaleMax, q.timeScale);
     }
-    this.local.last = v.alive ? [v.x, v.y, v.z] : null;
   }
 
   checkRemotes() {
@@ -191,12 +250,15 @@ class Client {
       const prev = this.prevRemote.get(r.id);
       if (prev && prev.alive && r.alive && prev.life === r.life) {
         const d = Math.hypot(r.x - prev.x, r.y - prev.y, r.z - prev.z);
+        const h = Math.hypot(r.x - prev.x, r.z - prev.z);
         this.cont.samples++;
         if (d > this.cont.maxStep) this.cont.maxStep = d;
-        if (d > 1.0) { this.cont.teleports++; if (!this.cont.worst) this.cont.worst = { id: r.id, d, from: [prev.x, prev.y, prev.z], to: [r.x, r.y, r.z] }; }
-      }
+        if (prev.step >= 0 && Math.abs(h - prev.step) > JERK) this.cont.jerks++;
+        prev.step = h;
+        if (d > 1.0) { this.cont.teleports++; if (VERBOSE) console.log('  big remote step', JSON.stringify({ id: r.id, d, from: [prev.x, prev.y, prev.z], to: [r.x, r.y, r.z] })); if (!this.cont.worst) this.cont.worst = { id: r.id, d, from: [prev.x, prev.y, prev.z], to: [r.x, r.y, r.z] }; }
+      } else if (prev) prev.step = -1;
       if (prev) { prev.x = r.x; prev.y = r.y; prev.z = r.z; prev.alive = r.alive; prev.life = r.life; }
-      else this.prevRemote.set(r.id, { x: r.x, y: r.y, z: r.z, alive: r.alive, life: r.life });
+      else this.prevRemote.set(r.id, { x: r.x, y: r.y, z: r.z, alive: r.alive, life: r.life, step: -1 });
     }
     for (const id of this.prevRemote.keys()) if (!seen.has(id)) this.prevRemote.delete(id);
   }
@@ -242,12 +304,102 @@ function report(label, clients) {
   }
 }
 
+/** What a player would feel, averaged over the 3 clients (rates per second of play). */
+function feel(clients, secs, serverNet) {
+  const N = clients.length;
+  const sum = (f) => clients.reduce((a, c) => a + f(c), 0);
+  const corr = sum((c) => c.net.stats.corrections);
+  const corrPos = sum((c) => c.net.stats.corrPos ?? c.net.stats.corrections);
+  const corrSum = sum((c) => c.net.stats.corrSum);
+  const delays = clients.flatMap((c) => { const s = c.net.stats; return Array.from(s.ackDelays.subarray ? s.ackDelays.subarray(0, Math.min(s.ackDelayN, s.ackDelays.length)) : s.ackDelays); }).sort((a, b) => a - b);
+  const pct = (a, q) => (a.length ? a[Math.min(a.length - 1, Math.floor(q * a.length))] : NaN);
+  const byId = new Map((serverNet || []).map((e) => [e.id, e]));
+  const srv = clients.map((c) => byId.get(c.net.state.id) || { starved: NaN, dropped: NaN });
+  const remSamples = sum((c) => c.net.stats.remoteSamples);
+  const remotesPerClient = sum((c) => c.net.remoteCount) / N;
+  const qn = sum((c) => c.q.n);
+  return {
+    ping: sum((c) => c.net.state.ping) / N,
+    corrPerS: corr / N / secs,
+    corrPosPerS: corrPos / N / secs,
+    corrAvgCm: corr ? 100 * corrSum / corr : 0,
+    corrBigPerS: sum((c) => c.net.stats.corrBig) / N / secs,
+    corrMaxCm: 100 * Math.max(...clients.map((c) => c.net.stats.corrMax)),
+    starvedPerS: srv.reduce((a, e) => a + e.starved, 0) / N / secs,
+    droppedPerS: srv.reduce((a, e) => a + e.dropped, 0) / N / secs,
+    droppedAlivePerS: srv.reduce((a, e) => a + (e.dropAlive ?? e.dropped), 0) / N / secs,
+    remoteJerkPerS: sum((c) => c.cont.jerks) / N / secs / Math.max(1, remotesPerClient),
+    remoteMaxStep: Math.max(...clients.map((c) => c.cont.maxStep)),
+    remoteTeleports: sum((c) => c.cont.teleports),
+    extrapPerS: sum((c) => c.net.stats.extrapEvents) / N / secs / Math.max(1, remotesPerClient),
+    holdPerS: sum((c) => c.net.stats.holdEvents) / N / secs / Math.max(1, remotesPerClient),
+    extrapPct: 100 * sum((c) => c.net.stats.extrapSamples) / Math.max(1, remSamples),
+    ackAvg: sum((c) => c.net.stats.ackDelaySum) / Math.max(1, sum((c) => c.net.stats.ackDelayN)),
+    ackP95: pct(delays, 0.95),
+    localJerkPerS: sum((c) => c.local.jerks) / N / secs,
+    localMaxStep: Math.max(...clients.map((c) => c.local.maxStep)),
+    interpMs: qn ? sum((c) => c.q.interp) / qn : NaN,
+    bufTicks: qn ? sum((c) => c.q.buf) / qn : NaN,
+    timeScale: qn ? sum((c) => c.q.scale) / qn : NaN,
+    timeScaleRange: qn ? [Math.min(...clients.map((c) => c.q.scaleMin)), Math.max(...clients.map((c) => c.q.scaleMax))] : null,
+    hits: sum((c) => c.c.hits), fired: sum((c) => c.c.fired),
+    replaysPerS: srv.reduce((a, e) => a + (e.replays || 0), 0) / N / secs,
+    commits: srv.reduce((a, e) => a + (e.commits || 0), 0),
+    srvTarget: srv.reduce((a, e) => a + (e.target ?? NaN), 0) / N,
+    rewindClamped: srv.reduce((a, e) => a + (e.rewindClamped ?? NaN), 0),
+    maxRewindMs: Math.max(...srv.map((e) => e.maxRewindMs ?? NaN)),
+    dilExtraSkipPerS: sum((c) => (c.net.stats.dilationExtra || 0) + (c.net.stats.dilationSkip || 0)) / N / secs,
+  };
+}
+
+const COLS = [
+  ['ping', 'ping ms', 0], ['corrPerS', 'corr all/s', 2], ['corrPosPerS', 'corr pos/s', 2], ['corrAvgCm', 'corr avg cm', 1], ['corrBigPerS', '>10cm/s', 2],
+  ['corrMaxCm', 'corr max cm', 0], ['starvedPerS', 'starved/s', 2], ['droppedPerS', 'dropped/s', 2], ['droppedAlivePerS', 'drop alive/s', 2],
+  ['remoteJerkPerS', 'rem jerk/s', 2], ['extrapPerS', 'extrap/s', 2], ['holdPerS', 'hold/s', 2], ['extrapPct', 'extrap %', 1],
+  ['remoteMaxStep', 'rem max step', 2], ['localJerkPerS', 'loc jerk/s', 2], ['ackAvg', 'ack ms', 0], ['ackP95', 'ack p95', 0],
+  ['interpMs', 'interp ms', 0], ['bufTicks', 'buf ticks', 1], ['timeScale', 'timeScale', 4],
+  ['srvTarget', 'srv target', 2], ['dilExtraSkipPerS', 'dil steps/s', 2], ['replaysPerS', 'spec replays/s', 2],
+  ['commits', 'spec commits', 0], ['maxRewindMs', 'max rewind ms', 0], ['rewindClamped', 'rewind clamped', 0],
+  ['hits', 'hits', 0], ['fired', 'shots', 0],
+];
+function table(rows) {
+  const names = Object.keys(rows);
+  console.log('\n== feel summary (per client, averaged over 3 clients; jerk/extrap/hold per remote) ==');
+  const w = 14;
+  console.log('metric'.padEnd(14) + names.map((n) => n.padStart(w)).join(''));
+  for (const [k, label, d] of COLS) {
+    console.log(label.padEnd(14) + names.map((n) => fmt(rows[n][k], d).padStart(w)).join(''));
+  }
+}
+
 async function phase(label, secs, room, makeSocket) {
   const clients = [0, 1, 2].map((i) => new Client(i, room, makeSocket ? makeSocket(i) : undefined));
   for (const c of clients) await c.connect();
+  // let clock sync / buffers settle, then measure from a clean slate
+  await run(clients, 2);
+  for (const c of clients) resetMeasure(c);
+  await fetch(`http://localhost:${PORT}/status?reset=1`).catch(() => {});
+  const trace = args.includes('--trace') ? setInterval(async () => {
+    const r = (await status()).rooms.find((x) => x.name === room);
+    if (r) console.log('  trace', JSON.stringify(r.net.map(({ id, target, depth, dilation, starved, replays, dropCommit, dropTrim, dropped }) => ({ id, target, depth, dilation, starved, replays, dropCommit, dropTrim, dropped }))),
+      clients.map((c) => JSON.stringify(c.net.state.quality)).join(' '));
+  }, 2000) : null;
   await run(clients, secs);
+  if (trace) clearInterval(trace);
+  const st = await status();
+  const r = st.rooms.find((x) => x.name === room);
   report(label, clients);
-  return clients;
+  return { clients, serverNet: r ? r.net : [] };
+}
+
+function resetMeasure(c) {
+  const s = c.net.stats;
+  for (const k of Object.keys(s)) if (typeof s[k] === 'number' && k !== 'connects') s[k] = 0;
+  if (Array.isArray(s.ackDelays)) s.ackDelays.length = 0;   // (typed-array ring: ackDelayN reset above)
+  c.cont = { samples: 0, maxStep: 0, teleports: 0, jerks: 0, worst: null };
+  c.local.maxStep = 0; c.local.steps = 0; c.local.jerks = 0;
+  c.q = { n: 0, interp: 0, scale: 0, buf: 0, jitter: 0, scaleMin: 1, scaleMax: 1 };
+  for (const k of Object.keys(c.c)) if (typeof c.c[k] === 'number' && k !== 'welcome') c.c[k] = 0;
 }
 
 async function disconnect(clients, room) {
@@ -264,9 +416,13 @@ async function main() {
   const failures = [];
   const check = (cond, msg) => { if (!cond) failures.push(msg); console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
   const ROOM = `ctest${process.pid}`;
+  const rows = {};
+  const wanted = String(args.includes('--profiles') ? args[args.indexOf('--profiles') + 1] : 'p80,p180,p250').split(',').filter(Boolean);
 
   // ---------------- clean run
-  const clean = await phase(`clean local run (${CLEAN_S}s, 3 clients + bots, room ${ROOM})`, CLEAN_S, ROOM, null);
+  const cleanRun = await phase(`clean local run (${CLEAN_S}s, 3 clients + bots, room ${ROOM})`, CLEAN_S, ROOM, null);
+  const clean = cleanRun.clients;
+  rows.clean = feel(clean, CLEAN_S, cleanRun.serverNet);
   console.log('\nassertions (clean):');
   const ids = new Set(clean.map((c) => c.net.state.id));
   check(ids.size === 3 && clean.every((c) => c.net.state.roomName === ROOM), 'three clients joined the same private room with distinct ids');
@@ -283,6 +439,11 @@ async function main() {
   check(compared > 500, 'reconciliation compared predicted vs authoritative state for hundreds of snapshots');
   check(corr / Math.max(1, compared) < 0.03, 'prediction matched the server bit-for-bit on >97% of acked states (clean link)');
   check(sumErr / Math.max(1, compared) < 0.01, 'average prediction error after reconciliation < 1 cm');
+  const posCorr = clean.reduce((a, c) => a + (c.net.stats.corrPos ?? c.net.stats.corrections), 0);
+  check(posCorr === 0, `clean link: prediction bit-exact, 0 corrections from position error (${posCorr})`);
+  const QK = ['rttMs', 'jitterMs', 'interpDelayMs', 'timeScale', 'inputBufferTicks', 'corrections10s', 'starved10s'];
+  check(clean.every((c) => c.net.state.quality && QK.every((k) => Number.isFinite(c.net.state.quality[k]))),
+    'net.state.quality exposes rttMs, jitterMs, interpDelayMs, timeScale, inputBufferTicks, corrections10s, starved10s');
   check(clean.every((c) => c.local.maxStep < 0.6), 'rendered local position never jumps more than 0.6 m in a tick while alive (smoothed corrections)');
   check(clean.every((c) => c.cont.teleports === 0), 'remote interpolation is continuous while alive (no per-tick step > 1 m)');
   check(clean.every((c) => c.c.fired > 0 && c.net.stats.predictedShots > 0), 'every client fired predicted shots');
@@ -299,24 +460,33 @@ async function main() {
   check(clean.every((c) => c.net.state.status === 'closed' && c.c.closes.every((e) => !e.willRetry)), 'clean disconnect: sockets closed, no reconnect attempts');
   check(dc.roomGone, 'server destroyed the private room after all clients left');
 
-  // ---------------- lag run
-  const LAT = opt('lat', 40), JIT = opt('jit', 10), LOSS = opt('loss', 0.02);   // one-way, each direction
-  const ROOM2 = `ctestlag${process.pid}`;
-  const lags = [];
-  const lagClients = await phase(`lag run (${LAG_S}s, ${LAT} +- ${JIT} ms each way = ~${2 * LAT} +- ${2 * JIT} ms RTT, ${LOSS * 100}% binary loss each way)`,
-    LAG_S, ROOM2, (i) => { const l = laggySocket({ latency: LAT, jitter: JIT, loss: LOSS, seed: 99 + i }); lags.push(l); return l.factory; });
-  for (const l of lags) console.log(`  injected: up ${l.counts.up} sent / ${l.counts.upDropped} dropped, down ${l.counts.down} recv / ${l.counts.downDropped} dropped`);
-  console.log('\nassertions (lag):');
-  let lc = 0, lcorr = 0, lmax = 0, lsum = 0;
-  for (const c of lagClients) { const s = c.net.stats; lc += s.compared; lcorr += s.corrections; lmax = Math.max(lmax, s.maxError); lsum += s.sumError; }
-  console.log(`  prediction totals: ${lc} compared, ${lcorr} corrections (${fmt(100 * lcorr / Math.max(1, lc), 2)}%), max error ${fmt(lmax)} m, avg ${fmt(lsum / Math.max(1, lc), 6)} m`);
-  check(lagClients.every((c) => c.net.state.connected && c.net.state.ping > LAT * 1.5), 'clients stayed connected and measured the injected RTT');
-  check(lc > 200, 'reconciliation kept running under lag + loss');
-  check(lagClients.every((c) => c.local.maxStep < 1.0), 'rendered local position stays smooth under lag (no per-tick jump > 1 m)');
-  check(lagClients.every((c) => c.cont.teleports === 0), 'remote interpolation stays continuous under lag + loss');
-  check(lagClients.every((c) => c.c.fired > 0), 'clients kept firing under lag');
-  const dc2 = await disconnect(lagClients, ROOM2);
-  check(dc2.roomGone, 'lag room destroyed after disconnect');
+  // ---------------- lag profiles
+  for (const name of wanted) {
+    const prof = PROFILES[name];
+    if (!prof) { console.log(`unknown profile ${name}`); continue; }
+    const room = `ct${name}${process.pid}`;
+    const links = [];
+    const r = await phase(`profile ${name} (${LAG_S}s): ${prof.rtt} ms RTT +- ${prof.jitter}, ${prof.stall * 100}% TCP stalls per message each way`,
+      LAG_S, room, (i) => { const l = laggySocket(prof, 99 + i * 7 + prof.rtt); links.push(l); return l.factory; });
+    for (const l of links) console.log(`  injected: up ${l.up.msgs} msgs / ${l.up.stalls} stalls (${fmt(l.up.stalledMs / 1000, 1)} s), down ${l.down.msgs} msgs / ${l.down.stalls} stalls (${fmt(l.down.stalledMs / 1000, 1)} s)`);
+    const lc = r.clients;
+    rows[name] = feel(lc, LAG_S, r.serverNet);
+    console.log(`\nassertions (${name}):`);
+    check(lc.every((c) => c.net.state.connected && c.net.state.ping > prof.rtt * 0.75), `${name}: clients stayed connected and measured the injected RTT`);
+    check(lc.every((c) => c.net.stats.compared > 100), `${name}: reconciliation kept running`);
+    check(lc.every((c) => c.local.maxStep < 1.0), `${name}: rendered local position stays smooth (no per-tick jump > 1 m)`);
+    const f = rows[name];
+    check(f.remoteTeleports / (3 * LAG_S) < 0.1, `${name}: remote players rarely jump (${f.remoteTeleports} per-tick steps > 1 m in ${3 * LAG_S} client-seconds)`);
+    check(f.corrPosPerS < 0.5, `${name}: local corrections from position error < 0.5/s (${fmt(f.corrPosPerS, 2)}/s)`);
+    check(f.extrapPct < 35, `${name}: remotes rendered from real snapshots (not extrapolated) > 65% of the time (${fmt(f.extrapPct, 1)}% extrapolated)`);
+    check(f.timeScaleRange === null || (f.timeScaleRange[0] >= 0.97 - 1e-9 && f.timeScaleRange[1] <= 1.03 + 1e-9), `${name}: time dilation stayed within +-3%`);
+    check(lc.every((c) => c.c.fired > 0), `${name}: clients kept firing`);
+    const dc2 = await disconnect(lc, room);
+    check(dc2.roomGone, `${name}: room destroyed after disconnect`);
+  }
+  table(rows);
+  const jsonOut = args.includes('--json') ? args[args.indexOf('--json') + 1] : null;
+  if (jsonOut) (await import('node:fs')).writeFileSync(jsonOut, JSON.stringify(rows, null, 1));
 
   killServer();
   await sleep(300);
