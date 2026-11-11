@@ -126,6 +126,8 @@ if (ROOM && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
 // ------------------------------------------------------------------ menu flow
 function showMenu() {
   menuOpen = true;
+  // Refresh the server line when the menu reopens (it is not polled while idle).
+  if (server.state === 'online' && !server.pending && !net.state.connected && performance.now() - server.checkedAt > 15000) probeSoon(0);
   input.enabled = false;
   hud.showMenu({
     defaultName: playerName,
@@ -170,7 +172,7 @@ let reconnectInfo = null;
 // Free hosting tiers put the server to sleep when nobody is playing, and waking it takes up to
 // a minute. Probe /health so the menu and the in-game overlay can say what is going on. While
 // a match is running the same probe doubles as a light keep-alive.
-const server = { state: 'checking', since: performance.now(), humans: 0, pending: false, timer: null };
+const server = { state: 'checking', since: performance.now(), humans: 0, pending: false, timer: null, checkedAt: 0 };
 let wakeShown = false;
 let serverUiNext = 0;
 function setServerState(state) {
@@ -197,14 +199,17 @@ async function probeServer() {
     const wasDown = server.state !== 'online';
     setServerState('online');
     if (wasDown && started && !net.state.connected && net.state.status === 'reconnecting') net.retryNow();
-    next = net.state.connected ? 240000 : 20000;
+    server.checkedAt = performance.now();
+    // Keep-alive only while actually playing. An idle menu must not poll, or an open tab would
+    // stop a sleep-when-idle host from ever sleeping.
+    next = net.state.connected ? 240000 : 0;
   } catch {
     if (server.state !== 'waking') setServerState('waking');
   } finally {
     clearTimeout(slow);
     clearTimeout(kill);
     server.pending = false;
-    probeSoon(next);
+    if (next > 0) probeSoon(next);
   }
 }
 function updateServerUi(t) {

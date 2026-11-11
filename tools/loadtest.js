@@ -35,6 +35,10 @@ const PORT = parseInt(opt('port', process.env.PORT || '3101'), 10);
 const HOST = opt('host', 'localhost');
 const ROOM = opt('room', '');
 const SPAWN = opt('spawn', false) === true;
+// --url https://host targets a remote (TLS) server instead of --host/--port.
+const URL_OPT = opt('url', '');
+const BASE_HTTP = typeof URL_OPT === 'string' && URL_OPT ? URL_OPT.replace(/\/+$/, '') : `http://${HOST}:${PORT}`;
+const BASE_WS = BASE_HTTP.replace(/^http/, 'ws');
 const TICK_MS = 1000 / TICK_RATE;
 const INTERP_TICKS = INTERP_DELAY_MS / TICK_MS;
 
@@ -54,7 +58,7 @@ async function startServer() {
   serverProc.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
   serverProc.stdout.on('data', () => {});
   for (let i = 0; i < 100; i++) {
-    try { const r = await fetch(`http://${HOST}:${PORT}/status`); if (r.ok) return; } catch { /* not yet */ }
+    try { const r = await fetch(`${BASE_HTTP}/status`); if (r.ok) return; } catch { /* not yet */ }
     await sleep(100);
   }
   throw new Error('server did not start');
@@ -87,7 +91,7 @@ class Client {
 
   connect() {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://${HOST}:${PORT}/ws`, { perMessageDeflate: false });
+      const ws = new WebSocket(`${BASE_WS}/ws`, { perMessageDeflate: false });
       this.ws = ws;
       ws.binaryType = 'nodebuffer';
       ws.on('open', () => { this.send(encodeJoin(`load${this.i}`, ROOM || undefined)); });
@@ -169,7 +173,7 @@ function fmtRoom(r) {
 
 async function main() {
   if (SPAWN) await startServer();
-  console.log(`load test: ${CLIENTS} clients -> ws://${HOST}:${PORT}/ws, ${DURATION}s (+${WARMUP}s warm-up)`);
+  console.log(`load test: ${CLIENTS} clients -> ${BASE_WS}/ws, ${DURATION}s (+${WARMUP}s warm-up)`);
   const clients = [];
   for (let i = 0; i < CLIENTS; i++) {
     const c = new Client(i);
@@ -199,12 +203,12 @@ async function main() {
   }, 1000);
 
   await sleep(WARMUP * 1000);
-  await fetch(`http://${HOST}:${PORT}/status?reset=1`).then((r) => r.json());
+  await fetch(`${BASE_HTTP}/status?reset=1`).then((r) => r.json());
   for (const c of clients) for (const k of Object.keys(c.stats)) c.stats[k] = 0;
   const m0 = performance.now();
   await sleep(DURATION * 1000);
   const secs = (performance.now() - m0) / 1000;
-  const status = await fetch(`http://${HOST}:${PORT}/status`).then((r) => r.json());
+  const status = await fetch(`${BASE_HTTP}/status`).then((r) => r.json());
 
   clearInterval(pump);
   clearInterval(pinger);
