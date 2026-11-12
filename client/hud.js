@@ -186,8 +186,21 @@ export function createHud(rootEl, hudOpts = {}) {
   const wsBtns = Array.from(rootEl.querySelectorAll('.hs-ws'));
   for (const b of wsBtns) {
     // taps on the weapon bar must not reach the touch-controls layer underneath
-    b.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
-    b.addEventListener('click', (e) => { e.stopPropagation(); if (hudOpts.onWeapon) hudOpts.onWeapon(+b.dataset.slot); });
+    // Switch on pointerdown: phone browsers often never send a 'click' here, because the touch
+    // layer cancels touch defaults (and a finger that is also holding the stick or look pad makes
+    // it a multi-touch gesture). 'click' stays as the fallback for keyboard activation.
+    let handledAt = -1e9;
+    b.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      handledAt = e.timeStamp;
+      if (hudOpts.onWeapon) hudOpts.onWeapon(+b.dataset.slot);
+    });
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (e.timeStamp - handledAt < 800) return;
+      if (hudOpts.onWeapon) hudOpts.onWeapon(+b.dataset.slot);
+    });
   }
 
   // damage indicator pool
