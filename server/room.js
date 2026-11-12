@@ -60,6 +60,8 @@ const DILATION_GAIN = 12;                          // permille per tick of depth
 const DILATION_DEADBAND = 0.25;                    // ticks
 const BURST_GAP = 0.15;                            // ticks: arrivals closer than this are a burst tail
 const ARR_LEAK = 0.04;                             // leaky-min rise per tick (> max dilation)
+const REANCHOR_TICKS = 0.75;                       // every arrival in a control window later than this -> re-anchor
+const REANCHOR_MIN_SAMPLES = 8;                    // ...needs at least this many samples in the window
 const MOVE_BUTTONS = BTN.FORWARD | BTN.BACK | BTN.LEFT | BTN.RIGHT | BTN.JUMP | BTN.CROUCH | BTN.ADS;
 const SLOW_CLIENT_BYTES = 64 * 1024;               // skip snapshots while more than this is queued
 const DEAD_CLIENT_BYTES = 1024 * 1024;             // terminate above this
@@ -222,7 +224,7 @@ export class Room {
       specBase: createPlayerState(), specN: 0, commitN: 0, commitTick: 0,
       // adaptive target + dilation
       lat: new Float32Array(LAT_N), latHead: 0, latN: 0, lastArrAt: -1e9,
-      arrMinCur: 1e9, arrBucketAt: 0,
+      arrMinCur: 1e9, arrBucketAt: 0, latWinMin: 1e9, latWinN: 0,
       target: 2, depthAvg: 2, dilation: 0, starvedCounter: 0,
       // net stats (/status)
       starvedTotal: 0, cmdsDropped: 0, dropCommit: 0, dropTrim: 0, dropAlive: 0, specReplays: 0, specCommits: 0, rewindClamped: 0, shotsFired: 0, maxRewind: 0,
@@ -360,6 +362,8 @@ export class Room {
     const burst = T - p.lastArrAt < BURST_GAP;
     p.lastArrAt = T;
     if (burst) return;
+    if (d - base < p.latWinMin) p.latWinMin = d - base;
+    p.latWinN++;
     p.lat[p.latHead] = d - base;
     p.latHead = (p.latHead + 1) % LAT_N;
     if (p.latN < LAT_N) p.latN++;
@@ -491,6 +495,16 @@ export class Room {
 
   /** Once per QUEUE_WINDOW ticks: target from jitter, dilation from depth error, latency cap. */
   netControl(p) {
+    // Re-anchor the arrival baseline after a discontinuity. A client that froze (background tab,
+    // locked phone) drops its backlog, so every cmd afterwards is "late" by the frozen time. The
+    // leaky minimum alone needs 25x the freeze to catch up and would hold the target at its
+    // maximum (extra input delay) all that time. If even the earliest arrival of a whole window
+    // was late, the baseline is stale: move it and start the jitter statistics afresh.
+    if (p.latWinN >= REANCHOR_MIN_SAMPLES && p.latWinMin > REANCHOR_TICKS) {
+      p.arrMinCur += p.latWinMin;
+      p.latN = 0; p.latHead = 0;
+    }
+    p.latWinMin = 1e9; p.latWinN = 0;
     this.updateTarget(p);
     const err = p.target - p.depthAvg;
     let dil = 0;

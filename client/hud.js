@@ -1,10 +1,16 @@
 // Hopshot HUD: pure DOM/CSS. Styles live in client/style.css (classes prefixed "hs-").
 // update(state) is called every frame and only touches the DOM when a value actually changed.
 
-// opts for createHud(rootEl, opts): { touch: bool, onScoreboardClose() }
+import { createLoadoutEditor } from './loadout-ui.js';
+
+// opts for createHud(rootEl, opts): { touch: bool, onScoreboardClose(), onWeapon(slot) }
 // Extra methods beyond the base contract: setPrefs(settings) (crosshair, stats line), setInGame(bool)
 // (rotate hint), showMenu({ ..., inGame, tab }) -> the menu is a two-pane card (play column +
-// Settings / Friends / Controls tabs) that fits a 640x360 landscape phone.
+// Loadout / Settings / Friends / Controls tabs) that fits a 640x360 landscape phone.
+// Weapons: update(state) takes state.slots = [{ name, att }] x3 + state.slot (active) for the weapon
+// bar, state.scope (0 none | 1 optic | 2 sniper scope overlay), state.crossGap (px) for the crosshair
+// bloom. showMenu({ loadout: { saved, onChange({code, builds}) } }); setLoadoutStatus({ pendingCode,
+// activeCode, joined }) keeps the "applies on your next spawn" line honest.
 
 const MAX_FEED = 6;
 const FEED_MS = 5500;
@@ -57,7 +63,7 @@ export function createHud(rootEl, hudOpts = {}) {
     <div class="hs-dmg-wrap"></div>
     <div class="hs-cross"><i class="t"></i><i class="b"></i><i class="l"></i><i class="r"></i><i class="d"></i></div>
     <div class="hs-hit"><i></i><i></i><i></i><i></i></div>
-    <div class="hs-scope"><div class="ring"></div><div class="h"></div><div class="v"></div></div>
+    <div class="hs-scope" data-k="0"><div class="ring"></div><div class="h"></div><div class="v"></div><div class="opt"><i></i></div></div>
 
     <div class="hs-topleft"><span class="hs-fps"></span><span class="hs-ping"></span><span class="hs-q"></span><span class="hs-pl"></span></div>
     <div class="hs-topcenter">
@@ -67,6 +73,11 @@ export function createHud(rootEl, hudOpts = {}) {
     <div class="hs-feed"></div>
     <div class="hs-status"></div>
 
+    <div class="hs-wbar" role="toolbar" aria-label="Weapons">
+      <button type="button" class="hs-ws" data-slot="0"><em>1</em><b></b><small></small></button>
+      <button type="button" class="hs-ws" data-slot="1"><em>2</em><b></b><small></small></button>
+      <button type="button" class="hs-ws" data-slot="2"><em>3</em><b></b><small></small></button>
+    </div>
     <div class="hs-bl">
       <div class="hs-health"><div class="hs-hnum">100</div><div class="hs-hlabel">HEALTH</div>
         <div class="hs-hbar"><div class="fill"></div></div></div>
@@ -116,11 +127,13 @@ export function createHud(rootEl, hudOpts = {}) {
       </div>
       <div class="hs-side">
         <div class="hs-tabs" role="tablist">
+          <button type="button" role="tab" data-tab="loadout">Loadout</button>
           <button type="button" role="tab" data-tab="settings">Settings</button>
           <button type="button" role="tab" data-tab="friends">Friends</button>
           <button type="button" role="tab" data-tab="keys">Controls</button>
         </div>
         <div class="hs-tabbody">
+          <section class="hs-pane" data-pane="loadout"><div class="hs-loadout"></div></section>
           <section class="hs-pane hs-settings" data-pane="settings"></section>
           <section class="hs-pane hs-friends" data-pane="friends">
             <div class="hs-ftitle">Play with friends</div>
@@ -168,8 +181,14 @@ export function createHud(rootEl, hudOpts = {}) {
     score: $('.hs-score'), scoreBody: $('.hs-score tbody'),
     round: $('.hs-round'), roundBody: $('.hs-round tbody'), winner: $('.hs-winner'), next: $('.hs-next'),
     menu: $('.hs-menu'), name: $('.hs-name'), play: $('.hs-play'),
-    rotate: $('.hs-rotate'), rotateGo: $('.hs-rgo'),
+    rotate: $('.hs-rotate'), rotateGo: $('.hs-rgo'), card: $('.hs-card'), wbar: $('.hs-wbar'),
   };
+  const wsBtns = Array.from(rootEl.querySelectorAll('.hs-ws'));
+  for (const b of wsBtns) {
+    // taps on the weapon bar must not reach the touch-controls layer underneath
+    b.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); if (hudOpts.onWeapon) hudOpts.onWeapon(+b.dataset.slot); });
+  }
 
   // damage indicator pool
   const dmgEls = [];
@@ -183,6 +202,7 @@ export function createHud(rootEl, hudOpts = {}) {
   let dmgNext = 0;
 
   const last = {};
+  let gapSm = 7;
   function setText(key, node, value) {
     if (last[key] !== value) { last[key] = value; node.textContent = value; }
   }
@@ -209,15 +229,37 @@ export function createHud(rootEl, hudOpts = {}) {
   function update(s) {
     const alive = s.alive !== false;
     const ads = s.ads || 0;
-    const scoped = ads > 0.85 && s.weaponKey === 'scout';
+    const kind = alive ? (s.scope | 0) : 0;      // 0 none, 1 optic reticle, 2 sniper scope
+    const scoped = kind > 0;
 
     setCls('alive', rootEl, 'hs-dead', !alive);
-    setCls('scoped', rootEl, 'hs-scoped', scoped && alive);
+    setCls('scoped', rootEl, 'hs-scoped', scoped);
     // crosshair: fades out as you aim down sights, hidden when scoped
     const crossOp = !alive || scoped ? 0 : 1 - ads * 0.65;
     const cq = Math.round(crossOp * 100) / 100;
     if (last.cross !== cq) { last.cross = cq; el.cross.style.opacity = cq; }
-    if (last.scopeop !== (scoped && alive)) { last.scopeop = scoped && alive; el.scope.style.opacity = scoped && alive ? 1 : 0; }
+    if (last.scopek !== kind) {
+      last.scopek = kind;
+      if (kind > 0) el.scope.dataset.k = String(kind);
+      el.scope.style.opacity = kind > 0 ? 1 : 0;
+    }
+    // crosshair gap follows the real spread (hip vs aimed, bloom while spraying), smoothed
+    if (s.crossGap != null) {
+      gapSm += (s.crossGap - gapSm) * 0.4;
+      const gq = Math.round(gapSm * 2) / 2;
+      if (last.gap !== gq) { last.gap = gq; el.cross.style.setProperty('--g', gq + 'px'); }
+    }
+
+    if (s.slots) {
+      for (let i = 0; i < 3; i++) {
+        const sl = s.slots[i];
+        if (!sl) continue;
+        const b = wsBtns[i];
+        setText('wsn' + i, b.children[1], sl.name);
+        setText('wsa' + i, b.children[2], sl.att > 0 ? '+' + sl.att : '');
+        setCls('wson' + i, b, 'on', i === s.slot);
+      }
+    }
 
     const hp = Math.max(0, Math.min(100, Math.round(s.health == null ? 100 : s.health)));
     setText('hp', el.hnum, String(hp));
@@ -258,7 +300,7 @@ export function createHud(rootEl, hudOpts = {}) {
     const row = document.createElement('div');
     row.className = 'hs-kill' + (k.localInvolved ? ' me' : '');
     const kn = document.createElement('b'); kn.textContent = k.killerName || '';
-    const wp = document.createElement('span'); wp.className = 'wp'; wp.textContent = String(k.weaponKey || '').toUpperCase();
+    const wp = document.createElement('span'); wp.className = 'wp'; wp.textContent = String(k.weaponName || k.weaponKey || '').toUpperCase();
     const vn = document.createElement('b'); vn.textContent = k.victimName || '';
     row.appendChild(kn); row.appendChild(wp);
     if (k.headshot) { const h = document.createElement('i'); h.className = 'hs'; h.title = 'Headshot'; row.appendChild(h); }
@@ -407,12 +449,21 @@ export function createHud(rootEl, hudOpts = {}) {
   }
   buildSettings();
 
+  // ---- loadout editor (the Loadout tab) ----
+  const editor = createLoadoutEditor($('.hs-loadout'), {
+    onChange(v) { if (menuCb && menuCb.loadout && menuCb.loadout.onChange) menuCb.loadout.onChange(v); },
+    onPlay() { play(); },
+  });
+  function setLoadoutStatus(st) { editor.setStatus(st); }
+
   // ---- tabs ----
   const tabBtns = Array.from(rootEl.querySelectorAll('.hs-tabs button'));
   const panes = Array.from(rootEl.querySelectorAll('.hs-pane'));
   let curTab = 'settings';
   function setTab(name) {
     curTab = name;
+    el.card.classList.toggle('lo-mode', name === 'loadout');
+    if (name === 'loadout') editor.refresh();
     for (const b of tabBtns) { const on = b.dataset.tab === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); }
     for (const p of panes) p.classList.toggle('on', p.dataset.pane === name);
   }
@@ -426,6 +477,8 @@ export function createHud(rootEl, hudOpts = {}) {
     for (const k in ctl) if (st[k] !== undefined) setControl(k, st[k]);
     applyPrefs(st);
     el.play.textContent = menuCb.inGame ? 'RESUME' : 'PLAY';
+    editor.setPlayLabel(el.play.textContent);
+    if (menuCb.loadout) { editor.setState(menuCb.loadout.saved); if (menuCb.loadout.status) editor.setStatus(menuCb.loadout.status); }
     applyRoom(menuCb.room);
     setTab(menuCb.tab || curTab);
     el.menu.classList.add('on');
@@ -542,5 +595,5 @@ export function createHud(rootEl, hudOpts = {}) {
     el.status.classList.toggle('on', !!text);
   }
 
-  return { update, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, showRoundEnd, hideRoundEnd, setStatus };
+  return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, showRoundEnd, hideRoundEnd, setStatus };
 }

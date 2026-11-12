@@ -5,11 +5,17 @@
 // lock needed - for automated browsers), ?touch=1 (force the on-screen touch controls, e.g. to
 // drive them with a mouse on a desktop; ?touch=0 forces them off). Debug surface: window.__hopshot.
 //
-// Layout of this file: settings -> modules -> menu flow -> server wake/probe -> game events ->
-// simulation (simTick) -> frame loop (runFrame: assists, sim, render, HUD) -> debug surface.
+// Layout of this file: settings -> modules -> loadout -> menu flow -> server wake/probe -> game
+// events -> simulation (simTick) -> frame loop (runFrame: assists, sim, render, HUD) -> debug surface.
+//
+// Weapons: every per-player number comes from net.kit (the ACTIVE loadout of the current life):
+// net.kit.slots[slot] = effective stats (mag size, ADS fov, spread, reload / swap ticks), .guns[slot] =
+// gun id, .masks[slot] = attachment mask. Aim progress is net.localView().aim (0..1) - never a timer
+// here. The menu's Loadout tab edits the PENDING loadout (net.setLoadout), which applies at the next spawn.
+// ?randlo=1 (autoplay) re-rolls a random loadout on every death, to exercise all six guns.
 
 import { TICK_RATE, BTN, RESPAWN_MS } from '../shared/constants.js';
-import { WEAPONS } from '../shared/weapons.js';
+import { GUNS, currentSpread, popcount6, SLOT_COUNT } from '../shared/weapons.js';
 import { MAP } from '../shared/map.js';
 import { createWorld, eyeHeight } from '../shared/physics.js';
 import { TICK_MS, SHOT } from '../shared/protocol.js';
@@ -18,10 +24,10 @@ import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
 import { createInput, createAutopilot, wrapAngle, detectTouch } from './input.js';
 import { createNet } from './net.js';
+import { normalizeSaved } from './loadout-ui.js';
 
 const MAX_CATCHUP_TICKS = 6;           // at most this many sim ticks per frame
 const RESYNC_MS = 250;                 // a frame gap longer than this drops the backlog
-const ADS_TIME = 0.14;                 // s to fully aim down sights
 const STEP_DIST = 2.3;                 // m of ground travel per footstep sound
 
 // ------------------------------------------------------------------ settings / params
@@ -29,6 +35,7 @@ const params = new URLSearchParams(location.search);
 const AUTOPLAY = params.get('autoplay') === '1' || params.get('autoplay') === 'true';
 const ROOM = (params.get('room') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
 // Bot fill level for a private room (0 = no bots). Undefined = server default.
+const RANDLO = params.get('randlo') === '1';
 const ROOM_BOTS = ROOM && params.has('bots') ? num(params.get('bots'), 0, 0, 20) | 0 : undefined;
 
 function load(key, def) {
@@ -81,6 +88,7 @@ if (IS_TOUCH) document.documentElement.classList.add('touch');
 const renderer = createRenderer(canvas, MAP, { quality: settings.quality, touch: IS_TOUCH });
 const hud = createHud(hudRoot, {
   touch: IS_TOUCH,
+  onWeapon(slot) { input.weapon = slot; },
   onScoreboardClose() { scoreboardHeld = false; input.setScoreboardActive(false); input.state.scoreboard = false; },
 });
 const audio = createAudio();
@@ -121,6 +129,26 @@ const onResize = () => renderer.resize(window.innerWidth, window.innerHeight);
 window.addEventListener('resize', onResize);
 window.addEventListener('orientationchange', () => setTimeout(onResize, 200));
 onResize();
+
+// ------------------------------------------------------------------ loadout
+// Saved as { code, builds } (loadout-ui.js). net remembers the pending loadout and sends it with
+// every join; changes while connected go to the server immediately but only apply at the next spawn.
+let savedLoadout = normalizeSaved(load('hopshot.loadout', null));
+net.setLoadout(savedLoadout.code);
+function loadoutStatus() {
+  const L = net.state.loadout;
+  return { pendingCode: L.pendingCode, activeCode: L.activeCode, joined: started && net.state.connected };
+}
+net.on('loadout', () => hud.setLoadoutStatus(loadoutStatus()));
+function randomLoadoutCode() {
+  let code = 0;
+  for (let s = 0; s < SLOT_COUNT; s++) {
+    let mask = 0;
+    for (let i = 0; i < 6; i++) if (Math.random() < 0.45) mask |= 1 << i;
+    code |= ((Math.random() < 0.5 ? 0 : 1) | (mask << 1)) << (8 * s);
+  }
+  return code;     // net.setLoadout sanitises it (3-attachment limit)
+}
 
 // ------------------------------------------------------------------ private rooms / invites
 function roomQuery(code, bots) {
@@ -178,6 +206,16 @@ function showMenu() {
     room: roomMenu,
     inGame: started,
     tab: menuShown++ === 0 && ROOM ? 'friends' : undefined,
+    loadout: {
+      saved: savedLoadout,
+      status: loadoutStatus(),
+      onChange(v) {
+        savedLoadout = v;
+        save('hopshot.loadout', v);
+        net.setLoadout(v.code);
+        hud.setLoadoutStatus(loadoutStatus());
+      },
+    },
     onPlay(name) {
       playerName = String(name || 'Player').slice(0, 16);
       save('hopshot.name', playerName);
@@ -288,6 +326,7 @@ function updateServerUi(t) {
 probeServer();
 
 net.on('status', (s, extra) => {
+  hud.setLoadoutStatus(loadoutStatus());
   if (s === 'connected') { setServerState('online'); probeSoon(240000); }
   else if (s === 'reconnecting' && server.state === 'online' && !server.pending) { setServerState('checking'); probeSoon(0); }
   if (s === 'connecting' || s === 'joining') setStatus(net.stats.connects ? 'Reconnecting...' : 'Connecting...');
@@ -319,16 +358,20 @@ net.on('spawn', (m) => {
 net.on('kill', (m) => {
   counters.kills++;
   const me = net.state.id;
-  const w = WEAPONS[m.weapon] || WEAPONS[0];
+  const g = GUNS[m.gun] || GUNS[(m.weapon | 0) * 2] || GUNS[0];
   const env = !m.killer;     // fell out of the map / world kill
   hud.addKill({
     killerName: env ? nameOf(m.victim) : nameOf(m.killer),
     victimName: env ? '' : nameOf(m.victim),
-    weaponKey: env ? 'fell' : w.key,
+    weaponKey: env ? 'fell' : g.key,
+    weaponName: env ? 'fell' : g.name,
     headshot: !!m.headshot,
     localInvolved: m.killer === me || m.victim === me,
   });
-  if (m.victim === me) { counters.localDeaths++; audio.play('death'); }
+  if (m.victim === me) {
+    counters.localDeaths++; audio.play('death');
+    if (RANDLO) net.setLoadout(randomLoadoutCode());
+  }
 });
 net.on('hit', (m) => {
   counters.hits++;
@@ -372,12 +415,13 @@ net.on('shots', (shots) => {
     counters.remoteShots++;
     if (!net.remoteEye(s.shooter, shotFrom)) continue;
     shotTo[0] = s.x; shotTo[1] = s.y; shotTo[2] = s.z;
-    renderer.tracer(shotFrom, shotTo, { local: false });
+    const gun = s.gun >= 0 && s.gun < GUNS.length ? s.gun : (s.weapon | 0) * 2;
+    renderer.tracer(shotFrom, shotTo, { local: false, gun });
     if (s.kind !== SHOT.MISS) renderer.impact(shotTo, s.normal, { flesh: s.kind === SHOT.BODY || s.kind === SHOT.HEAD });
     if (!seenShooter.has(s.shooter)) {
       seenShooter.add(s.shooter);
       renderer.remoteFire(s.shooter);
-      audio.play((WEAPONS[s.weapon] || WEAPONS[0]).key, { pos: shotFrom.slice(), volume: 0.9 });
+      audio.play(GUNS[gun].key, { pos: shotFrom.slice(), volume: 0.9 });
     }
   }
 });
@@ -394,7 +438,8 @@ function scoreRows() {
 // ------------------------------------------------------------------ simulation
 const cmdInput = { buttons: 0, yaw: 0, pitch: 0, weapon: 0 };
 const local = { alive: false, x: 0, y: 0, z: 0, eyeHeight: 1.62, yaw: 0, pitch: 0, vx: 0, vy: 0, vz: 0,
-  onGround: true, crouching: false, sliding: false, weapon: 0, ads: 0, reloading: false };
+  onGround: true, crouching: false, sliding: false, weapon: 0, gun: 0, aim: 0, ads: 0, reloading: false,
+  att: 0, adsFov: 90, swapDur: 0.3, reloadP: 0, scopeKind: 0 };
 const frame = { dt: 0, time: 0, local, players: [] };
 let stepAcc = 0;
 let adsHeld = false;
@@ -406,7 +451,7 @@ function simTick() {
     const p = net.pred, w = net.predWeapon;
     const o = autopilot.update({
       world, self: p, alive: net.state.alive, remotes: frame.players,
-      weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: WEAPONS[w.weapon].magSize,
+      weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: net.kit.slots[w.weapon].magSize, auto: net.kit.slots[w.weapon].auto,
     });
     input.yaw = o.yaw; input.pitch = o.pitch; input.weapon = o.weapon;
     buttons = o.buttons;
@@ -426,16 +471,20 @@ function simTick() {
 // Side effects of the FIRST (live) prediction of a tick only - replays never get here.
 function liveEffects(fx) {
   if (fx.fired) {
-    renderer.localFire(fx.weapon);
-    audio.play(WEAPONS[fx.weapon].key, { volume: 0.75 });
+    const eff = net.kit.slots[fx.weapon];
+    renderer.localFire(fx.gun, net.kit.masks[fx.weapon], eff.fireTicks / TICK_RATE);
+    audio.play(GUNS[fx.gun].key, { volume: 0.75 });
     for (let k = 0; k < fx.shotCount; k++) {
       const s = fx.shots[k];
-      renderer.tracer(s.from, s.to, { local: true });
+      renderer.tracer(s.from, s.to, { local: true, gun: fx.gun });
       if (s.kind !== SHOT.MISS) renderer.impact(s.to, s.hasNormal ? s.normal : null, { flesh: s.kind === SHOT.BODY || s.kind === SHOT.HEAD });
     }
   }
   if (fx.switched) audio.play('switch', { volume: 0.6 });
-  if (fx.reloadStart) audio.play('reload', { volume: 0.7 });
+  if (fx.reloadStart) {
+    const e = net.kit.slots[net.predWeapon.weapon];
+    audio.play('reload_' + (e.cls === 'assault' ? 'rifle' : e.cls), { volume: 0.7, dur: e.reloadTicks / TICK_RATE, pitch: e.gun === 1 ? 1.2 : e.gun === 3 ? 0.8 : 1 });
+  }
   if (fx.empty) audio.play('empty', { volume: 0.7 });
   if (fx.jumped) audio.play('jump', { volume: 0.5 });
   if (fx.landed && fx.landSpeed > 3) audio.play('land', { volume: Math.min(1, 0.3 + fx.landSpeed / 20) });
@@ -491,7 +540,7 @@ function runFrame() {
     if (connected && input.enabled) {
       const pw = net.predWeapon;
       input.applyAssist(dt, { world, self: net.pred, alive: net.state.alive, remotes: frame.players,
-        weapon: pw.weapon, ammo: pw.ammo[pw.weapon], reloading: pw.reload > 0, ads: local.ads,
+        weapon: pw.weapon, ammo: pw.ammo[pw.weapon], reloading: pw.reload > 0, ads: local.ads, range: net.kit.slots[pw.weapon].range,
         aimAssist: settings.aimAssist, autoFire: settings.autoFire });
     } else { input.state.autoFire = false; input.state.assistSlow = 1; }
   }
@@ -511,12 +560,20 @@ function runFrame() {
   if (!connected) local.alive = false;
   local.yaw = input.yaw;
   local.pitch = input.pitch;
-  const adsTarget = adsHeld && local.alive && !local.reloading ? 1 : 0;
-  local.ads += Math.max(-dt / ADS_TIME, Math.min(dt / ADS_TIME, adsTarget - local.ads));
-  if (!local.alive) local.ads = 0;
-  const w = WEAPONS[local.weapon] || WEAPONS[0];
+  // aim comes from the weapon state (net.localView -> local.aim 0..1), so it follows each gun's and
+  // attachment's real aim time; a little smoothing hides the 60 Hz stepping on fast displays
+  const kit = net.kit;
+  const eff = kit.slots[local.weapon] || kit.slots[0];
+  input.kit = kit;
+  local.ads = local.alive ? local.ads + (local.aim - local.ads) * (1 - Math.exp(-dt * 45)) : 0;
+  local.att = kit.masks[local.weapon] | 0;
+  local.adsFov = eff.adsFov;
+  local.swapDur = eff.swapTicks / TICK_RATE;
+  const pw0 = net.predWeapon;
+  local.reloadP = pw0.reload > 0 ? 1 - pw0.reload / eff.reloadTicks : 0;
+  local.scopeKind = eff.cls === 'sniper' ? 2 : (local.att & 1) ? 1 : 0;
   // keep the on-screen sensitivity constant while zoomed
-  const zoom = Math.tan((w.adsFov * Math.PI) / 360) / Math.tan((settings.fov * Math.PI) / 360);
+  const zoom = Math.tan((eff.adsFov * Math.PI) / 360) / Math.tan((settings.fov * Math.PI) / 360);
   input.adsScale = 1 + (zoom * settings.adsSens - 1) * local.ads;
 
   frame.dt = dt;
@@ -528,14 +585,17 @@ function runFrame() {
   updateHud(t);
 }
 
-const hudState = { alive: true, health: 100, ammo: 0, magSize: 0, weaponKey: 'rifle', weaponName: 'Rifle', reloading: false,
+const hudSlots = [{ name: '', att: 0 }, { name: '', att: 0 }, { name: '', att: 0 }];
+const hudState = { alive: true, health: 100, ammo: 0, magSize: 0, weaponKey: 'maul', weaponName: 'Maul', reloading: false,
+  slots: hudSlots, slot: 0, scope: 0, crossGap: 7,
   ads: 0, speed: 0, kills: 0, deaths: 0, roundTimeLeft: 0, respawnIn: 0, ping: 0, fps: 60, players: 0 };
 let sbNext = 0;
 
 function updateHud(t) {
   const s = net.state;
   const pw = net.predWeapon;
-  const w = WEAPONS[pw.weapon] || WEAPONS[0];
+  const kit = net.kit;
+  const w = kit.slots[pw.weapon] || kit.slots[0];
   const st = net.serverTick(t);
   const me = s.roster.get(s.id);
   hudState.alive = s.connected ? s.alive : true;
@@ -544,6 +604,16 @@ function updateHud(t) {
   hudState.magSize = w.magSize;
   hudState.weaponKey = w.key;
   hudState.weaponName = w.name;
+  hudState.slot = pw.weapon;
+  for (let i = 0; i < SLOT_COUNT; i++) { hudSlots[i].name = kit.slots[i].name; hudSlots[i].att = popcount6(kit.masks[i]); }
+  // scope overlay: a sniper rifle or any gun with the optic, once (nearly) fully aimed and not reloading
+  hudState.scope = s.alive && local.ads > 0.85 && pw.reload === 0 ? local.scopeKind : 0;
+  // crosshair gap = real spread (hip vs aimed blend + recoil bloom) projected to screen pixels
+  {
+    const fovR = renderer.getCamera().fov * Math.PI / 180;
+    const px = Math.tan(currentSpread(w, pw)) * (window.innerHeight / 2) / Math.tan(fovR / 2) / settings.crosshairSize;
+    hudState.crossGap = Math.max(2.5, Math.min(90, px));
+  }
   hudState.reloading = pw.reload > 0;
   hudState.ads = local.ads;
   hudState.speed = Math.hypot(local.vx, local.vz);
@@ -612,7 +682,11 @@ window.__hopshot = {
   get settings() { return { ...settings }; },
   get quality() { return renderer.getQuality(); },
   get tags() { return renderer.tagDebug(); },
-  renderer,
+  renderer, audio,
+  get kit() { return net.kit; },
+  get loadout() { return { saved: savedLoadout, ...net.state.loadout }; },
+  get hudState() { return hudState; },
+  setLoadout(v) { net.setLoadout(v); },
   get counters() { return { ...counters, predictedShots: net.stats.predictedShots, frameErrors: errors }; },
   get round() { return { ...net.state.round }; },
   net, input,

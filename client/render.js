@@ -1,11 +1,11 @@
 // Hopshot renderer: low-poly flat-shaded look, merged static map, instanced characters,
-// pooled tracers / sparks, first-person box viewmodels. No allocations inside render().
+// pooled tracers / sparks, first-person box viewmodels (client/gunmodels.js). No allocations inside render().
 //
 // Draw calls (typical frame): sky 1, skyline 1, clouds 1, map 1, blob shadows 1, characters 1,
 // name tags 1, tracers 1, sparks 1, viewmodel 3-4 (body, mag, pump, flash)  => about 13.
 
 import * as THREE from 'three';
-import { WEAPONS } from '../shared/weapons.js';
+import { buildViewmodel, buildThird, TP_PARTS, TRACER_STYLE } from './gunmodels.js';
 
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -63,11 +63,21 @@ function accToGeometry(acc) {
   return g;
 }
 
-// parts: [cx, cy, cz, sx, sy, sz, hex]
+// parts: [cx, cy, cz, sx, sy, sz, hex, rotX?]  (rotX rolls the box around its own X axis)
 function partsGeometry(parts) {
   const acc = newAcc();
   for (const p of parts) {
+    const v0 = acc.pos.length;
     addBox(acc, p[0] - p[3] / 2, p[1] - p[4] / 2, p[2] - p[5] / 2, p[0] + p[3] / 2, p[1] + p[4] / 2, p[2] + p[5] / 2, p[6], {});
+    if (p[7]) {
+      const c = Math.cos(p[7]), sn = Math.sin(p[7]);
+      for (let i = v0; i < acc.pos.length; i += 3) {
+        const y = acc.pos[i + 1] - p[1], z = acc.pos[i + 2] - p[2];
+        acc.pos[i + 1] = p[1] + y * c - z * sn; acc.pos[i + 2] = p[2] + y * sn + z * c;
+        const ny = acc.nor[i + 1], nz = acc.nor[i + 2];
+        acc.nor[i + 1] = ny * c - nz * sn; acc.nor[i + 2] = ny * sn + nz * c;
+      }
+    }
   }
   return accToGeometry(acc);
 }
@@ -112,83 +122,11 @@ function flashTexture() {
   return t;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Viewmodel part lists (model space: -Z forward, +X right, +Y up; origin on the sight line)
-// ---------------------------------------------------------------------------------------------
-const SKIN = 0xf0c8a0, SLEEVE = 0x2f4a73;
-function arms(rz, lz) {
-  return [
-    [0.03, -0.13, rz, 0.075, 0.075, 0.085, SKIN],             // right glove (grip)
-    [0.07, -0.2, rz + 0.3, 0.085, 0.085, 0.5, SLEEVE],        // right forearm
-    [-0.02, -0.105, lz, 0.075, 0.07, 0.1, SKIN],              // left glove (fore-end)
-    [-0.11, -0.19, lz + 0.3, 0.085, 0.085, 0.5, SLEEVE],      // left forearm
-  ];
-}
-
-const VM_DEFS = [
-  { // rifle
-    body: [
-      [0, -0.055, 0.0, 0.07, 0.07, 0.36, 0x39414f],
-      [0, -0.095, -0.27, 0.06, 0.05, 0.22, 0xf28c38],
-      [0, -0.048, -0.4, 0.026, 0.026, 0.3, 0x1c2029],
-      [0, -0.012, -0.5, 0.012, 0.022, 0.012, 0x101318],
-      [0, -0.012, 0.09, 0.034, 0.02, 0.012, 0x101318],
-      [0, -0.033, 0.0, 0.03, 0.012, 0.26, 0x252a34],
-      [0, -0.075, 0.3, 0.055, 0.1, 0.26, 0x39414f],
-      [0, -0.14, 0.09, 0.05, 0.11, 0.05, 0x1c2029],
-      ...arms(0.09, -0.26),
-    ],
-    mag: [[0, -0.16, -0.05, 0.05, 0.14, 0.075, 0xf2c744]],
-    muzzle: [0, -0.048, -0.58], hip: [0.22, -0.2, -0.46], ads: [0, 0, -0.36],
-    recoil: 1.0, camKick: 0.003, flash: 0.2,
-  },
-  { // scout
-    body: [
-      [0, -0.055, 0.0, 0.06, 0.07, 0.42, 0x5e4334],
-      [0, -0.05, -0.54, 0.028, 0.028, 0.66, 0x1c2029],
-      [0, -0.05, -0.9, 0.05, 0.05, 0.07, 0x2b303b],
-      [0, 0.022, -0.02, 0.05, 0.05, 0.3, 0x20242d],      // scope tube
-      [0, 0.022, -0.17, 0.062, 0.062, 0.04, 0x20242d],
-      [0, 0.022, 0.14, 0.058, 0.058, 0.035, 0x20242d],
-      [0, 0.022, -0.192, 0.045, 0.045, 0.006, 0x66ccff],
-      [0, -0.012, -0.1, 0.02, 0.03, 0.03, 0x20242d],
-      [0, -0.012, 0.08, 0.02, 0.03, 0.03, 0x20242d],
-      [0.045, -0.035, 0.1, 0.05, 0.014, 0.014, 0xd9d9d9],  // bolt handle
-      [0, -0.085, 0.36, 0.055, 0.12, 0.3, 0x5e4334],
-      [0, -0.14, 0.1, 0.05, 0.1, 0.05, 0x1c2029],
-      ...arms(0.1, -0.32),
-    ],
-    mag: [[0, -0.12, 0.0, 0.04, 0.07, 0.09, 0x2fb5a8]],
-    muzzle: [0, -0.05, -0.96], hip: [0.23, -0.2, -0.42], ads: [0, -0.022, -0.3],
-    recoil: 2.6, camKick: 0.02, flash: 0.3,
-  },
-  { // shotgun
-    body: [
-      [0, -0.065, 0.02, 0.08, 0.085, 0.38, 0x7a3b2a],
-      [0, -0.036, -0.4, 0.05, 0.05, 0.52, 0x2a2f38],
-      [0, -0.09, -0.36, 0.036, 0.036, 0.44, 0x3a3f48],
-      [0, -0.006, -0.64, 0.012, 0.014, 0.012, 0xf2c744],
-      [0, -0.088, 0.31, 0.062, 0.11, 0.26, 0x7a3b2a],
-      [0, -0.145, 0.1, 0.05, 0.1, 0.05, 0x2a2f38],
-      ...arms(0.1, -0.33),
-    ],
-    mag: [[0.06, -0.07, -0.02, 0.04, 0.04, 0.12, 0xe0483c], [0.06, -0.07, 0.1, 0.04, 0.04, 0.12, 0xe0483c]],
-    pump: [[0, -0.1, -0.3, 0.075, 0.065, 0.17, 0xf28c38]],
-    muzzle: [0, -0.036, -0.68], hip: [0.23, -0.21, -0.44], ads: [0, -0.012, -0.38],
-    recoil: 2.2, camKick: 0.025, flash: 0.34,
-  },
-];
-
-// Third-person weapon dims in the arm frame: body width/len/height, barrel width/len, colours.
-const TP_WEAPONS = [
-  { bw: 0.1, bl: 0.45, bh: 0.14, rw: 0.04, rl: 0.3, body: 0x39414f, barrel: 0x1c2029 },
-  { bw: 0.08, bl: 0.55, bh: 0.12, rw: 0.035, rl: 0.5, body: 0x5e4334, barrel: 0x1c2029 },
-  { bw: 0.12, bl: 0.45, bh: 0.15, rw: 0.06, rl: 0.35, body: 0x7a3b2a, barrel: 0x2a2f38 },
-];
-
-const PARTS = 11, MAXP = 32;
+// per player: 2 legs, torso, head, visor, 2 arms, TP_PARTS gun boxes, backpack, muzzle flash
+const MAXP = 32;
 const P_LEGL = 0, P_LEGR = 1, P_TORSO = 2, P_HEAD = 3, P_VISOR = 4, P_ARML = 5, P_ARMR = 6,
-  P_GUN = 7, P_BARREL = 8, P_PACK = 9, P_FLASH = 10;
+  P_GUN = 7, P_PACK = 7 + TP_PARTS, P_FLASH = 8 + TP_PARTS;
+const PARTS = 9 + TP_PARTS;
 const SKIN_TONES = [0xf3d2b3, 0xe0b08a, 0xb98260, 0x8d5b3f, 0xf0c8a0, 0xd9a47a];
 
 // opts = { quality: 'low'|'medium'|'high', touch: bool }. Anti-aliasing is fixed when the WebGL
@@ -327,7 +265,8 @@ export function createRenderer(canvas, map, opts = {}) {
   scene.add(shadows);
 
   const slotId = new Int32Array(MAXP).fill(-1);
-  const slotWeapon = new Int8Array(MAXP).fill(-1);
+  const slotWeapon = new Int16Array(MAXP).fill(-1);      // gun * 64 + attachment mask of the gun in hand
+  const slotThird = new Array(MAXP).fill(null);          // buildThird() result for that gun
   const slotName = new Array(MAXP).fill('');
   const slotSeen = new Float64Array(MAXP);
   const prevX = new Float32Array(MAXP), prevZ = new Float32Array(MAXP);
@@ -354,7 +293,7 @@ export function createRenderer(canvas, map, opts = {}) {
   const hsl = new THREE.Color();
   function setCol(i, part, hex) { _col.setHex(hex); chars.setColorAt(i * PARTS + part, _col); }
   function assignSlot(i, p) {
-    slotId[i] = p.id; slotWeapon[i] = -1; slotName[i] = '';
+    slotId[i] = p.id; slotWeapon[i] = -1; slotThird[i] = null; slotName[i] = '';
     prevX[i] = p.x; prevZ[i] = p.z; speedSm[i] = 0; phase[i] = 0;
     crouchSm[i] = 0; slideSm[i] = 0; deadT[i] = 0; flashT[i] = 0;
     const h = (Math.abs(p.id) * 0.61803398875) % 1;
@@ -369,10 +308,14 @@ export function createRenderer(canvas, map, opts = {}) {
     tagDirty = true;
     tagAlpha[i] = 0; tagVis[i] = -1;
   }
-  function setWeaponLook(i, w) {
-    slotWeapon[i] = w;
-    const t = TP_WEAPONS[w] || TP_WEAPONS[0];
-    setCol(i, P_GUN, t.body); setCol(i, P_BARREL, t.barrel);
+  function setWeaponLook(i, key) {
+    slotWeapon[i] = key;
+    const t = buildThird(key >> 6, key & 63);
+    slotThird[i] = t;
+    for (let k = 0; k < TP_PARTS; k++) {
+      const part = t.parts[k];
+      if (part) setCol(i, P_GUN + k, part[6]);
+    }
     chars.instanceColor.needsUpdate = true;
   }
 
@@ -461,7 +404,7 @@ export function createRenderer(canvas, map, opts = {}) {
   const tr = {
     a: new Float32Array(MAXT * 3), d: new Float32Array(MAXT * 3), dist: new Float32Array(MAXT),
     age: new Float32Array(MAXT), life: new Float32Array(MAXT), len: new Float32Array(MAXT),
-    width: new Float32Array(MAXT), local: new Uint8Array(MAXT), on: new Uint8Array(MAXT), next: 0,
+    width: new Float32Array(MAXT), cr: new Float32Array(MAXT), cg: new Float32Array(MAXT), cb: new Float32Array(MAXT), local: new Uint8Array(MAXT), on: new Uint8Array(MAXT), next: 0,
   };
   const trPos = new Float32Array(MAXT * 12), trCol = new Float32Array(MAXT * 12);
   const trGeo = new THREE.BufferGeometry();
@@ -505,7 +448,18 @@ export function createRenderer(canvas, map, opts = {}) {
   vmScene.add(vmRoot);
   const vmMat = new THREE.MeshLambertMaterial({ vertexColors: true });
   const flashTex = flashTexture();
-  const vm = VM_DEFS.map((def) => {
+  const flashMat = new THREE.MeshBasicMaterial({
+    map: flashTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, opacity: 0,
+  });
+  const flashGeo = new THREE.PlaneGeometry(1, 1);
+  // One viewmodel per (gun, attachment mask) in use, built on first need (4 meshes: body, mag, pump,
+  // flash). At most VM_KEEP stay cached; older ones lose their geometry.
+  const VM_KEEP = 8;
+  const vmCache = new Map();
+  function getVm(key) {
+    let v = vmCache.get(key);
+    if (v) { vmCache.delete(key); vmCache.set(key, v); return v; }     // refresh LRU order
+    const def = buildViewmodel(key >> 6, key & 63);
     const group = new THREE.Group();
     const body = new THREE.Mesh(partsGeometry(def.body), vmMat);
     group.add(body);
@@ -513,23 +467,33 @@ export function createRenderer(canvas, map, opts = {}) {
     if (mag) group.add(mag);
     const pump = def.pump ? new THREE.Mesh(partsGeometry(def.pump), vmMat) : null;
     if (pump) group.add(pump);
-    const flash = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
-      map: flashTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, opacity: 0,
-    }));
+    const flash = new THREE.Mesh(flashGeo, flashMat.clone());
     flash.position.set(def.muzzle[0], def.muzzle[1], def.muzzle[2] - 0.04);
     flash.visible = false; flash.renderOrder = 10;
     group.add(flash);
     group.visible = false;
     vmRoot.add(group);
-    return { def, group, body, mag, pump, flash };
-  });
+    v = { key, def, group, body, mag, pump, flash };
+    vmCache.set(key, v);
+    if (vmCache.size > VM_KEEP) {
+      for (const [k, old] of vmCache) {
+        if (k === key || k === vmKey) continue;
+        vmRoot.remove(old.group);
+        old.body.geometry.dispose(); if (old.mag) old.mag.geometry.dispose(); if (old.pump) old.pump.geometry.dispose();
+        old.flash.material.dispose();
+        vmCache.delete(k);
+        break;
+      }
+    }
+    return v;
+  }
 
   // ---- state ----
   let baseFov = 90, W = 1, H = 1;
-  let vmWeapon = 0, vmLower = 0;
-  let recoil = 0, camKick = 0, flashLeft = 0, flashScale = 1, flashRotZ = 0, flashWeapon = 0, pumpKick = 0;
+  let vmKey = 0, vmLower = 0;       // viewmodel on screen (gun * 64 + mask) and how far it is lowered (0 up .. 1 away)
+  let recoil = 0, camKick = 0, flashLeft = 0, flashScale = 1, flashRotZ = 0, flashKey = 0, cycleT = 9, cycleDur = 0.5;
   let sway = 0, swayP = 0, prevYaw = 0, prevPitch = 0, havePrev = false;
-  let bobPhase = 0, reloadT = 0, reloadSm = 0, slideSmL = 0;
+  let bobPhase = 0, reloadSm = 0, slideSmL = 0;
   let prevGround = true, lastAirVy = 0, dip = 0, roll = 0, fovKick = 0, deadTime = 0, lastAds = 0;
   let frameNo = 0;
 
@@ -555,19 +519,22 @@ export function createRenderer(canvas, map, opts = {}) {
   }
   function getQuality() { return quality; }
 
-  function localFire(weaponId) {
-    const v = vm[weaponId] || vm[0];
+  // gun = gun id, mask = its attachment mask, fireSec = seconds until the next shot (drives pump / bolt)
+  function localFire(gun, mask, fireSec) {
+    const key = ((gun | 0) >= 0 && (gun | 0) < 6 ? (gun | 0) : 0) * 64 + ((mask | 0) & 63);
+    const v = getVm(key);
     recoil = Math.min(recoil + 0.3 * v.def.recoil, 1.6);
     camKick += v.def.camKick;
-    flashLeft = 0.055; flashWeapon = weaponId;
+    flashLeft = 0.055; flashKey = key;
     flashScale = v.def.flash * (0.8 + Math.random() * 0.5);
     flashRotZ = Math.random() * TAU;
-    if (v.pump) pumpKick = 1;
+    cycleT = 0; cycleDur = Math.max(0.12, +fireSec || 0.5);
   }
   function remoteFire(playerId) {
     for (let i = 0; i < slotCount; i++) if (slotId[i] === playerId) { flashT[i] = 0.06; flashRot[i] = Math.random(); return; }
   }
   function tracer(from, to, opts) {
+    const st = TRACER_STYLE[opts && opts.gun >= 0 && opts.gun < 6 ? opts.gun | 0 : 0];
     const i = tr.next; tr.next = (i + 1) % MAXT;
     const local = !!(opts && opts.local);
     let ax = from[0], ay = from[1], az = from[2];
@@ -581,9 +548,10 @@ export function createRenderer(canvas, map, opts = {}) {
     const inv = 1 / dist;
     tr.a[i * 3] = ax; tr.a[i * 3 + 1] = ay; tr.a[i * 3 + 2] = az;
     tr.d[i * 3] = dx * inv; tr.d[i * 3 + 1] = dy * inv; tr.d[i * 3 + 2] = dz * inv;
-    tr.dist[i] = dist; tr.age[i] = 0; tr.len[i] = Math.min(9, dist);
+    tr.dist[i] = dist; tr.age[i] = 0; tr.len[i] = Math.min(9 * st[1], dist);
+    tr.cr[i] = st[2]; tr.cg[i] = st[3]; tr.cb[i] = st[4];
     tr.life[i] = Math.min(0.3, (dist + tr.len[i]) / 380);
-    tr.width[i] = local ? 0.022 : 0.04; tr.local[i] = local ? 1 : 0; tr.on[i] = 1;
+    tr.width[i] = (local ? 0.022 : 0.04) * st[0]; tr.local[i] = local ? 1 : 0; tr.on[i] = 1;
   }
   function impact(pos, normal, opts) {
     const flesh = !!(opts && opts.flesh);
@@ -604,7 +572,6 @@ export function createRenderer(canvas, map, opts = {}) {
 
   // -------------------------------------------------------------------------------------------
   function updateCamera(L, dt) {
-    const w = WEAPONS[L.weapon] || WEAPONS[0];
     const yaw = L.yaw, pitch = L.pitch;
     const sy = Math.sin(yaw), cy = Math.cos(yaw);
     const hspeed = Math.hypot(L.vx, L.vz);
@@ -627,7 +594,7 @@ export function createRenderer(canvas, map, opts = {}) {
     const kickT = L.alive ? clamp((hspeed - 7) / 9, 0, 1) * 7 * (1 - L.ads) + (L.sliding ? 2 : 0) : 0;
     fovKick += (kickT - fovKick) * Math.min(1, dt * 6);
     const ads = L.ads * L.ads * (3 - 2 * L.ads);
-    camera.fov = lerp(baseFov, w.adsFov, ads) + fovKick;
+    camera.fov = lerp(baseFov, L.adsFov || baseFov, ads) + fovKick;
     camera.updateProjectionMatrix();
 
     camKick *= Math.exp(-dt * 10);
@@ -657,16 +624,25 @@ export function createRenderer(canvas, map, opts = {}) {
     clouds.position.set(camera.position.x, 0, camera.position.z);
   }
 
+  let curVm = null;
   function updateViewmodel(L, dt) {
-    const target = L.weapon | 0;
-    if (vmWeapon !== target) {
-      vmLower += dt / 0.1;
-      if (vmLower >= 1) { vmLower = 1; vmWeapon = target; }
-    } else if (vmLower > 0) vmLower = Math.max(0, vmLower - dt / 0.2);
-    for (let i = 0; i < vm.length; i++) vm[i].group.visible = i === vmWeapon;
+    const g = (L.gun | 0) >= 0 && (L.gun | 0) < 6 ? L.gun | 0 : 0;
+    const wantKey = g * 64 + ((L.att | 0) & 63);
+    // weapon swap: lower the old gun, then raise the new one; durations come from the kit (swap ticks)
+    const swapDur = Math.max(0.16, +L.swapDur || 0.3);
+    if (!L.alive) { vmKey = wantKey; vmLower = 0; }
+    else if (vmKey !== wantKey) {
+      vmLower += dt / (0.4 * swapDur);
+      if (vmLower >= 1) { vmLower = 1; vmKey = wantKey; }
+    } else if (vmLower > 0) vmLower = Math.max(0, vmLower - dt / (0.6 * swapDur));
 
-    const v = vm[vmWeapon] || vm[0], def = v.def;
-    const hidden = !L.alive || (vmWeapon === 1 && L.ads > 0.6);
+    const v = curVm && curVm.key === vmKey ? curVm : getVm(vmKey), def = v.def;
+    if (curVm !== v) {
+      if (curVm) { curVm.group.visible = false; curVm.flash.visible = false; }
+      v.group.visible = true; curVm = v;
+      cycleT = 9;
+    }
+    const hidden = !L.alive || (L.scopeKind > 0 && L.ads > 0.6 && !L.reloading);
     vmRoot.visible = !hidden;
 
     // look sway (lags behind view rotation)
@@ -686,11 +662,12 @@ export function createRenderer(canvas, map, opts = {}) {
     const bp = bobPhase;
     slideSmL += ((L.sliding ? 1 : 0) - slideSmL) * Math.min(1, dt * 9);
 
-    if (L.reloading) reloadT += dt; else reloadT = 0;
+    // reload progress 0..1 comes from the weapon state (so it follows this gun's / attachments' reload time)
+    const rp = L.reloading ? clamp(L.reloadP || 0, 0, 1) : 0;
     reloadSm += ((L.reloading ? 1 : 0) - reloadSm) * Math.min(1, dt * 9);
 
     recoil *= Math.exp(-dt * 11);
-    pumpKick = Math.max(0, pumpKick - dt * 2.2);
+    cycleT += dt;
 
     const air = L.onGround ? 0 : clamp(L.vy * 0.004, -0.03, 0.03);
     let px = lerp(def.hip[0], def.ads[0], ads) + sway + Math.cos(bp) * 0.008 * bobAmt - slideSmL * 0.06;
@@ -703,30 +680,33 @@ export function createRenderer(canvas, map, opts = {}) {
       sway * 1.2 + reloadSm * 0.35 + slideSmL * 0.45 + Math.sin(bp) * 0.012 * bobAmt,
     );
 
-    // mag swap while reloading, pump action
+    // magazine / drum comes out and goes back in; shotgun shells jiggle one by one
     if (v.mag) {
-      const t = clamp((reloadT - 0.3) / 0.5, 0, 1);
-      const out = reloadT > 0 ? Math.sin(t * Math.PI) : 0;
-      v.mag.position.set(0, -out * 0.16, 0);
-      if (vmWeapon === 2) v.mag.position.set(0, Math.sin(reloadT * 12) * 0.01 * reloadSm, 0);
+      if (def.style === 'shell') v.mag.position.set(0, Math.sin(rp * 5 * TAU) * 0.012 * reloadSm, 0);
+      else {
+        const t = clamp((rp - 0.2) / 0.55, 0, 1);
+        v.mag.position.set(0, -Math.sin(t * Math.PI) * 0.16 * (rp > 0 ? 1 : 0), 0);
+      }
     }
+    // pump forend / bolt handle: slides during the fire cycle, works again at the end of a reload
     if (v.pump) {
-      const fireSlide = pumpKick > 0 ? Math.sin(clamp((1 - pumpKick) * 1.6, 0, 1) * Math.PI) * 0.1 : 0;
-      v.pump.position.z = fireSlide + (reloadT > 0 ? Math.sin(reloadT * 10) * 0.03 : 0);
+      const p = clamp(cycleT / cycleDur, 0, 1);
+      let slide = 0;
+      if (cycleT < cycleDur) slide = def.cyc === 'bolt' ? Math.sin(clamp((p - 0.12) / 0.62, 0, 1) * Math.PI) * 0.075 : Math.sin(clamp((p - 0.2) / 0.6, 0, 1) * Math.PI) * 0.1;
+      if (rp > 0) slide += def.cyc === 'bolt' ? Math.sin(clamp((rp - 0.82) / 0.16, 0, 1) * Math.PI) * 0.075 : Math.sin(rp * 5 * TAU) * 0.03;
+      v.pump.position.z = slide;
     }
 
     // muzzle flash
-    for (let i = 0; i < vm.length; i++) vm[i].flash.visible = false;
     if (flashLeft > 0) {
       flashLeft -= dt;
-      const f = vm[flashWeapon];
-      if (f && flashWeapon === vmWeapon) {
-        f.flash.visible = true;
-        f.flash.material.opacity = clamp(flashLeft / 0.055, 0, 1);
-        f.flash.scale.set(flashScale, flashScale, 1);
-        f.flash.rotation.z = flashRotZ;
+      if (flashKey === vmKey) {
+        v.flash.visible = true;
+        v.flash.material.opacity = clamp(flashLeft / 0.055, 0, 1);
+        v.flash.scale.set(flashScale, flashScale, 1);
+        v.flash.rotation.z = flashRotZ;
       }
-    }
+    } else if (v.flash.visible) v.flash.visible = false;
   }
 
   function updateCharacters(frame, dt) {
@@ -742,7 +722,8 @@ export function createRenderer(canvas, map, opts = {}) {
     for (let i = 0; i < n; i++) {
       const p = players[i];
       if (slotId[i] !== p.id) assignSlot(i, p);
-      if (slotWeapon[i] !== p.weapon) setWeaponLook(i, p.weapon in TP_WEAPONS ? p.weapon : 0);
+      const gkey = ((p.gun | 0) >= 0 && (p.gun | 0) < 6 ? (p.gun | 0) : 0) * 64 + ((p.att | 0) & 63);
+      if (slotWeapon[i] !== gkey) setWeaponLook(i, gkey);
       if (slotName[i] !== p.name) { slotName[i] = p.name; drawTag(i, p); }
 
       crouchSm[i] += ((p.crouching ? 1 : 0) - crouchSm[i]) * k;
@@ -785,11 +766,15 @@ export function createRenderer(canvas, map, opts = {}) {
       const armRx = Math.PI / 2 + p.pitch + lean - 0.05;
       pivot(mP, mTorso, 0.32, 0.52, 0, armRx, 0);
       put(b + P_ARMR, mP, 0, -0.26, 0, 0.13, 0.52, 0.13);
-      const t = TP_WEAPONS[slotWeapon[i]] || TP_WEAPONS[0];
-      put(b + P_GUN, mP, -0.1, -(0.3 + t.bl / 2), -0.02, t.bw, t.bl, t.bh);
-      put(b + P_BARREL, mP, -0.1, -(0.3 + t.bl + t.rl / 2), -0.02, t.rw, t.rl, t.rw);
+      // gun boxes in the arm frame: forward = -y (distance gf from the shoulder), up = -z
+      const t = slotThird[i] || buildThird(0, 0);
+      for (let k = 0; k < TP_PARTS; k++) {
+        const g = t.parts[k];
+        if (g) put(b + P_GUN + k, mP, g[0] - 0.1, -g[2], -g[1] - 0.02, g[3], g[5], g[4]);
+        else put(b + P_GUN + k, mP, 0, 0, 0, 0.0001, 0.0001, 0.0001);
+      }
       const fs = flashT[i] > 0 ? (0.18 + flashRot[i] * 0.14) : 0.0001;
-      put(b + P_FLASH, mP, -0.1, -(0.3 + t.bl + t.rl + 0.1), -0.02, fs, fs, fs);
+      put(b + P_FLASH, mP, -0.1, -(t.muzzle + 0.1), -0.02, fs, fs, fs);
       pivot(mP, mTorso, -0.32, 0.52, 0, armRx, -1.0);
       put(b + P_ARML, mP, 0, -0.26, 0, 0.13, 0.52, 0.13);
 
@@ -833,7 +818,7 @@ export function createRenderer(canvas, map, opts = {}) {
       }
     }
     for (let i = n; i < MAXP; i++) {
-      if (slotId[i] !== -1) { slotId[i] = -1; slotName[i] = ''; slotWeapon[i] = -1; }
+      if (slotId[i] !== -1) { slotId[i] = -1; slotName[i] = ''; slotWeapon[i] = -1; slotThird[i] = null; }
     }
     // free the leftover slots visually
     tagPos.fill(0, n * 12);
@@ -871,7 +856,7 @@ export function createRenderer(canvas, map, opts = {}) {
       trPos[o + 3] = tx + sx; trPos[o + 4] = ty + sy; trPos[o + 5] = tz + sz;
       trPos[o + 6] = hx - sx; trPos[o + 7] = hy - sy; trPos[o + 8] = hz - sz;
       trPos[o + 9] = hx + sx; trPos[o + 10] = hy + sy; trPos[o + 11] = hz + sz;
-      const r = tr.local[i] ? 1.0 : 1.0, g = tr.local[i] ? 0.85 : 0.7, bl = tr.local[i] ? 0.45 : 0.35;
+      const r = tr.cr[i], g = tr.cg[i] * (tr.local[i] ? 1.0 : 0.85), bl = tr.cb[i] * (tr.local[i] ? 1.0 : 0.8);
       trCol[o] = r * 0.05; trCol[o + 1] = g * 0.05; trCol[o + 2] = bl * 0.05;
       trCol[o + 3] = r * 0.05; trCol[o + 4] = g * 0.05; trCol[o + 5] = bl * 0.05;
       trCol[o + 6] = r; trCol[o + 7] = g; trCol[o + 8] = bl;

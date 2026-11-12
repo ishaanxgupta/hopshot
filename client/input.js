@@ -80,6 +80,7 @@ export function createInput(canvas, opts = {}) {
     autoPulse: false,
     assistSlow: 1,    // look-speed multiplier while the crosshair is near an enemy (touch aim assist)
     touchSens: 1,
+    kit: null,        // weapons.getKit(...) of the current life (so semi/auto is the real gun's)
     lookDYaw: 0, lookDPitch: 0,   // look deltas accumulated since the last applyAssist (rad)
   };
   let lastWheel = 0;
@@ -190,7 +191,8 @@ export function createInput(canvas, opts = {}) {
     if (st.enabled && st.autoFire) {
       // semi-automatic weapons need a release between shots: pulse the trigger every other tick
       st.autoPulse = !st.autoPulse;
-      const w = WEAPONS[st.weapon] || WEAPONS[0];
+      // the gun in hand decides (st.kit = the player's active kit, set by main.js)
+      const w = (st.kit && st.kit.slots[st.weapon]) || WEAPONS[st.weapon] || WEAPONS[0];
       if (w.auto || st.autoPulse) b |= BTN.FIRE;
     }
     st.latched = 0;
@@ -236,6 +238,7 @@ export function createInput(canvas, opts = {}) {
     get weapon() { return st.weapon; }, set weapon(v) { setWeapon(v | 0); },
     get enabled() { return st.enabled; }, set enabled(v) { st.enabled = !!v; if (!v) clear(); if (touchUi) touchUi.setVisible(st.enabled); },
     get touch() { return st.touch; },
+    get kit() { return st.kit; }, set kit(v) { st.kit = v || null; },
     get invertY() { return st.invertY; }, set invertY(v) { st.invertY = !!v; },
     configureTouch(c) { if (touchUi) touchUi.configure(c); },
     setScoreboardActive(v) { if (touchUi) touchUi.setScoreboardActive(v); },
@@ -274,7 +277,7 @@ export function createAssist() {
     if ((wantAim || wantFire) && c.alive && c.self && c.remotes) {
       const s = c.self, ex = s.x, ey = s.y + eyeHeight(s), ez = s.z;
       const w = WEAPONS[c.weapon | 0] || WEAPONS[0];
-      const maxD = Math.min(90, w.range);
+      const maxD = Math.min(90, c.range || w.range);
       const cp = Math.cos(c.pitch);
       let bestScore = 1e9;
       for (let i = 0; i < c.remotes.length; i++) {
@@ -610,7 +613,8 @@ export function createAutopilot(opts = {}) {
       const aimErr = Math.abs(wrapAngle(wantYaw - out.yaw)) + Math.abs(wantPitch - out.pitch);
       if (aimErr < 0.06) {
         const w = WEAPONS[ctx.weapon | 0] || WEAPONS[0];
-        firePulse = w.auto ? true : !firePulse;          // semi-autos need a release between shots
+        const auto = ctx.auto !== undefined ? !!ctx.auto : w.auto;
+        firePulse = auto ? true : !firePulse;          // semi-autos need a release between shots
         if (firePulse) b |= BTN.FIRE;
         if (h > 18) b |= BTN.ADS;
       }

@@ -1,14 +1,19 @@
 // Hopshot audio: every sound is synthesised with WebAudio (no files).
 // Positional sounds use manual distance attenuation + stereo pan + distance low-pass.
 
-export const SOUND_NAMES = ['rifle', 'scout', 'shotgun', 'reload', 'empty', 'switch', 'hit', 'headshot', 'kill',
-  'hurt', 'death', 'jump', 'land', 'slide', 'step'];
+// Fire sounds are named after the guns (shared/weapons.js GUNS[].key); 'rifle' / 'scout' / 'shotgun'
+// are the old slot names and play the slot's first gun. Reload sounds take opts.dur (seconds) so the
+// click-clack timeline stretches over this gun's real reload time.
+export const GUN_SOUNDS = ['maul', 'vireo', 'kestrel', 'halberd', 'breaker', 'squall'];
+export const SOUND_NAMES = [...GUN_SOUNDS, 'rifle', 'scout', 'shotgun', 'reload', 'reload_rifle', 'reload_sniper', 'reload_shotgun',
+  'bolt', 'pump', 'empty', 'switch', 'hit', 'headshot', 'kill', 'hurt', 'death', 'jump', 'land', 'slide', 'step'];
 
 export function createAudio() {
   let ctx = null, master = null, noiseBuf = null;
   let volume = 0.7;
   let lx = 0, ly = 0, lz = 0, lyaw = 0;
   let active = 0;
+  let PM = 1;                // pitch multiplier for the voice being built (reload family)
   const MAX_VOICES = 28;
 
   function ensure() {
@@ -47,8 +52,8 @@ export function createAudio() {
     src.buffer = noiseBuf; src.loop = true;
     const f = ctx.createBiquadFilter();
     f.type = type; f.Q.value = q;
-    f.frequency.setValueAtTime(f0, t);
-    if (f1 !== f0) f.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    f.frequency.setValueAtTime(f0 * PM, t);
+    if (f1 !== f0) f.frequency.exponentialRampToValueAtTime(Math.max(20, f1 * PM), t + dur);
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t);
     g.gain.linearRampToValueAtTime(gain, t + attack);
@@ -60,8 +65,8 @@ export function createAudio() {
   function tone(o, t, dur, { type = 'sine', f0 = 440, f1 = f0, gain = 0.4, attack = 0.002, curve = 3 } = {}) {
     const osc = ctx.createOscillator();
     osc.type = type;
-    osc.frequency.setValueAtTime(f0, t);
-    if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    osc.frequency.setValueAtTime(f0 * PM, t);
+    if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f1 * PM), t + dur);
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t);
     g.gain.linearRampToValueAtTime(gain, t + attack);
@@ -70,31 +75,97 @@ export function createAudio() {
     osc.start(t); osc.stop(t + dur + 0.05);
   }
 
+  // a bolt-action cycle: lift, pull back, push forward, lock. k scales loudness.
+  function bolt(o, t, k) {
+    noise(o, t, 0.04, { f0: 2200, q: 4, gain: 0.35 * k }); tone(o, t, 0.04, { type: 'square', f0: 300, f1: 200, gain: 0.07 * k });
+    noise(o, t + 0.09, 0.1, { f0: 700, f1: 1200, q: 1.5, gain: 0.14 * k, attack: 0.03 });
+    noise(o, t + 0.2, 0.05, { f0: 1600, q: 4, gain: 0.4 * k }); tone(o, t + 0.2, 0.05, { f0: 140, f1: 90, gain: 0.2 * k });
+    noise(o, t + 0.28, 0.05, { f0: 2400, q: 4, gain: 0.45 * k }); tone(o, t + 0.28, 0.06, { type: 'square', f0: 260, f1: 160, gain: 0.08 * k });
+  }
+  // a pump-action rack: forend back, forend forward
+  function pump(o, t, k) {
+    noise(o, t, 0.06, { f0: 1100, f1: 700, q: 2.5, gain: 0.5 * k }); tone(o, t, 0.06, { type: 'square', f0: 200, f1: 120, gain: 0.1 * k });
+    noise(o, t + 0.13, 0.07, { f0: 1900, f1: 1300, q: 3, gain: 0.55 * k }); tone(o, t + 0.13, 0.07, { f0: 130, f1: 70, gain: 0.3 * k });
+  }
+
   const SOUNDS = {
-    rifle(o, t) {
-      noise(o, t, 0.1, { f0: 2400, f1: 900, q: 0.7, gain: 0.7, curve: 4 });
-      noise(o, t, 0.035, { type: 'highpass', f0: 4500, gain: 0.35 });
-      tone(o, t, 0.12, { f0: 190, f1: 55, gain: 0.8, curve: 4 });
+    // ---- guns: each has its own weight, pitch and tail
+    maul(o, t) {      // heavy battle rifle: deep thump, mid bark, short rumble
+      noise(o, t, 0.13, { f0: 1700, f1: 520, q: 0.7, gain: 0.8, curve: 4 });
+      noise(o, t, 0.04, { type: 'highpass', f0: 3800, gain: 0.3 });
+      tone(o, t, 0.16, { f0: 150, f1: 42, gain: 1.0, curve: 4 });
+      tone(o, t, 0.09, { type: 'sawtooth', f0: 210, f1: 90, gain: 0.16, curve: 4 });
+      noise(o, t + 0.06, 0.14, { type: 'lowpass', f0: 700, f1: 200, gain: 0.18 });
     },
-    scout(o, t) {
-      noise(o, t, 0.4, { type: 'lowpass', f0: 4200, f1: 300, q: 0.5, gain: 1.0, curve: 4 });
-      noise(o, t, 0.05, { type: 'highpass', f0: 3000, gain: 0.5 });
-      tone(o, t, 0.34, { f0: 130, f1: 35, gain: 1.0, curve: 4 });
-      tone(o, t + 0.01, 0.5, { type: 'triangle', f0: 1500, f1: 1400, gain: 0.07, curve: 5 });
-      noise(o, t + 0.11, 0.35, { type: 'lowpass', f0: 1200, f1: 250, gain: 0.25, curve: 3 }); // echo tail
+    vireo(o, t) {     // light carbine: bright, snappy tick
+      noise(o, t, 0.07, { f0: 3400, f1: 1500, q: 0.9, gain: 0.55, curve: 4 });
+      noise(o, t, 0.025, { type: 'highpass', f0: 6000, gain: 0.32 });
+      tone(o, t, 0.07, { f0: 300, f1: 105, gain: 0.55, curve: 4 });
+      tone(o, t, 0.03, { type: 'square', f0: 1900, f1: 1200, gain: 0.05, curve: 4 });
     },
-    shotgun(o, t) {
-      noise(o, t, 0.28, { type: 'lowpass', f0: 3200, f1: 250, q: 0.5, gain: 1.0, curve: 4 });
+    kestrel(o, t) {   // light bolt-action: sharp crack, medium boom, echo, then the bolt
+      noise(o, t, 0.3, { type: 'lowpass', f0: 4800, f1: 400, q: 0.5, gain: 0.85, curve: 4 });
+      noise(o, t, 0.04, { type: 'highpass', f0: 3600, gain: 0.55 });
+      tone(o, t, 0.24, { f0: 175, f1: 48, gain: 0.85, curve: 4 });
+      tone(o, t + 0.005, 0.4, { type: 'triangle', f0: 1700, f1: 1500, gain: 0.06, curve: 5 });
+      noise(o, t + 0.1, 0.3, { type: 'lowpass', f0: 1400, f1: 300, gain: 0.2, curve: 3 });
+      bolt(o, t + 0.5, 1.0);
+    },
+    halberd(o, t) {   // heavy rifle: huge low boom, long tail, slow bolt
+      noise(o, t, 0.6, { type: 'lowpass', f0: 3600, f1: 160, q: 0.5, gain: 1.1, curve: 4 });
+      noise(o, t, 0.06, { type: 'highpass', f0: 2400, gain: 0.55 });
+      tone(o, t, 0.6, { f0: 100, f1: 24, gain: 1.2, curve: 4 });
+      tone(o, t, 0.2, { type: 'sawtooth', f0: 140, f1: 50, gain: 0.2, curve: 4 });
+      noise(o, t + 0.14, 0.6, { type: 'lowpass', f0: 900, f1: 150, gain: 0.3, curve: 3 });
+      noise(o, t + 0.3, 0.45, { type: 'lowpass', f0: 500, f1: 120, gain: 0.14, curve: 3 });
+      bolt(o, t + 0.8, 0.8);
+    },
+    breaker(o, t) {   // pump shotgun: wide blast, then the pump racks
+      noise(o, t, 0.3, { type: 'lowpass', f0: 3200, f1: 230, q: 0.5, gain: 1.0, curve: 4 });
       noise(o, t, 0.05, { type: 'highpass', f0: 2500, gain: 0.5 });
-      tone(o, t, 0.28, { f0: 110, f1: 32, gain: 1.0, curve: 4 });
-      noise(o, t + 0.07, 0.2, { type: 'lowpass', f0: 900, f1: 200, gain: 0.2 });
+      tone(o, t, 0.3, { f0: 112, f1: 32, gain: 1.0, curve: 4 });
+      noise(o, t + 0.07, 0.22, { type: 'lowpass', f0: 900, f1: 200, gain: 0.2 });
+      pump(o, t + 0.36, 1.0);
     },
-    reload(o, t) {
-      noise(o, t, 0.05, { f0: 900, q: 3, gain: 0.5 }); tone(o, t, 0.05, { type: 'square', f0: 220, f1: 140, gain: 0.12 });
-      noise(o, t + 0.55, 0.06, { f0: 1300, q: 3, gain: 0.55 }); tone(o, t + 0.55, 0.08, { f0: 120, f1: 70, gain: 0.35 });
-      noise(o, t + 1.1, 0.04, { f0: 2800, q: 4, gain: 0.5 });
-      noise(o, t + 1.18, 0.05, { f0: 2000, q: 4, gain: 0.55 });
-      tone(o, t + 1.18, 0.05, { type: 'square', f0: 330, f1: 200, gain: 0.1 });
+    squall(o, t) {    // auto shotgun: short, punchy pops with a metallic rattle
+      noise(o, t, 0.13, { type: 'lowpass', f0: 2600, f1: 320, q: 0.6, gain: 0.85, curve: 4 });
+      noise(o, t, 0.03, { type: 'highpass', f0: 3000, gain: 0.4 });
+      tone(o, t, 0.13, { f0: 150, f1: 48, gain: 0.85, curve: 4 });
+      tone(o, t + 0.01, 0.06, { type: 'square', f0: 700, f1: 420, gain: 0.07, curve: 4 });
+    },
+    // old slot names
+    rifle(o, t, op) { SOUNDS.maul(o, t, op); },
+    scout(o, t, op) { SOUNDS.kestrel(o, t, op); },
+    shotgun(o, t, op) { SOUNDS.breaker(o, t, op); },
+
+    // ---- handling
+    bolt(o, t) { bolt(o, t, 1); },
+    pump(o, t) { pump(o, t, 1); },
+    reload(o, t, op) { SOUNDS.reload_rifle(o, t, op); },
+    reload_rifle(o, t, op) {      // mag out, mag in, charging handle
+      const d = Math.max(0.5, (op && op.dur) || 2.2);
+      noise(o, t + d * 0.12, 0.05, { f0: 900, q: 3, gain: 0.5 }); tone(o, t + d * 0.12, 0.05, { type: 'square', f0: 220, f1: 140, gain: 0.12 });
+      noise(o, t + d * 0.2, 0.18, { f0: 500, f1: 900, q: 1.2, gain: 0.12, attack: 0.05 });
+      noise(o, t + d * 0.58, 0.06, { f0: 1300, q: 3, gain: 0.55 }); tone(o, t + d * 0.58, 0.08, { f0: 120, f1: 70, gain: 0.35 });
+      noise(o, t + d * 0.84, 0.04, { f0: 2800, q: 4, gain: 0.5 });
+      noise(o, t + d * 0.84 + 0.08, 0.05, { f0: 2000, q: 4, gain: 0.55 });
+      tone(o, t + d * 0.84 + 0.08, 0.05, { type: 'square', f0: 330, f1: 200, gain: 0.1 });
+    },
+    reload_sniper(o, t, op) {     // mag out and in, then a full bolt cycle
+      const d = Math.max(0.6, (op && op.dur) || 2.4);
+      noise(o, t + d * 0.1, 0.06, { f0: 800, q: 3, gain: 0.5 }); tone(o, t + d * 0.1, 0.06, { type: 'square', f0: 180, f1: 120, gain: 0.12 });
+      noise(o, t + d * 0.5, 0.07, { f0: 1100, q: 3, gain: 0.6 }); tone(o, t + d * 0.5, 0.1, { f0: 100, f1: 60, gain: 0.4 });
+      bolt(o, t + d * 0.8, 1.0);
+    },
+    reload_shotgun(o, t, op) {    // shells go in one at a time, then the action closes
+      const d = Math.max(0.6, (op && op.dur) || 2.2);
+      const n = 5;
+      for (let i = 0; i < n; i++) {
+        const tt = t + d * (0.08 + (0.74 * i) / n);
+        noise(o, tt, 0.05, { f0: 1500 + i * 60, q: 3.5, gain: 0.5 }); tone(o, tt, 0.06, { f0: 150, f1: 90, gain: 0.3 });
+        noise(o, tt + 0.05, 0.03, { f0: 2600, q: 4, gain: 0.25 });
+      }
+      pump(o, t + d * 0.88, 1.0);
     },
     empty(o, t) {
       tone(o, t, 0.04, { type: 'triangle', f0: 1400, f1: 800, gain: 0.35, curve: 5 });
@@ -150,6 +221,8 @@ export function createAudio() {
     },
   };
 
+  const LIFE = { kestrel: 1200, halberd: 2000, breaker: 900, death: 1100, bolt: 600, pump: 500 };
+
   function play(name, opts) {
     const fn = SOUNDS[name];
     if (!fn || !ensure()) return;
@@ -188,8 +261,10 @@ export function createAudio() {
 
     active++;
     const t = ctx.currentTime + 0.005;
-    fn(out, t);
-    const life = name === 'reload' ? 1500 : name === 'scout' || name === 'death' ? 1100 : 700;
+    PM = (opts && opts.pitch) || 1;
+    fn(out, t, opts);
+    PM = 1;
+    const life = LIFE[name] || (name.startsWith('reload') ? 400 + ((opts && opts.dur) || 2.4) * 1000 : 700);
     setTimeout(() => { active--; try { out.disconnect(); } catch (e) { /* already gone */ } }, life);
   }
 
