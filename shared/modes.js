@@ -79,9 +79,13 @@ export const DEFAULT_MODE = 'ffa';
 export function isTeamMode(mode) { const m = MODES[mode]; return !!(m && m.teams); }
 export function otherTeam(t) { return t === 'a' ? 'b' : t === 'b' ? 'a' : ''; }
 
+/** Bot difficulty. 'hard' is the original tuning. */
+export const BOT_LEVELS = ['easy', 'normal', 'hard'];
+export const DEFAULT_BOT_LEVEL = 'hard';
+
 export function defaultMatchConfig(mode = DEFAULT_MODE, mapId = DEFAULT_MAP_ID) {
   const m = MODES[mode] || MODES[DEFAULT_MODE];
-  return { mode: m.id, mapId: MAP_IDS.includes(mapId) ? mapId : DEFAULT_MAP_ID, bots: { fill: 0 }, coop: false,
+  return { mode: m.id, mapId: MAP_IDS.includes(mapId) ? mapId : DEFAULT_MAP_ID, bots: { fill: 0, level: DEFAULT_BOT_LEVEL }, coop: false,
     timeLimitS: m.timeLimitS, scoreLimit: m.scoreLimit };
 }
 
@@ -102,6 +106,8 @@ export function sanitizeMatchConfig(input, prev) {
   else if (typeof src.bots === 'number') fill = int(src.bots);
   if (fill === null) fill = base && base.bots ? int(base.bots.fill) : 0;
   fill = clamp(fill ?? 0, 0, MAX_PLAYERS);
+  let level = src.bots && typeof src.bots === 'object' ? src.bots.level : undefined;
+  if (!BOT_LEVELS.includes(level)) level = base && base.bots && BOT_LEVELS.includes(base.bots.level) ? base.bots.level : DEFAULT_BOT_LEVEL;
 
   let coop = typeof src.coop === 'boolean' ? src.coop : !!(base && base.coop);
   if (!M.teams) coop = false;
@@ -116,11 +122,11 @@ export function sanitizeMatchConfig(input, prev) {
   if (scoreLimit === null) scoreLimit = M.scoreLimit;
   scoreLimit = clamp(scoreLimit, M.scoreLimitMin, M.scoreLimitMax);
 
-  return { mode, mapId, bots: { fill }, coop, timeLimitS, scoreLimit };
+  return { mode, mapId, bots: { fill, level }, coop, timeLimitS, scoreLimit };
 }
 
 export function sameMatchConfig(a, b) {
-  return !!a && !!b && a.mode === b.mode && a.mapId === b.mapId && a.bots.fill === b.bots.fill && a.coop === b.coop &&
+  return !!a && !!b && a.mode === b.mode && a.mapId === b.mapId && a.bots.fill === b.bots.fill && a.bots.level === b.bots.level && a.coop === b.coop &&
     a.timeLimitS === b.timeLimitS && a.scoreLimit === b.scoreLimit;
 }
 

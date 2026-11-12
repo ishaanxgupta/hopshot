@@ -32,6 +32,20 @@ const DECIDE_EVERY = 30;       // ticks between goal decisions (staggered by id)
 const VIEW_RANGE = 70;
 const TURN_IDLE = 0.12;        // rad per tick
 const TURN_COMBAT = 0.3;
+// Difficulty (room.config.bots.level). 'hard' is the original tuning.
+//   skill: scales reaction time and initial aim error (lower = slower, sloppier)
+//   decay: how fast the initial aim error closes (closer to 1 = slower)
+//   sway:  constant aim wobble (rad); turn: max aim turn per tick in combat
+//   view:  sight range (m); burst: fraction of the time an auto gun keeps firing
+const BOT_LEVEL = {
+  easy:   { skill: 0.45, decay: 0.992, sway: 0.05,  turn: 0.14, view: 40, burst: 0.45 },
+  normal: { skill: 0.7,  decay: 0.985, sway: 0.028, turn: 0.2,  view: 55, burst: 0.75 },
+  hard:   { skill: 1,    decay: 0.97,  sway: 0.012, turn: TURN_COMBAT, view: VIEW_RANGE, burst: 1 },
+};
+function levelOf(room) {
+  const l = room && room.config && room.config.bots && room.config.bots.level;
+  return BOT_LEVEL[l] || BOT_LEVEL.hard;
+}
 const TWO_PI = Math.PI * 2;
 const STEP = MOVE.stepHeight;
 const PATH_BUDGET_PER_TICK = 1;   // A* searches per room per tick
@@ -197,8 +211,9 @@ export class Bot {
     if (this.target === q) { this.lostTicks = 0; return; }
     this.target = q;
     this.lostTicks = 0;
-    this.reactAt = tick + Math.round(rnd(15, 27) / this.skill);   // 250-450 ms (slower for weaker bots)
-    const e = rnd(0.05, 0.12) / this.skill;
+    const sk = this.skill * levelOf(this.room).skill;
+    this.reactAt = tick + Math.round(rnd(15, 27) / sk);   // 250-450 ms on hard (slower for weaker bots)
+    const e = rnd(0.05, 0.12) / sk;
     this.errYaw = Math.random() < 0.5 ? -e : e;
     this.errPitch = rnd(-0.5, 0.5) * e;
     const dx = q.state.x - this.p.state.x, dz = q.state.z - this.p.state.z;
@@ -213,7 +228,7 @@ export class Bot {
     const tx = q.state.x, ty = q.state.y + hitboxHeight(q.state) * 0.7, tz = q.state.z;
     let dx = tx - ex, dy = ty - ey, dz = tz - ez;
     const d = Math.hypot(dx, dy, dz);
-    if (d > VIEW_RANGE || d < 1e-3) return d < 1e-3;
+    if (d > levelOf(this.room).view || d < 1e-3) return d < 1e-3;
     dx /= d; dy /= d; dz /= d;
     return raycastWorld(this.room.world, ex, ey, ez, dx, dy, dz, d, undefined) >= d - 0.3;
   }
@@ -226,7 +241,7 @@ export class Bot {
       const dx = q.state.x - me.state.x, dz = q.state.z - me.state.z;
       let d = dx * dx + dz * dz;
       if (q.carrying) d *= 0.25;                         // flag carriers first
-      if (d >= bestD || d > VIEW_RANGE * VIEW_RANGE) continue;
+      if (d >= bestD || d > levelOf(this.room).view ** 2) continue;
       // rough field of view (about 200 degrees) unless very close
       const ang = Math.abs(wrapAngle(Math.atan2(-dx, -dz) - this.yaw));
       if (ang > 1.75 && d > 36) continue;
@@ -439,11 +454,12 @@ export class Bot {
       const ex = st.x, ey = st.y + eyeHeight(st), ez = st.z;
       const tx = t.state.x - ex, ty = t.state.y + hitboxHeight(t.state) * 0.72 - ey, tz = t.state.z - ez;
       const hd = Math.hypot(tx, tz);
-      const wantYaw = Math.atan2(-tx, -tz) + this.errYaw + Math.sin(tick * 0.11 + p.id) * 0.012;
-      const wantPitch = Math.atan2(ty, hd) + this.errPitch;
-      this.errYaw *= 0.97; this.errPitch *= 0.97;
-      this.yaw = approach(this.yaw, wantYaw, TURN_COMBAT);
-      this.pitch += Math.max(-TURN_COMBAT, Math.min(TURN_COMBAT, wantPitch - this.pitch));
+      const L = levelOf(this.room);
+      const wantYaw = Math.atan2(-tx, -tz) + this.errYaw + Math.sin(tick * 0.11 + p.id) * L.sway;
+      const wantPitch = Math.atan2(ty, hd) + this.errPitch + Math.sin(tick * 0.07 + p.id * 3) * L.sway * 0.5;
+      this.errYaw *= L.decay; this.errPitch *= L.decay;
+      this.yaw = approach(this.yaw, wantYaw, L.turn);
+      this.pitch += Math.max(-L.turn, Math.min(L.turn, wantPitch - this.pitch));
       const aimed = Math.abs(wrapAngle(wantYaw - this.yaw)) < 0.08;
       const slot = p.wstate.weapon;
       const w = p.kit.slots[slot];
@@ -453,7 +469,7 @@ export class Bot {
       if (wantAds && !p.carrying) buttons |= BTN.ADS;
       const ready = slot !== 1 || p.wstate.aim >= w.adsTicks;
       if (tick >= this.reactAt && aimed && hd < reach && ready) {
-        if (w.auto) buttons |= BTN.FIRE;
+        if (w.auto) { if (L.burst >= 1 || ((tick + p.id * 13) % 48) < 48 * L.burst) buttons |= BTN.FIRE; }
         else { this.firePulse = !this.firePulse; if (this.firePulse) buttons |= BTN.FIRE; }
       }
       if (tick >= this.strafeUntil) { this.strafe = -this.strafe; this.strafeUntil = tick + Math.round(rnd(25, 70)); }

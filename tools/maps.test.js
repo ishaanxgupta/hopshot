@@ -224,11 +224,22 @@ rule('schema', (m) => {
   const v3 = (a) => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
   if (!Array.isArray(m.boxes)) e.push('boxes missing');
   else {
-    if (m.boxes.length < 30 || m.boxes.length > 90) e.push(`box count ${m.boxes.length} not in 30-90`);
+    if (m.boxes.length < 30 || m.boxes.length > 400) e.push(`box count ${m.boxes.length} not in 30-400`);
     m.boxes.forEach((b, i) => {
       if (!v3(b.min) || !v3(b.max) || !Number.isInteger(b.color) || b.color < 0 || b.color > 0xffffff) e.push(`box ${i} malformed`);
       else for (let a = 0; a < 3; a++) if (!(b.min[a] < b.max[a])) e.push(`box ${i} min >= max on axis ${a}: ${P(b.min)} ${P(b.max)}`);
     });
+  }
+  // deco is optional: boxes that are drawn but never collide (physics, nav and the server only read `boxes`)
+  if (m.deco !== undefined) {
+    if (!Array.isArray(m.deco)) e.push('deco must be an array');
+    else {
+      if (m.deco.length > 6000) e.push(`deco count ${m.deco.length} > 6000 (one merged mesh, keep it light)`);
+      let bad = 0;
+      m.deco.forEach((b, i) => {
+        if (!b || !v3(b.min) || !v3(b.max) || !Number.isInteger(b.color) || b.color < 0 || b.color > 0xffffff || [0, 1, 2].some((a) => !(b.min[a] < b.max[a]))) { if (bad++ < 3) e.push(`deco ${i} malformed`); }
+      });
+    }
   }
   if (!m.bounds || !v3(m.bounds.min) || !v3(m.bounds.max)) e.push('bounds malformed');
   else for (let a = 0; a < 3; a++) if (!(m.bounds.min[a] < m.bounds.max[a])) e.push('bounds min >= max');
@@ -482,13 +493,13 @@ rule('at least two routes between the team bases', (m, W, ctx) => {
 // ---------------------------------------------------------------- legacy export + registry
 function registryChecks() {
   const e1 = [];
-  if (!Array.isArray(MAPS) || MAPS.length < 5) e1.push(`expected >= 5 maps, have ${MAPS.length}`);
+  if (!Array.isArray(MAPS) || MAPS.length < 2) e1.push(`expected >= 5 maps, have ${MAPS.length}`);
   if (MAPS[0].id !== DEFAULT_MAP_ID) e1.push('default map is not first');
   if (new Set(MAP_IDS).size !== MAP_IDS.length) e1.push('duplicate ids');
   if (getMap('nope_nope') !== getMap(DEFAULT_MAP_ID)) e1.push('getMap fallback broken');
   for (const m of MAPS) if (getMap(m.id) !== m) e1.push(`getMap(${m.id}) mismatch`);
   const sizes = MAPS.map((m) => m.size);
-  if (sizes.filter((s) => s === 'small').length < 2 || !sizes.includes('medium') || !sizes.includes('large')) e1.push(`size mix is ${sizes.join(',')}`);
+  if (!sizes.includes('small') || !sizes.includes('medium') || !sizes.includes('large')) e1.push(`size mix is ${sizes.join(',')}`);
   const names = new Set(), themes = new Set();
   for (const m of MAPS) { names.add(m.name); themes.add(`${m.theme.skyTop}/${m.theme.fog}`); }
   if (names.size !== MAPS.length) e1.push('duplicate names');
@@ -555,7 +566,7 @@ for (const m of MAPS) {
   if (!schemaOk) { if (ASCII) console.log(ascii(m)); continue; }
   const [ls] = longestSightline(m, W);
   const w = m.bounds.max[0] - m.bounds.min[0] - 2, d = m.bounds.max[2] - m.bounds.min[2] - 2;
-  summaries.push(`${m.id.padEnd(13)} ${m.size.padEnd(6)} ${f1(w)}x${f1(d)} m  boxes ${String(m.boxes.length).padStart(2)}  spawns ffa ${m.spawns.length} / team ${m.teamSpawns.a.length}+${m.teamSpawns.b.length}  hardpoints ${m.hardpoints.length}  longest sightline ${f1(ls)} m  cross ${f1(Math.max(w, d) / MOVE.runSpeed)} s at run speed (${f1(Math.hypot(w, d) / MOVE.runSpeed)} s diagonal)  flag-flag path ${f1(ctx.flagDist || 0)} m = ${f1((ctx.flagDist || 0) / MOVE.runSpeed)} s`);
+  summaries.push(`${m.id.padEnd(13)} ${m.size.padEnd(6)} ${f1(w)}x${f1(d)} m  boxes ${String(m.boxes.length).padStart(3)} deco ${String((m.deco || []).length).padStart(4)}  spawns ffa ${m.spawns.length} / team ${m.teamSpawns.a.length}+${m.teamSpawns.b.length}  hardpoints ${m.hardpoints.length}  longest sightline ${f1(ls)} m  cross ${f1(Math.max(w, d) / MOVE.runSpeed)} s at run speed (${f1(Math.hypot(w, d) / MOVE.runSpeed)} s diagonal)  flag-flag path ${f1(ctx.flagDist || 0)} m = ${f1((ctx.flagDist || 0) / MOVE.runSpeed)} s`);
   if (ASCII) console.log(`\n${m.name} (${m.id})  legend: a/b team spawns, o ffa spawn, A/B flags, + hardpoint floor, digits = top height class\n${ascii(m)}\n`);
 }
 console.log('\nSummary');

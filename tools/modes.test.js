@@ -106,11 +106,11 @@ function testConfig() {
 
 function testLobby() {
   section('lobby, host, phases, host migration');
-  const room = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 6 } });
+  const room = privateRoom({ mode: 'tdm', mapId: 'crate_cove', bots: { fill: 6 } });
   const A = fakeHuman(room, 'Ann'), B = fakeHuman(room, 'Ben');
   check(room.phase === 'lobby' && room.hostId === A.p.id, 'private room starts in the lobby; first human is host');
   const w = A.msgs[0];
-  check(w.t === 'welcome' && w.match && w.match.phase === 'lobby' && w.mapId === 'cinder_loop' && w.lobby.hostId === A.p.id && w.v === 4,
+  check(w.t === 'welcome' && w.match && w.match.phase === 'lobby' && w.mapId === 'crate_cove' && w.lobby.hostId === A.p.id && w.v === 4,
     'welcome carries match (phase, config), lobby roster with host, map id');
   check(room.botCount === 0 && !room.players.some((p) => p.alive), 'lobby: no bots, nobody alive');
   steps(room, 240);
@@ -118,10 +118,10 @@ function testLobby() {
   check(A.p.team !== B.p.team && [A.p.team, B.p.team].every((t) => t === 'a' || t === 'b'), 'humans auto-assigned to different teams in a team mode');
   check(room.requestConfig(B.p, { mode: 'ctf' }) === 'not_host' && room.requestStart(B.p) === 'not_host', 'only the host may change the config or start');
   check(room.requestConfig(A.p, 'x') === 'bad_config' && room.requestTeam(A.p, 'c') === 'bad_team', 'bad config / team rejected');
-  check(room.requestConfig(A.p, { mode: 'ctf', mapId: 'tidal_basin', timeLimitS: 30 }) === null && room.config.mode === 'ctf' && room.map.id === 'tidal_basin',
+  check(room.requestConfig(A.p, { mode: 'ctf', mapId: 'hollow_pines', timeLimitS: 30 }) === null && room.config.mode === 'ctf' && room.map.id === 'hollow_pines',
     'host config change applied (mode + map: the room world follows the map)');
   const mm = B.last('match');
-  check(mm && mm.mapId === 'tidal_basin' && mm.config.mode === 'ctf' && mm.config.timeLimitS === 30, 'config change broadcast to everyone (match)');
+  check(mm && mm.mapId === 'hollow_pines' && mm.config.mode === 'ctf' && mm.config.timeLimitS === 30, 'config change broadcast to everyone (match)');
   check(room.requestTeam(B.p, A.p.team) === null && B.p.team === A.p.team && B.last('team'), 'team switch in the lobby');
   check(room.requestStart(A.p) === null && room.phase === 'countdown', 'host starts -> countdown');
   check(Math.abs(room.teamCounts().a - room.teamCounts().b) === 0 && room.botCount === 4, `bots fill both teams evenly around the humans (a ${room.teamCounts().a} / b ${room.teamCounts().b})`);
@@ -145,7 +145,7 @@ function testLobby() {
   check(res.draw === (res.scores.a === res.scores.b) && (res.draw || res.winner === (res.scores.a > res.scores.b ? 'a' : 'b')), `winner by score (${JSON.stringify(res.scores)} -> ${res.winner})`);
   check(!room.players.some((p) => p.alive), 'results: everyone despawned');
   steps(room, 70);
-  check(room.phase === 'lobby' && room.config.mode === 'ctf' && room.map.id === 'tidal_basin' && room.botCount === 0, 'results -> back to the lobby with the same config, bots removed');
+  check(room.phase === 'lobby' && room.config.mode === 'ctf' && room.map.id === 'hollow_pines' && room.botCount === 0, 'results -> back to the lobby with the same config, bots removed');
   check(room.requestLobby(C.p) === 'not_host', 'only the host returns to the lobby');
   room.requestStart(B.p); steps(room, 10);
   check(room.requestLobby(B.p) === null && room.phase === 'lobby', 'host can abort back to the lobby');
@@ -155,7 +155,7 @@ function testLobby() {
 
 function testTeams() {
   section('teams: late joins, co-op, no-bot balance');
-  const room = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 0 } });
+  const room = privateRoom({ mode: 'tdm', mapId: 'crate_cove', bots: { fill: 0 } });
   const hs = [fakeHuman(room, 'h0')];
   startNow(room, hs[0].p);
   for (let i = 1; i < 6; i++) hs.push(fakeHuman(room, `h${i}`));
@@ -163,19 +163,19 @@ function testTeams() {
   check(c.ha === 3 && c.hb === 3 && room.botCount === 0, `late joiners alternate to the smaller team (${c.ha} vs ${c.hb}), fill 0 = no bots`);
   for (const h of hs) room.removePlayer(h.p);
 
-  const co = privateRoom({ mode: 'hardpoint', mapId: 'dune_relay', bots: { fill: 8 }, coop: true });
+  const co = privateRoom({ mode: 'hardpoint', mapId: 'maple_street', bots: { fill: 8 }, coop: true });
   const H = [fakeHuman(co, 'c0'), fakeHuman(co, 'c1'), fakeHuman(co, 'c2')];
   startNow(co, H[0].p);
   const humansA = H.every((h) => h.p.team === 'a');
   const bots = co.players.filter((p) => p.bot);
   check(humansA && bots.length === 5 && bots.every((b) => b.team === 'b'), `co-op: all humans on team a, ${bots.length} bots on team b (fill 8 - 3 humans)`);
-  const co2 = privateRoom({ mode: 'ctf', mapId: 'cinder_loop', bots: { fill: 2 }, coop: true });
+  const co2 = privateRoom({ mode: 'ctf', mapId: 'crate_cove', bots: { fill: 2 }, coop: true });
   const G = [fakeHuman(co2, 'g0'), fakeHuman(co2, 'g1'), fakeHuman(co2, 'g2')];
   startNow(co2, G[0].p);
   check(co2.players.filter((p) => p.bot && p.team === 'b').length === 3, 'co-op: at least as many bots as humans');
   for (const h of [...H, ...G]) { co.removePlayer(h.p); co2.removePlayer(h.p); }
 
-  const nb = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 0 } });
+  const nb = privateRoom({ mode: 'tdm', mapId: 'crate_cove', bots: { fill: 0 } });
   const N = [fakeHuman(nb, 'n0'), fakeHuman(nb, 'n1'), fakeHuman(nb, 'n2'), fakeHuman(nb, 'n3')];
   for (const h of N) nb.requestTeam(h.p, 'a');
   nb.requestStart(N[0].p);
@@ -186,25 +186,25 @@ function testTeams() {
 
 function testCombat() {
   section('friendly fire, spawn protection');
-  const room = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 0 }, timeLimitS: 600 });
+  const room = privateRoom({ mode: 'tdm', mapId: 'prism_yard', bots: { fill: 0 }, timeLimitS: 600 });
   const A = fakeHuman(room, 'A'), B = fakeHuman(room, 'B'), C = fakeHuman(room, 'C');
   room.requestTeam(C.p, A.p.team);
   startNow(room, A.p);
   check(A.p.team === C.p.team && A.p.team !== B.p.team, 'A and C teammates, B enemy');
   check(room.isProtected(A.p) && room.isProtected(B.p), 'freshly spawned players are protected');
   // line up on open floor, protection still on
-  place(A.p, -3, 0, 0); place(B.p, 3, 0, 0); place(C.p, 0, 0, 3);
+  place(A.p, -3, 0, -15); place(B.p, 3, 0, -15); place(C.p, 0, 0, -12);
   steps(room, 2);
   shoot(room, A.p, B.p);
   check(B.p.health === 100 && !room.isProtected(A.p) && room.isProtected(B.p), 'shot at a protected enemy: no damage; firing ended the shooter\'s protection');
   steps(room, 95);
   check(!room.isProtected(B.p) && !room.isProtected(C.p), 'protection ends after 1.5 s');
-  place(A.p, -3, 0, 0); place(B.p, 3, 0, 0); place(C.p, 0, 0, 0.0);
+  place(A.p, -3, 0, -15); place(B.p, 3, 0, -15); place(C.p, 0, 0, -15);
   steps(room, 2);
   // C stands between A and B: the shot passes through the teammate and hits B
   shoot(room, A.p, B.p);
   check(C.p.health === 100 && B.p.health < 100, `friendly fire off: the teammate in the line of fire is untouched, the enemy behind is hit (B ${B.p.health})`);
-  place(C.p, 0, 0, 3); steps(room, 2);
+  place(C.p, 0, 0, -12); steps(room, 2);
   shoot(room, A.p, C.p);
   check(C.p.health === 100, 'shooting a teammate directly does nothing');
   // snapshot entry carries team + protected bits
@@ -215,7 +215,7 @@ function testCombat() {
 
 function testCtf() {
   section('capture the flag rules');
-  const room = privateRoom({ mode: 'ctf', mapId: 'cinder_loop', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 2 });
+  const room = privateRoom({ mode: 'ctf', mapId: 'crate_cove', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 2 });
   const A = fakeHuman(room, 'A'), B = fakeHuman(room, 'B');
   startNow(room, A.p);
   const ta = A.p.team, tb = B.p.team, map = room.map;
@@ -226,7 +226,7 @@ function testCtf() {
   place(A.p, fB[0], fB[1], fB[2]); steps(room, 1);
   check(F[tb].state === 'carried' && F[tb].carrier === A.p.id && A.p.carrying === tb && A.evs('flag_taken').length === 1, 'touching the enemy flag picks it up (flag_taken)');
   // A dies -> drop
-  place(A.p, 2, 0, 2); steps(room, 1);
+  place(A.p, 2, 0, 7); steps(room, 1);   // open floor on crate_cove
   room.kill(A.p, B.p, 0, false);
   check(F[tb].state === 'dropped' && Math.abs(F[tb].x - 2) < 0.01 && Math.abs(F[tb].y - 0) < 0.05 && A.p.carrying === '', 'carrier killed -> flag dropped where he died, on the ground');
   const rt = F[tb].returnTick;
@@ -272,7 +272,7 @@ function testCtf() {
 
 function testHardpoint() {
   section('hardpoint rules');
-  const room = privateRoom({ mode: 'hardpoint', mapId: 'cinder_loop', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 500 });
+  const room = privateRoom({ mode: 'hardpoint', mapId: 'crate_cove', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 500 });
   const A = fakeHuman(room, 'A'), B = fakeHuman(room, 'B');
   startNow(room, A.p);
   const ta = A.p.team, tb = B.p.team;
@@ -306,7 +306,7 @@ function testHardpoint() {
 
 function testLimitsAndPublic() {
   section('limits, ties, public rotation');
-  const room = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 2 });
+  const room = privateRoom({ mode: 'tdm', mapId: 'crate_cove', bots: { fill: 0 }, timeLimitS: 600, scoreLimit: 2 });
   const A = fakeHuman(room, 'A'), B = fakeHuman(room, 'B');
   startNow(room, A.p);
   room.kill(B.p, A.p, 0, false); steps(room, 1);
@@ -317,14 +317,14 @@ function testLimitsAndPublic() {
   check(room.phase === 'results' && room.result.winner === A.p.team && room.result.reason === 'score', 'tdm score limit ends the match');
   room.removePlayer(A.p); room.removePlayer(B.p);
 
-  const t = privateRoom({ mode: 'tdm', mapId: 'cinder_loop', bots: { fill: 0 }, timeLimitS: 10 });
+  const t = privateRoom({ mode: 'tdm', mapId: 'crate_cove', bots: { fill: 0 }, timeLimitS: 10 });
   const X = fakeHuman(t, 'X'), Y = fakeHuman(t, 'Y');
   startNow(t, X.p);
   steps(t, 10 * 60 + 2);
   check(t.phase === 'results' && t.result.draw && t.result.winner === null && t.result.reason === 'time', 'time limit with equal scores -> draw');
   t.removePlayer(X.p); t.removePlayer(Y.p);
 
-  const f = privateRoom({ mode: 'ffa', mapId: 'cinder_loop', bots: { fill: 0 }, scoreLimit: 2 });
+  const f = privateRoom({ mode: 'ffa', mapId: 'crate_cove', bots: { fill: 0 }, scoreLimit: 2 });
   const P = fakeHuman(f, 'P'), Q = fakeHuman(f, 'Q');
   startNow(f, P.p);
   check(P.p.team === '' && Q.p.team === '', 'ffa: no teams');
@@ -545,7 +545,7 @@ async function e2e() {
 
   // ---- 1. complete cycles of every mode on two maps (8 private rooms in parallel)
   const plan = [];
-  const pairs = { ffa: ['cinder_loop', 'dune_relay'], tdm: ['tidal_basin', 'prism_yard'], ctf: ['cinder_loop', 'halo_spire'], hardpoint: ['dune_relay', 'tidal_basin'] };
+  const pairs = { ffa: ['crate_cove', 'maple_street'], tdm: ['hollow_pines', 'prism_yard'], ctf: ['crate_cove', 'skyline'], hardpoint: ['maple_street', 'hollow_pines'] };
   for (const mode of MODE_IDS) for (const mapId of pairs[mode]) plan.push({ mode, mapId });
   const MATCH_S = QUICK ? 16 : 24;
   const rooms = plan.map((pl, i) => {
@@ -590,9 +590,9 @@ async function e2e() {
 
   // ---- 2. second match on another map in the same room + late join + host migration
   const R = rooms.find((r) => r.mode === 'ctf');
-  R.host.net.setMatchConfig({ mapId: 'tidal_basin', timeLimitS: 60, bots: { fill: 4 } });
-  await waitFor(() => R.guest.net.state.match.mapId === 'tidal_basin', 2000);
-  check(R.guest.maps[R.guest.maps.length - 1] === 'tidal_basin' && R.guest.net.map.id === 'tidal_basin', 'map change in the lobby: net emits map with the new map object');
+  R.host.net.setMatchConfig({ mapId: 'hollow_pines', timeLimitS: 60, bots: { fill: 4 } });
+  await waitFor(() => R.guest.net.state.match.mapId === 'hollow_pines', 2000);
+  check(R.guest.maps[R.guest.maps.length - 1] === 'hollow_pines' && R.guest.net.map.id === 'hollow_pines', 'map change in the lobby: net emits map with the new map object');
   R.host.net.startMatch();
   await waitFor(() => R.guest.net.state.match.phase === 'playing', 3000);
   const late = new C('late', R.room);
@@ -602,7 +602,7 @@ async function e2e() {
   const lm = late.net.state.match;
   const counts = { a: 0, b: 0 };
   for (const e of lm.lobby) if (!e.bot && e.team) counts[e.team]++;
-  check(lm.phase === 'playing' && lm.mode === 'ctf' && lm.mapId === 'tidal_basin' && lm.flags && lm.flags.a && typeof lm.flags.a.returnInS === 'number' && lm.timeLeftS > 30,
+  check(lm.phase === 'playing' && lm.mode === 'ctf' && lm.mapId === 'hollow_pines' && lm.flags && lm.flags.a && typeof lm.flags.a.returnInS === 'number' && lm.timeLeftS > 30,
     'late joiner: full match state within a second (phase, mode, map, flags, timers)');
   check(late.net.state.alive && lm.myTeam !== '' && Math.abs(counts.a - counts.b) <= 1, `late joiner spawned on a team, humans balanced (${counts.a}/${counts.b})`);
   const before = all.reduce((s, c) => s + c.net.stats.corrections, 0);

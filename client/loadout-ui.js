@@ -1,7 +1,7 @@
 // Hopshot loadout editor (the menu's Loadout tab). Visual first: a big turntable render of the real gun
 // model (client/gunpreview.js, one shared WebGL renderer) with the part an attachment adds lit up, two
 // image cards for the slot's guns, six attachment tiles with generated SVG icons and a one-line effect,
-// three slot pips, and compact stat bars. Long text lives behind the small "i" buttons (a tip over the
+// slot pips (attachments header only), and compact stat bars. Long text lives behind the small "i" buttons (a tip over the
 // preview). Pure DOM otherwise, styled by client/style.css (.hs-lo*).
 //
 // The editor owns the working loadout: for each of the 3 class slots a gun (A or B) and an attachment
@@ -183,16 +183,11 @@ export function createLoadoutEditor(host, opts = {}) {
   for (let s = 0; s < SLOT_COUNT; s++) {
     const b = h('button', 'hs-lo-slot');
     b.type = 'button'; b.setAttribute('role', 'tab');
-    b.append(h('em', '', String(s + 1)), h('span', 'c', SLOT_NAMES[s]), h('b', 'g'), h('span', 'a'));
+    b.append(h('em', '', String(s + 1)), h('span', 'c', SLOT_NAMES[s]), h('b', 'g'));
     b.addEventListener('click', () => { sel = s; picked = -1; hover = -1; closeTip(); clearWarn(); render(); });
     el.slots.appendChild(b);
   }
   const slotBtns = Array.from(el.slots.children);
-  function pipsEl(n, cls) {
-    const w = h('span', cls || 'hs-pips-mini');
-    for (let i = 0; i < MAX_ATTACHMENTS; i++) w.appendChild(h('i', i < n ? 'on' : ''));
-    return w;
-  }
 
   // ---- gun cards: render + name + 3-word role
   const gunCards = [0, 1].map((v) => {
@@ -343,8 +338,6 @@ export function createLoadoutEditor(host, opts = {}) {
       b.classList.toggle('on', s === sel);
       b.setAttribute('aria-selected', s === sel ? 'true' : 'false');
       b.querySelector('.g').textContent = GUNS[e.gun].name;
-      const a = b.querySelector('.a'), n = popcount6(e.att);
-      if (a.dataset.n !== String(n)) { a.dataset.n = String(n); a.textContent = ''; a.appendChild(pipsEl(n)); a.title = `${n}/${MAX_ATTACHMENTS} attachments`; }
     }
     const cur = slots[sel], cls = GUNS[cur.gun].cls;
     for (let v = 0; v < 2; v++) {

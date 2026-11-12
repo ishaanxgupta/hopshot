@@ -262,6 +262,8 @@ export function createRenderer(canvas, map, opts = {}) {
       addBox(acc, b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], b.color, { ao: true, skipBottom: true });
       for (let k = 0; k < 3; k++) { flatBoxes[i * 6 + k] = b.min[k]; flatBoxes[i * 6 + 3 + k] = b.max[k]; }
     });
+    // deco: drawn only (no collision, not in flatBoxes), merged into the same mesh and the same draw call
+    if (Array.isArray(map.deco)) for (const d of map.deco) addBox(acc, d.min[0], d.min[1], d.min[2], d.max[0], d.max[1], d.max[2], d.color, { skipBottom: true });
     mapMesh = new THREE.Mesh(accToGeometry(acc), new THREE.MeshLambertMaterial({ vertexColors: true, map: gridTex }));
     mapMesh.matrixAutoUpdate = false; mapMesh.frustumCulled = false;
     scene.add(mapMesh);
