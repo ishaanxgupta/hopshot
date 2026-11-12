@@ -38,7 +38,8 @@
 //   u32  tick            server tick the snapshot was taken at (after that tick's simulation)
 //   u32  ackSeq          last cmd seq of YOURS the server has processed (0 = none yet)
 //   u8   youId
-//   u8   youFlags        bit0 alive, bit1 hasAck (ackSeq is valid)
+//   u8   youFlags        bit0 alive, bit1 hasAck (ackSeq is valid), (v4) bit2 spawn-protected,
+//                        bits3-4 team (0 none / ffa, 1 'a', 2 'b'), bit5 carrying the enemy flag
 //   u8   health         0..100 (rounded)
 //   u16  respawnTicks    ticks until respawn while dead, else 0
 //   u8   inputBuffer     (v2) server-side input jitter buffer depth for you, smoothed, 1/8 ticks
@@ -52,7 +53,7 @@
 //                        state right after cmd ackSeq (never includes guessed ticks).
 //   WSTATE_BYTES         your full weapon state (weapons.writeWeaponState; v3: 10 bytes with
 //                        u16 reload, aim and heat)
-//   u8   playerCount     OTHER players (you are not in this list), then playerCount x 13 bytes:
+//   u8   playerCount     OTHER players (you are not in this list), then playerCount x 14 bytes:
 //     u8  id
 //     i16 x, i16 y, i16 z    feet position * POS_SCALE (1/128 m)
 //     u16 yaw                (yaw mod 2pi) * 65536 / 2pi
@@ -61,6 +62,8 @@
 //                            bit4 ads, bit5 reloading, bits6-7 weapon SLOT (0..2)
 //     u8  health | gunB << 7  (v3) bits0-6 health 0..100, bit7 = the slot holds gun B, so
 //                            gun id = slot * 2 + bit7 (weapons.GUNS)
+//     u8  extra              (v4) bits0-1 team (0 none, 1 'a', 2 'b'), bit2 spawn-protected,
+//                            bit3 carrying the enemy flag
 //   u8   shotCount       tracers fired since the previous snapshot (ALL shooters, including you),
 //                        then shotCount x 9 bytes - one entry per pellet:
 //     u8  shooter id
@@ -106,6 +109,54 @@
 //   { t:'scores', rows:[{ id, kills, deaths, ping }] }       ~ every 1 s
 //   { t:'error', code, message }                              e.g. room_full, bad_version
 //
+// MODES, TEAMS, LOBBY, MAPS (v4; rules and config in shared/modes.js)
+//   Teams are 'a' / 'b' ('' = none, free-for-all). Every room plays one map (config.mapId,
+//   shared/maps getMap); clients build their prediction world from that id.
+//   Phases: 'lobby' -> 'countdown' -> 'playing' -> 'results' -> 'lobby' (private rooms) or
+//   'playing' -> 'results' -> 'countdown' (next map/mode) -> 'playing' (public rooms, no lobby).
+//   Nobody is alive in lobby / countdown / results; everyone (re)spawns when 'playing' starts.
+//   endsTick: countdown = tick play starts; playing = time-limit tick; results = tick the
+//   results end; lobby = 0.
+// client -> server:
+//   { t:'config', cfg:<MatchConfig, may be partial> }   host only, lobby only (re-sanitised)
+//   { t:'start' }                                         host only, lobby only -> countdown
+//   { t:'team', team:'a'|'b' }                            lobby only, team modes, not co-op
+//   { t:'lobby' }                                         host only, private rooms: abort the
+//                                                         countdown / match / results -> lobby
+// server -> client:
+//   welcome gains: private, mapId, map (name), match:<match>, lobby:<lobby>, obj:<obj|null>;
+//   roster entries ('welcome'.players, 'join'.player) gain team ('' | 'a' | 'b') and obj (the
+//   player's objective score: captures in ctf, seconds in the zone in hardpoint, else 0).
+//   { t:'match', phase, mode, mapId, map, config, private, hostId, startTick, endsTick,
+//     scores:{a,b}, result:<result|null> }        on every change + every 2 s (refresh)
+//   { t:'lobby', hostId, players:[{ id, name, team, bot }] }    on change (+ every 2 s in lobby)
+//   { t:'team', id, team }                        a player's team changed
+//   { t:'obj', mode, scores:{a,b}, flags:{a:<flag>, b:<flag>}|null, hp:<zone>|null }
+//                                                 objective state, on change + every 1 s while
+//                                                 playing (ctf / hardpoint / tdm)
+//     <flag> = { state:'home'|'carried'|'dropped', carrier:<id|0>, pos:[x,y,z] (stand, drop
+//                point, or the carrier's position when sent), returnTick:<tick|0> (dropped) }
+//              flags.a is TEAM A's flag (it stands at map.flags.a; team B steals it)
+//     <zone> = { index, name, min:[x,y,z], max:[x,y,z], owner:''|'a'|'b'|'contested',
+//                rotateTick, next:<index of the next zone>, count:{a,b} (players inside) }
+//   { t:'ev', e, ... }                            objective / match events:
+//     e:'flag_taken'    team (whose flag), player              (also from a dropped flag)
+//     e:'flag_dropped'  team, player (the carrier), pos, returnTick
+//     e:'flag_returned' team, player (0 = timed out / fell out of the world)
+//     e:'flag_captured' team (the CAPTURED flag's team), player, scorer (scoring team), scores
+//     e:'zone_rotated'  index, name, rotateTick
+//     e:'zone_taken'    team         e:'zone_contested'        e:'zone_neutral'
+//     e:'match_start'   mode, mapId, endsTick        e:'match_end'  <result fields>
+//   { t:'result', ...<result> }                   match over (also kept in 'match'.result)
+//     <result> = { mode, mapId, winner:'a'|'b'|<player id>|null, draw, winnerName,
+//                  scores:{a,b}, reason:'score'|'time', endsTick /* results end */,
+//                  rows:[{ id, name, team, bot, kills, deaths, obj }] }
+//   { t:'scores', rows:[{ id, kills, deaths, ping, team, obj }] }   ~ every 1 s
+//   'spawn' gains team and prot (spawn-protection ticks; it ends early when that player fires).
+//   'kill' only scores while playing: kills / deaths / team points count in phase 'playing'.
+//   'round' is still sent for old clients: phase 'playing' while playing, else 'intermission'.
+//   { t:'error', code, message }  also non-fatal: not_host, bad_phase, bad_team, bad_config
+//
 // CLOCK SYNC (client side; client/net.js implements all of this)
 //   v2: the render clock for remote players is derived from SNAPSHOT ARRIVAL TIMES, not from
 //   the ping clock: base = max over a few seconds of (snapshot.tick - arrivalMs / TICK_MS)
@@ -141,11 +192,14 @@ import {
 } from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
-export const PROTOCOL_VERSION = 3;   // v2: input-buffer feedback + dilation; v3: guns + loadouts
+export const PROTOCOL_VERSION = 4;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps
 export const MSG = { INPUT: 1, SNAPSHOT: 2 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
 export const POS_SCALE = 128;
+/** Team <-> wire code (snapshot team bits). '' = no team (free-for-all). */
+export const TEAM_CODES = ['', 'a', 'b'];
+export function teamCode(t) { return t === 'a' ? 1 : t === 'b' ? 2 : 0; }
 export const TICK_MS = 1000 / 60;
 
 export const INPUT_REDUNDANCY = 4;     // cmds the client should send per packet
@@ -157,7 +211,7 @@ export const MAX_TEXT_BYTES = 2048;
 
 export const SNAP_HEADER_BYTES = 18;   // type..starved
 export const SNAP_SELF_BYTES = SNAP_HEADER_BYTES + STATE_BYTES + WSTATE_BYTES;
-export const PLAYER_ENTRY_BYTES = 13;
+export const PLAYER_ENTRY_BYTES = 14;
 export const SHOT_ENTRY_BYTES = 9;
 export const MAX_SNAP_PLAYERS = 255;
 export const MAX_SNAP_SHOTS = 255;
@@ -317,7 +371,8 @@ export function decodeInput(data, out = createInputPacket()) {
 
 /**
  * Write header + self block at `offset`. you = { id, alive, health, respawnTicks, state, weapon,
- * inputBuffer, inputTarget (ticks, fractional), timeScale (permille), starved (counter) }.
+ * inputBuffer, inputTarget (ticks, fractional), timeScale (permille), starved (counter),
+ * (v4) protected (bool), team ('' | 'a' | 'b'), carrier (bool) }.
  * ackSeq < 0 or null means "no cmd processed yet". Returns new offset (offset + SNAP_SELF_BYTES).
  */
 export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
@@ -326,7 +381,8 @@ export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
   const hasAck = ackSeq !== null && ackSeq !== undefined && ackSeq >= 0;
   view.setUint32(offset + 5, hasAck ? ackSeq >>> 0 : 0, true);
   view.setUint8(offset + 9, you.id & 0xff);
-  view.setUint8(offset + 10, (you.alive ? 1 : 0) | (hasAck ? 2 : 0));
+  view.setUint8(offset + 10, (you.alive ? 1 : 0) | (hasAck ? 2 : 0) | (you.protected ? 4 : 0) |
+    (teamCode(you.team) << 3) | (you.carrier ? 32 : 0));
   view.setUint8(offset + 11, clampU8(Math.round(you.health)));
   view.setUint16(offset + 12, Math.max(0, Math.min(65535, you.respawnTicks | 0)), true);
   view.setUint8(offset + 14, clampU8(Math.round((+you.inputBuffer || 0) * 8)));
@@ -341,7 +397,8 @@ export function writeSnapshotSelf(view, offset, tick, ackSeq, you) {
 
 /**
  * Write one compact player entry. p = { id, x, y, z, yaw, pitch, alive, crouching, sliding,
- * onGround, ads, reloading, weapon (slot), gun (gun id; only bit0 = gun B is sent), health }.
+ * onGround, ads, reloading, weapon (slot), gun (gun id; only bit0 = gun B is sent), health,
+ * (v4) team ('' | 'a' | 'b'), protected (bool), carrier (bool) }.
  * Returns offset + PLAYER_ENTRY_BYTES.
  */
 export function writePlayerEntry(view, o, p) {
@@ -356,6 +413,7 @@ export function writePlayerEntry(view, o, p) {
     (p.ads ? 16 : 0) | (p.reloading ? 32 : 0) | ((p.weapon & 3) << 6));
   const hp = clampU8(Math.round(p.health));
   view.setUint8(o + 12, (hp > 127 ? 127 : hp) | ((p.gun & 1) << 7));
+  view.setUint8(o + 13, teamCode(p.team) | (p.protected ? 4 : 0) | (p.carrier ? 8 : 0));
   return o + PLAYER_ENTRY_BYTES;
 }
 
@@ -398,7 +456,7 @@ export function encodeSnapshot(snap) {
 
 function createRemotePlayer() {
   return { id: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0 };
+    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0, team: '', protected: false, carrier: false };
 }
 function createShot() {
   return { shooter: 0, weapon: 0, gun: 0, kind: 0, victim: 0, x: 0, y: 0, z: 0, normal: null };
@@ -407,8 +465,9 @@ function createShot() {
 /**
  * Reusable output object for decodeSnapshot:
  * { tick, ackSeq /* -1 = none *\/, you:{ id, alive, health, respawnTicks, inputBuffer, inputTarget,
- *   timeScale /* permille *\/, starved, state, weapon },
- *   players:[{ id,x,y,z,yaw,pitch,alive,crouching,sliding,onGround,ads,reloading,weapon,gun,health }],
+ *   timeScale /* permille *\/, starved, state, weapon, protected, team, carrier },
+ *   players:[{ id,x,y,z,yaw,pitch,alive,crouching,sliding,onGround,ads,reloading,weapon,gun,health,
+ *              team /* '' | 'a' | 'b' *\/, protected, carrier }],
  *   shots:[{ shooter, weapon, gun, kind, victim, x,y,z, normal:[x,y,z]|null }] }
  * weapon = slot (0..2), gun = gun id (slot * 2 + variant, see weapons.GUNS).
  * The arrays/objects are reused by the next decode into the same `out` - copy what you keep
@@ -418,7 +477,7 @@ export function createSnapshot() {
   return {
     tick: 0, ackSeq: -1,
     you: { id: 0, alive: false, health: 0, respawnTicks: 0, inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0,
-      state: createPlayerState(), weapon: createWeaponState() },
+      protected: false, team: '', carrier: false, state: createPlayerState(), weapon: createWeaponState() },
     players: [], shots: [],
     _pp: [], _sp: [],
   };
@@ -438,6 +497,9 @@ export function decodeSnapshot(data, out = createSnapshot()) {
     const you = out.you;
     you.id = v.getUint8(9);
     you.alive = (flags & 1) !== 0;
+    you.protected = (flags & 4) !== 0;
+    you.team = TEAM_CODES[(flags >> 3) & 3] || '';
+    you.carrier = (flags & 32) !== 0;
     you.health = v.getUint8(11);
     you.respawnTicks = v.getUint16(12, true);
     you.inputBuffer = v.getUint8(14) / 8;
@@ -468,6 +530,10 @@ export function decodeSnapshot(data, out = createSnapshot()) {
       const hb = v.getUint8(o + 12);
       p.health = hb & 0x7f;
       p.gun = p.weapon * 2 + (hb >> 7);
+      const xb = v.getUint8(o + 13);
+      p.team = TEAM_CODES[xb & 3] || '';
+      p.protected = (xb & 4) !== 0;
+      p.carrier = (xb & 8) !== 0;
       out.players.push(p);
       o += PLAYER_ENTRY_BYTES;
     }
@@ -543,6 +609,17 @@ export function encodeSetLoadout(loadoutCode) {
 export function parseLoadoutCode(v, fallback) {
   return Number.isInteger(v) && v >= 0 && v <= 0xffffff ? sanitizeLoadoutCode(v) : fallback;
 }
+/** (v4) Host: set the match config (lobby only). cfg may be partial; the server re-sanitises it. */
+export function encodeMatchConfig(cfg) { return JSON.stringify({ t: 'config', cfg: cfg && typeof cfg === 'object' ? cfg : {} }); }
+/** (v4) Host: start the match (lobby -> countdown). */
+export function encodeStart() { return '{"t":"start"}'; }
+/** (v4) Switch team in the lobby. */
+export function encodeTeam(team) { return JSON.stringify({ t: 'team', team: team === 'b' ? 'b' : 'a' }); }
+/** (v4) Host: back to the lobby (private rooms). */
+export function encodeReturnToLobby() { return '{"t":"lobby"}'; }
+/** Server-side: 'a' | 'b' or null. */
+export function parseTeam(v) { return v === 'a' || v === 'b' ? v : null; }
+
 export function encodePing(clientMs, rtt) {
   const m = { t: 'ping', c: clientMs };
   if (Number.isFinite(rtt)) m.rtt = rtt;

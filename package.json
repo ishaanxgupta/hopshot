@@ -6,7 +6,7 @@
   "description": "Hopshot - an original browser arena FPS prototype (authoritative multiplayer, 20 players per room)",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node tools/physics.test.js && node tools/weapons.test.js && node tools/maps.test.js",
+    "test": "node tools/physics.test.js && node tools/weapons.test.js && node tools/maps.test.js && node tools/modes.test.js --quick",
     "loadtest": "node tools/loadtest.js",
     "build:static": "node tools/build-static.js"
   },

@@ -21,13 +21,24 @@
 // simulated cmd - live, replayed after a stall, or guessed - uses p.kit, and a respawn clears
 // any speculation (specN = 0), so a replay can never mix two lives' loadouts. The client gets
 // the active code in its own 'spawn' event and predicts with exactly the same kit.
+//
+// Matches (protocol v4, rules in shared/modes.js):
+//   phase 'lobby'     private rooms only. Nobody is alive, no bots, no snapshots, and the loop
+//                     wakes only every LOBBY_WAKE_MS (cheap). The host (first human; the
+//                     longest-present human after the host leaves) edits the config and starts.
+//   phase 'countdown' everyone dead; teams balanced, bots added; play starts at endsTick.
+//   phase 'playing'   the mode runs (scores, flags, zone); spawn protection; respawns.
+//   phase 'results'   everyone dead; result shown until endsTick, then private -> lobby (same
+//                     config), public -> the next map/mode of the rotation -> countdown.
+//   Public rooms never use the lobby. Score changes that end a match are applied at the end of
+//   the tick (pendingEnd), so nothing is despawned while the tick is still iterating players.
 
 import { performance } from 'node:perf_hooks';
 import {
-  TICK_RATE, SNAPSHOT_EVERY, MAX_PLAYERS, MAX_REWIND_MS, RESPAWN_MS, ROUND_MS, INTERMISSION_MS,
+  TICK_RATE, SNAPSHOT_EVERY, MAX_PLAYERS, MAX_REWIND_MS, RESPAWN_MS,
   MAX_HEALTH, REGEN_DELAY_MS, REGEN_PER_SEC, BTN, DT, MAX_DILATION_PERMILLE,
+  COUNTDOWN_MS, PUBLIC_COUNTDOWN_MS, RESULTS_MS,
 } from '../shared/constants.js';
-import { MAP } from '../shared/map.js';
 import {
   createPlayerState, copyState, spawnState, stepPlayer, eyeHeight, hitboxHeight, raycastWorld, raycastPlayer,
 } from '../shared/physics.js';
@@ -40,7 +51,27 @@ import {
   writeSnapshotSelf, writePlayerEntry, writeShotEntry, normalToAxis, createCmd, sanitizeCmd, encodeText,
   parseLoadoutCode,
 } from '../shared/protocol.js';
+import {
+  MODES, isTeamMode, otherTeam, sanitizeMatchConfig, defaultMatchConfig, decideWinner, MAP_SIZE_PLAYERS,
+  FLAG_RETURN_S, HARDPOINT_ROTATE_S, SPAWN_PROTECT_MS, FLAG_TOUCH_RADIUS,
+} from '../shared/modes.js';
+import { MAPS } from '../shared/maps/index.js';
 import { Bot } from './bots.js';
+import { worldFor, pickSpawn } from './spawns.js';
+
+const envMs = (name, def) => {
+  const v = process.env[name];
+  const n = v === undefined || v === '' ? NaN : parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? n : def;
+};
+const COUNTDOWN = envMs('COUNTDOWN_MS', COUNTDOWN_MS);
+const PUBLIC_COUNTDOWN = envMs('PUBLIC_COUNTDOWN_MS', PUBLIC_COUNTDOWN_MS);
+const RESULTS = envMs('RESULTS_MS', RESULTS_MS);
+const LOBBY_WAKE_MS = 100;
+const MATCH_REFRESH = 120;        // ticks: periodic 'match' (+ 'lobby' in the lobby) refresh
+const OBJ_REFRESH = 60;           // ticks: periodic 'obj' refresh while playing
+const OBJ_MIN_GAP = 6;            // ticks: objective changes are sent at most this often
+const PUBLIC_MODES = ['ffa', 'tdm', 'hardpoint', 'ctf'];
 
 const TICK_MS = 1000 / TICK_RATE;
 const msToTicks = (ms) => Math.round(ms / TICK_MS);
@@ -73,18 +104,42 @@ export const BOT_MIN = process.env.BOTS !== undefined && process.env.BOTS !== ''
   ? Math.max(0, Math.min(MAX_PLAYERS, parseInt(process.env.BOTS, 10) || 0)) : 4;
 
 export class Room {
-  constructor(name, world, opts = {}) {
+  /**
+   * opts: { isPrivate, config (partial MatchConfig), botMin (public rooms: keep this many
+   * participants), onEmpty(room), spawnPolicy ('smart' | 'legacy') }
+   */
+  constructor(name, opts = {}) {
     this.name = name;
-    this.world = world;
+    this.isPrivate = !!opts.isPrivate;
     this.botMin = opts.botMin ?? BOT_MIN;
     this.onEmpty = opts.onEmpty || (() => {});
+    this.spawnPolicy = opts.spawnPolicy || 'smart';
     this.players = [];          // dense list, humans and bots
     this.byId = new Map();
     this.nextId = 1;
+    this.joinSeq = 0;
     this.tick = 0;
-    this.phase = 'playing';
-    this.endsTick = msToTicks(ROUND_MS);
     this.destroyed = false;
+
+    // match
+    this.modeRot = 0; this.mapRot = 0;
+    const cfg = this.isPrivate ? sanitizeMatchConfig(opts.config || {}, defaultMatchConfig())
+      : this.rotationConfig(opts.config);
+    this.config = cfg;
+    this.map = null; this.world = null;
+    this.setMap(cfg.mapId);
+    this.phase = this.isPrivate ? 'lobby' : 'playing';
+    this.startTick = 0;
+    this.endsTick = this.isPrivate ? 0 : msToTicks(cfg.timeLimitS * 1000);
+    this.scores = { a: 0, b: 0 };
+    this.result = null;
+    this.hostId = 0;
+    this.pendingEnd = null;
+    this.flags = null;          // ctf: { a: flag, b: flag }
+    this.hp = null;             // hardpoint zone state
+    this.objDirty = false; this.objSentAt = -1e9;
+    this.spawnStats = { spawns: 0, visible: 0 };
+    if (this.phase === 'playing') this.initObjectives();
 
     // Timing / stats
     this.tickTimes = new Float32Array(TIMING_SAMPLES);
@@ -142,7 +197,10 @@ export class Room {
     if (this.destroyed) return;
     const now = performance.now();
     let steps = 0;
-    while (now >= this.nextAt && steps < MAX_CATCHUP) {
+    // lobby: nothing is simulated, so wake rarely and catch the tick counter up in one go
+    const idle = this.phase === 'lobby';
+    const maxSteps = idle ? Math.ceil(LOBBY_WAKE_MS / TICK_MS) + MAX_CATCHUP : MAX_CATCHUP;
+    while (now >= this.nextAt && steps < maxSteps) {
       this.lastTickAt = this.nextAt;
       this.nextAt += TICK_MS;
       const t0 = performance.now();
@@ -151,16 +209,17 @@ export class Room {
       } catch (err) {
         console.error(`[room ${this.name}] tick ${this.tick} failed:`, err);
       }
-      this.recordTiming(performance.now() - t0);
+      if (!idle) this.recordTiming(performance.now() - t0);
       steps++;
       if (this.destroyed) return;
     }
-    if (now - this.nextAt > TICK_MS * MAX_CATCHUP) {
+    if (now - this.nextAt > TICK_MS * maxSteps) {
       // Hopelessly behind (machine stalled): drop the backlog instead of fast-forwarding.
       this.catchUpDrops++;
       this.nextAt = now + TICK_MS;
     }
-    const delay = this.nextAt - performance.now();
+    let delay = this.nextAt - performance.now();
+    if (this.phase === 'lobby') delay += LOBBY_WAKE_MS - TICK_MS;
     this.timer = setTimeout(this.loop, delay > 1 ? Math.floor(delay) : 0);
   }
 
@@ -185,7 +244,8 @@ export class Room {
   /** Current server time in fractional ticks (for pong / clock sync). */
   currentTick() {
     const f = (performance.now() - this.lastTickAt) / TICK_MS;
-    return this.tick + (f < 0 ? 0 : f > 1.5 ? 1.5 : f);
+    const cap = this.phase === 'lobby' ? LOBBY_WAKE_MS / TICK_MS + 2 : 1.5;   // the lobby loop sleeps
+    return this.tick + (f < 0 ? 0 : f > cap ? cap : f);
   }
 
   get humans() { let n = 0; for (const p of this.players) if (!p.bot) n++; return n; }
@@ -217,6 +277,9 @@ export class Room {
       loadout: lo, kit,
       alive: false, health: 0, respawnAt: 0, lastDamageTick: -1e9, spawnTick: 0,
       kills: 0, deaths: 0, ping: 0,
+      // match: team ('' | 'a' | 'b'), spawn protection end tick, carried flag ('' | the
+      // flag's team), objective score (captures / zone seconds), join order (host migration)
+      team: '', protectedUntil: 0, carrying: '', obj: 0, joinSeq: ++this.joinSeq,
       // cmd jitter buffer
       queue, qHead: 0, qLen: 0, lastQueuedSeq: -1, ackSeq: -1,
       lastCmd: createCmd(), guess: createCmd(), starved: 0, qMin: 1e9, qWindow: 0,
@@ -232,9 +295,9 @@ export class Room {
       hist: new Float32Array(HIST * 4), histTick: new Int32Array(HIST).fill(-1), histAlive: new Uint8Array(HIST),
       // reused snapshot views
       entry: { id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-        onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0 },
+        onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, health: 0, team: '', protected: false, carrier: false },
       you: { id, alive: false, health: 0, respawnTicks: 0, state: null, weapon: null,
-        inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0 },
+        inputBuffer: 0, inputTarget: 0, timeScale: 0, starved: 0, protected: false, team: '', carrier: false },
       index: 0, removed: false,
     };
     p.you.state = p.state;
@@ -246,29 +309,34 @@ export class Room {
     p.index = this.players.length;
     this.players.push(p);
     this.byId.set(p.id, p);
+    if (!p.bot && !this.hostId) this.hostId = p.id;
     if (p.ws) this.sendTo(p, this.welcomeFor(p));
     this.broadcast(encodeText({ t: 'join', player: this.rosterEntry(p) }), p);
-    this.respawn(p);
+    if (this.phase === 'playing') this.respawn(p);
+    else this.despawn(p);
   }
 
   /** Add a human (loadoutCode: optional client-supplied code). Returns the player, or null if the room is full. */
   addHuman(ws, name, loadoutCode) {
     if (!this.hasFreeSlot()) return null;
-    // make room by removing a bot first if necessary
-    if (this.players.length >= MAX_PLAYERS) {
-      const bot = this.players.find((q) => q.bot);
-      if (bot) this.removePlayer(bot);
-    }
     const p = this.createPlayer(name, ws, false, loadoutCode);
     if (!p) return null;
+    p.team = this.teamForNew(p);
+    // make room by removing a bot first if necessary (one from the newcomer's team if possible)
+    if (this.players.length >= MAX_PLAYERS) {
+      const bot = this.players.find((q) => q.bot && q.team === p.team) || this.players.find((q) => q.bot);
+      if (bot) this.removePlayer(bot);
+    }
     this.addPlayer(p);
     this.updateBots();
+    this.lobbyChanged();
     return p;
   }
 
-  addBot() {
+  addBot(team = '') {
     const p = this.createPlayer(Bot.pickName(this), null, true, Bot.pickLoadout());
     if (!p) return null;
+    p.team = team;
     p.botBrain = new Bot(this, p);
     this.addPlayer(p);
     return p;
@@ -276,7 +344,9 @@ export class Room {
 
   removePlayer(p) {
     if (p.removed) return;
+    if (p.carrying) this.dropFlag(p, false);
     p.removed = true;
+    p.alive = false;
     const i = this.players.indexOf(p);
     if (i >= 0) {
       this.players.splice(i, 1);
@@ -287,25 +357,111 @@ export class Room {
     this.broadcast(encodeText({ t: 'leave', id: p.id }), null);
     if (!p.bot) {
       if (this.humans === 0) { this.destroy(); this.onEmpty(this); return; }
+      if (this.hostId === p.id) this.migrateHost();
       this.updateBots();
+      this.lobbyChanged();
     }
   }
 
+  /** The human present longest becomes host. */
+  migrateHost() {
+    let best = null;
+    for (const q of this.players) if (!q.bot && (!best || q.joinSeq < best.joinSeq)) best = q;
+    this.hostId = best ? best.id : 0;
+    this.broadcastMatch();
+  }
+
+  get teamMode() { return isTeamMode(this.config.mode); }
+
+  teamCounts(except = null) {
+    const c = { a: 0, b: 0, ha: 0, hb: 0 };
+    for (const q of this.players) {
+      if (q === except || q.removed) continue;
+      if (q.team === 'a') { c.a++; if (!q.bot) c.ha++; } else if (q.team === 'b') { c.b++; if (!q.bot) c.hb++; }
+    }
+    return c;
+  }
+
+  /**
+   * Team for a joining human: co-op -> 'a'; otherwise the smaller team counting humans first
+   * (bots are rebalanced around humans), then all players, then the lower score, then 'a'.
+   */
+  teamForNew(p) {
+    if (!this.teamMode) return '';
+    if (this.config.coop) return 'a';
+    const c = this.teamCounts(p);
+    if (c.ha !== c.hb) return c.ha < c.hb ? 'a' : 'b';
+    if (c.a !== c.b) return c.a < c.b ? 'a' : 'b';
+    if (this.scores.a !== this.scores.b) return this.scores.a < this.scores.b ? 'a' : 'b';
+    return 'a';
+  }
+
+  setTeam(p, team) {
+    if (p.team === team) return;
+    p.team = team;
+    this.broadcast(encodeText({ t: 'team', id: p.id, team }), null);
+  }
+
+  /** (Re)assign every human's team after a mode / co-op change in the lobby. */
+  reassignTeams() {
+    const humans = this.players.filter((q) => !q.bot).sort((x, y) => x.joinSeq - y.joinSeq);
+    if (!this.teamMode) { for (const q of humans) this.setTeam(q, ''); return; }
+    if (this.config.coop) { for (const q of humans) this.setTeam(q, 'a'); return; }
+    // keep valid teams, place the rest on the smaller side
+    for (const q of humans) if (q.team !== 'a' && q.team !== 'b') q.team = '';
+    for (const q of humans) {
+      if (q.team === 'a' || q.team === 'b') continue;
+      const c = this.teamCounts(q);
+      this.setTeam(q, c.ha <= c.hb ? 'a' : 'b');
+    }
+  }
+
+  /** Without bots, humans are evened out (latest joiners move) when a match starts. */
+  balanceHumans() {
+    if (!this.teamMode || this.config.coop || (this.isPrivate ? this.config.bots.fill : this.botMin) > 0) return;
+    for (let guard = 0; guard < MAX_PLAYERS; guard++) {
+      const c = this.teamCounts();
+      if (Math.abs(c.ha - c.hb) <= 1) return;
+      const from = c.ha > c.hb ? 'a' : 'b';
+      let mover = null;
+      for (const q of this.players) if (!q.bot && q.team === from && (!mover || q.joinSeq > mover.joinSeq)) mover = q;
+      if (!mover) return;
+      this.setTeam(mover, otherTeam(from));
+    }
+  }
+
+  /**
+   * Bots. Lobby: none. Private rooms fill to config.bots.fill participants, public rooms to
+   * botMin. Team modes: both teams are filled to the same size (ceil(total / 2)) around the
+   * humans; 0 = no bots at all. Co-op: every bot on team 'b', max(fill - humans, humans) of them.
+   */
   updateBots() {
     const humans = this.humans;
-    const want = Math.max(0, Math.min(this.botMin - humans, MAX_PLAYERS - humans));
-    let have = this.botCount;
-    while (have > want) {
-      let bot = null;
-      for (let i = this.players.length - 1; i >= 0; i--) if (this.players[i].bot) { bot = this.players[i]; break; }
-      this.removePlayer(bot);
-      have--;
+    const fill = this.isPrivate ? this.config.bots.fill : this.botMin;
+    const want = { '': 0, a: 0, b: 0 };
+    if (this.phase === 'lobby' || fill <= 0) { /* none */ } else if (!this.teamMode) {
+      want[''] = Math.max(0, Math.min(fill - humans, MAX_PLAYERS - humans));
+    } else if (this.config.coop) {
+      want.b = Math.max(0, Math.min(Math.max(fill - humans, humans), MAX_PLAYERS - humans));
+    } else {
+      const c = this.teamCounts();
+      const per = Math.ceil(Math.min(MAX_PLAYERS, Math.max(fill, humans)) / 2);
+      want.a = Math.max(0, per - c.ha); want.b = Math.max(0, per - c.hb);
+      while (humans + want.a + want.b > MAX_PLAYERS) { if (want.a >= want.b) want.a--; else want.b--; }
     }
-    while (have < want) { if (!this.addBot()) break; have++; }
+    // remove surplus (newest first) and bots on a team that no longer exists in this mode
+    for (let i = this.players.length - 1; i >= 0; i--) {
+      const q = this.players[i];
+      if (!q || !q.bot) continue;
+      const t = q.team in want ? q.team : null;
+      if (t === null || want[t] <= 0) { this.removePlayer(q); continue; }
+      want[t]--;
+    }
+    for (const t of ['', 'a', 'b']) while (want[t] > 0) { if (!this.addBot(t)) break; want[t]--; }
   }
 
   rosterEntry(p) {
-    return { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code };
+    return { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code, team: p.team, obj: p.obj };
   }
 
   /**
@@ -322,12 +478,378 @@ export class Room {
   welcomeFor(p) {
     return encodeText({
       t: 'welcome', v: PROTOCOL_VERSION, id: p.id, room: this.name, tick: this.currentTick(),
-      private: !!this.isPrivate, bots: this.botMin,
-      tickRate: TICK_RATE, snapshotEvery: SNAPSHOT_EVERY, map: MAP.name, lo: p.loadout,
+      private: !!this.isPrivate, bots: this.isPrivate ? this.config.bots.fill : this.botMin,
+      tickRate: TICK_RATE, snapshotEvery: SNAPSHOT_EVERY, mapId: this.map.id, map: this.map.name, lo: p.loadout,
       players: this.players.map((q) => this.rosterEntry(q)),
-      round: { phase: this.phase, endsTick: this.endsTick },
+      round: this.roundCompat(),
+      match: this.matchState(), lobby: this.lobbyState(), obj: this.objState(),
     });
   }
+
+  // ------------------------------------------------------------------ match: state + messages
+
+  setMap(mapId) {
+    const { map, world } = worldFor(mapId);
+    this.map = map; this.world = world;
+  }
+
+  matchState() {
+    return {
+      phase: this.phase, mode: this.config.mode, mapId: this.map.id, map: this.map.name, config: this.config,
+      private: this.isPrivate, hostId: this.isPrivate ? this.hostId : 0, startTick: this.startTick, endsTick: this.endsTick,
+      scores: { a: this.scores.a, b: this.scores.b }, result: this.phase === 'results' ? this.result : null,
+    };
+  }
+
+  lobbyState() {
+    return {
+      hostId: this.isPrivate ? this.hostId : 0,
+      players: this.players.map((q) => ({ id: q.id, name: q.name, team: q.team, bot: q.bot })),
+    };
+  }
+
+  roundCompat() {
+    return { phase: this.phase === 'playing' ? 'playing' : 'intermission', endsTick: this.endsTick };
+  }
+
+  broadcastMatch() { this.broadcast(encodeText({ t: 'match', ...this.matchState() }), null); }
+  lobbyChanged() { this.broadcast(encodeText({ t: 'lobby', ...this.lobbyState() }), null); }
+
+  objState() {
+    if (this.phase !== 'playing') return null;
+    const o = { mode: this.config.mode, scores: { a: this.scores.a, b: this.scores.b }, flags: null, hp: null };
+    if (this.flags) {
+      o.flags = {};
+      for (const t of ['a', 'b']) {
+        const f = this.flags[t];
+        const c = f.state === 'carried' ? this.byId.get(f.carrier) : null;
+        if (c) { f.x = c.state.x; f.y = c.state.y; f.z = c.state.z; }
+        o.flags[t] = { state: f.state, carrier: f.carrier, pos: [round2(f.x), round2(f.y), round2(f.z)], returnTick: f.returnTick };
+      }
+    }
+    if (this.hp) {
+      const h = this.hp, z = this.map.hardpoints[h.index];
+      o.hp = { index: h.index, name: z.name, min: z.min, max: z.max, owner: h.owner, rotateTick: h.rotateTick,
+        next: (h.index + 1) % this.map.hardpoints.length, count: { a: h.countA, b: h.countB } };
+    }
+    return o;
+  }
+
+  sendObj() {
+    const o = this.objState();
+    if (!o) return;
+    this.objDirty = false; this.objSentAt = this.tick;
+    this.broadcast(encodeText({ t: 'obj', ...o }), null);
+  }
+
+  event(e, fields) { this.broadcast(encodeText({ t: 'ev', e, ...fields }), null); }
+
+  // ------------------------------------------------------------------ match: client requests
+
+  /** Returns null on success or an error code (the caller reports it to the client). */
+  requestConfig(p, cfg) {
+    if (!this.isPrivate || p.id !== this.hostId) return 'not_host';
+    if (this.phase !== 'lobby') return 'bad_phase';
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return 'bad_config';
+    const prev = this.config;
+    const next = sanitizeMatchConfig(cfg, prev);
+    this.config = next;
+    if (next.mapId !== this.map.id) this.setMap(next.mapId);
+    if (next.mode !== prev.mode || next.coop !== prev.coop) { this.reassignTeams(); this.lobbyChanged(); }
+    this.broadcastMatch();
+    return null;
+  }
+
+  requestStart(p) {
+    if (!this.isPrivate || p.id !== this.hostId) return 'not_host';
+    if (this.phase !== 'lobby') return 'bad_phase';
+    this.startCountdown(COUNTDOWN);
+    return null;
+  }
+
+  requestTeam(p, team) {
+    if (team !== 'a' && team !== 'b') return 'bad_team';
+    if (!this.teamMode || this.config.coop) return 'bad_team';
+    if (this.phase !== 'lobby') return 'bad_phase';
+    this.setTeam(p, team);
+    this.lobbyChanged();
+    return null;
+  }
+
+  requestLobby(p) {
+    if (!this.isPrivate || p.id !== this.hostId) return 'not_host';
+    if (this.phase === 'lobby') return 'bad_phase';
+    this.toLobby();
+    return null;
+  }
+
+  // ------------------------------------------------------------------ match: phases
+
+  /** Kill silently (no kill event, no score): phase changes. Commits any speculation. */
+  despawn(p) {
+    if (p.carrying) this.dropFlag(p, false);
+    if (p.alive && p.specN > 0) { p.commitN += p.specN; p.commitTick = this.tick; p.specN = 0; }
+    p.alive = false;
+    p.health = 0;
+    p.respawnAt = Infinity;
+    p.protectedUntil = 0;
+  }
+
+  startCountdown(ms) {
+    this.phase = 'countdown';
+    this.result = null;
+    this.pendingEnd = null;
+    this.flags = null; this.hp = null;
+    for (const p of this.players) {
+      this.despawn(p);
+      // a fresh start for the input path (clients stop sending in the lobby)
+      p.commitN = 0; p.specN = 0;
+    }
+    this.reassignTeams();
+    this.balanceHumans();
+    this.updateBots();
+    this.endsTick = this.tick + Math.max(1, msToTicks(ms));
+    this.warmNav();
+    this.broadcastMatch();
+    this.lobbyChanged();
+    this.broadcast(encodeText({ t: 'round', ...this.roundCompat() }), null);
+  }
+
+  startPlaying() {
+    this.phase = 'playing';
+    this.pendingEnd = null;
+    this.result = null;
+    this.scores.a = 0; this.scores.b = 0;
+    this.startTick = this.tick;
+    this.endsTick = this.tick + msToTicks(this.config.timeLimitS * 1000);
+    for (const p of this.players) { p.kills = 0; p.deaths = 0; p.obj = 0; p.carrying = ''; }
+    this.initObjectives();
+    this.broadcastMatch();
+    this.event('match_start', { mode: this.config.mode, mapId: this.map.id, endsTick: this.endsTick });
+    this.broadcast(encodeText({ t: 'round', ...this.roundCompat() }), null);
+    // spawn everyone in a random order (spawn choice depends on who is already standing)
+    const order = this.players.slice();
+    for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = order[i]; order[i] = order[j]; order[j] = t; }
+    for (const p of order) this.respawn(p);
+    this.sendObj();
+  }
+
+  endMatch(reason) {
+    const rows = this.players.map((p) => ({ id: p.id, name: p.name, team: p.team, bot: p.bot, kills: p.kills, deaths: p.deaths, obj: p.obj }));
+    const { winner, draw } = decideWinner(this.config.mode, this.scores, rows);
+    const wp = typeof winner === 'number' ? this.byId.get(winner) : null;
+    this.phase = 'results';
+    this.pendingEnd = null;
+    this.endsTick = this.tick + Math.max(1, msToTicks(RESULTS));
+    this.result = {
+      mode: this.config.mode, mapId: this.map.id, winner, draw,
+      winnerName: wp ? wp.name : winner === 'a' ? 'Team A' : winner === 'b' ? 'Team B' : '',
+      scores: { a: this.scores.a, b: this.scores.b }, reason, endsTick: this.endsTick, rows,
+    };
+    for (const p of this.players) this.despawn(p);
+    this.flags = null; this.hp = null;
+    this.broadcast(encodeText({ t: 'result', ...this.result }), null);
+    this.event('match_end', this.result);
+    this.broadcastMatch();
+    this.broadcast(encodeText({
+      t: 'round', phase: 'intermission', endsTick: this.endsTick, winner: wp ? wp.id : 0, rows: this.scoreRows(),
+    }), null);
+  }
+
+  afterResults() {
+    if (this.isPrivate) { this.toLobby(); return; }
+    this.config = this.rotationConfig();
+    this.setMap(this.config.mapId);
+    this.startCountdown(PUBLIC_COUNTDOWN);
+  }
+
+  toLobby() {
+    this.phase = 'lobby';
+    this.result = null;
+    this.pendingEnd = null;
+    this.flags = null; this.hp = null;
+    this.endsTick = 0;
+    for (const p of this.players) this.despawn(p);
+    this.updateBots();          // removes every bot
+    this.broadcastMatch();
+    this.lobbyChanged();
+    this.broadcast(encodeText({ t: 'round', ...this.roundCompat() }), null);
+  }
+
+  /**
+   * Public rotation: modes in PUBLIC_MODES order; maps whose `size` suits the expected
+   * participant count (max(humans, botMin)), cycling, never the same map twice in a row when
+   * another one fits. Mode defaults for limits.
+   */
+  rotationConfig(seed) {
+    const mode = PUBLIC_MODES[this.modeRot++ % PUBLIC_MODES.length];
+    const n = Math.max(this.players ? this.humans : 1, this.botMin, 2);
+    let fit = MAPS.filter((m) => { const r = MAP_SIZE_PLAYERS[m.size] || [2, 20]; return n >= r[0] && n <= r[1]; });
+    if (!fit.length) fit = MAPS.slice();
+    const cur = this.map ? this.map.id : null;
+    let pick = fit[this.mapRot++ % fit.length];
+    if (fit.length > 1 && pick.id === cur) pick = fit[this.mapRot++ % fit.length];
+    const base = defaultMatchConfig(mode, pick.id);
+    return sanitizeMatchConfig({ ...base, ...(seed || {}), mode, mapId: pick.id, bots: { fill: this.botMin } });
+  }
+
+  initObjectives() {
+    this.flags = null; this.hp = null;
+    const map = this.map;
+    if (this.config.mode === 'ctf' && map.flags) {
+      this.flags = {};
+      for (const t of ['a', 'b']) {
+        const s = map.flags[t];
+        this.flags[t] = { team: t, state: 'home', carrier: 0, x: s[0], y: s[1], z: s[2], home: s, returnTick: 0 };
+      }
+    } else if (this.config.mode === 'hardpoint' && map.hardpoints && map.hardpoints.length) {
+      this.hp = { index: 0, owner: '', rotateTick: this.tick + msToTicks(HARDPOINT_ROTATE_S * 1000), hold: 0, countA: 0, countB: 0 };
+    }
+    this.objDirty = true;
+  }
+
+  /** Precompute the bots' flow fields for this map + mode (once per map, cached). */
+  warmNav() {
+    if (!this.players.some((q) => q.bot)) return;
+    Bot.warm(this);
+  }
+
+  isProtected(p) { return p.alive && this.tick < p.protectedUntil; }
+
+  // ------------------------------------------------------------------ match: objectives (per tick)
+
+  stepMatch(tick) {
+    if (this.phase === 'countdown') { if (tick >= this.endsTick) this.startPlaying(); return; }
+    if (this.phase === 'results') { if (tick >= this.endsTick) this.afterResults(); return; }
+    if (this.phase !== 'playing') return;
+    if (this.flags) this.stepFlags(tick);
+    else if (this.hp) this.stepHardpoint(tick);
+    if (!this.pendingEnd && tick >= this.endsTick) this.pendingEnd = 'time';
+    if (this.pendingEnd) { this.endMatch(this.pendingEnd); return; }
+    if (this.objDirty && tick - this.objSentAt >= OBJ_MIN_GAP) this.sendObj();
+    else if (tick - this.objSentAt >= OBJ_REFRESH && (this.flags || this.hp || this.config.mode === 'tdm')) this.sendObj();
+  }
+
+  addScore(team, n) {
+    this.scores[team] += n;
+    this.objDirty = true;
+    if (this.scores[team] >= this.config.scoreLimit) this.pendingEnd = 'score';
+  }
+
+  touches(p, x, y, z) {
+    const dx = p.state.x - x, dz = p.state.z - z, dy = p.state.y - y;
+    return dx * dx + dz * dz < FLAG_TOUCH_RADIUS * FLAG_TOUCH_RADIUS && dy > -1.2 && dy < 2.2;
+  }
+
+  stepFlags(tick) {
+    const F = this.flags;
+    for (const t of ['a', 'b']) {
+      const f = F[t];
+      if (f.state === 'dropped' && tick >= f.returnTick) this.returnFlag(f, null);
+    }
+    const players = this.players;
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p.alive || !p.team) continue;
+      const own = F[p.team], enemy = F[otherTeam(p.team)];
+      if (own.state === 'dropped' && this.touches(p, own.x, own.y, own.z)) this.returnFlag(own, p);
+      if ((enemy.state === 'home' || enemy.state === 'dropped') && !p.carrying && this.touches(p, enemy.x, enemy.y, enemy.z)) {
+        enemy.state = 'carried'; enemy.carrier = p.id; enemy.returnTick = 0;
+        p.carrying = enemy.team;
+        p.protectedUntil = 0;              // no invulnerable carriers
+        this.objDirty = true;
+        this.event('flag_taken', { team: enemy.team, player: p.id });
+      }
+      if (p.carrying && own.state === 'home' && this.touches(p, own.home[0], own.home[1], own.home[2])) {
+        const f = F[p.carrying];
+        p.carrying = '';
+        p.obj++;
+        this.resetFlag(f);
+        this.addScore(p.team, 1);
+        this.event('flag_captured', { team: f.team, player: p.id, scorer: p.team, scores: { a: this.scores.a, b: this.scores.b } });
+      }
+    }
+    for (const t of ['a', 'b']) {
+      const f = F[t];
+      if (f.state !== 'carried') continue;
+      const c = this.byId.get(f.carrier);
+      if (c) { f.x = c.state.x; f.y = c.state.y; f.z = c.state.z; }
+    }
+  }
+
+  resetFlag(f) {
+    f.state = 'home'; f.carrier = 0; f.returnTick = 0;
+    f.x = f.home[0]; f.y = f.home[1]; f.z = f.home[2];
+    this.objDirty = true;
+  }
+
+  returnFlag(f, byPlayer) {
+    this.resetFlag(f);
+    this.event('flag_returned', { team: f.team, player: byPlayer ? byPlayer.id : 0 });
+  }
+
+  /** p (carrier) died / left / despawned: the flag drops on the ground below p (or goes home). */
+  dropFlag(p, fell) {
+    const F = this.flags;
+    const team = p.carrying;
+    p.carrying = '';
+    if (!F || !F[team]) return;
+    const f = F[team];
+    if (f.state !== 'carried' || f.carrier !== p.id) return;
+    if (this.phase !== 'playing') { this.resetFlag(f); return; }
+    const s = p.state;
+    const t = fell ? Infinity : raycastWorld(this.world, s.x, s.y + 0.5, s.z, 0, -1, 0, 40, undefined);
+    if (!(t < 40) || s.y + 0.5 - t < this.map.killY + 1) { this.returnFlag(f, null); return; }
+    f.state = 'dropped'; f.carrier = 0;
+    f.x = s.x; f.y = s.y + 0.5 - t; f.z = s.z;
+    f.returnTick = this.tick + msToTicks(FLAG_RETURN_S * 1000);
+    this.objDirty = true;
+    this.event('flag_dropped', { team: f.team, player: p.id, pos: [round2(f.x), round2(f.y), round2(f.z)], returnTick: f.returnTick });
+  }
+
+  inZone(p, z) {
+    const s = p.state;
+    return s.x >= z.min[0] && s.x <= z.max[0] && s.z >= z.min[2] && s.z <= z.max[2] && s.y >= z.min[1] - 0.6 && s.y <= z.max[1];
+  }
+
+  stepHardpoint(tick) {
+    const h = this.hp, zones = this.map.hardpoints;
+    if (tick >= h.rotateTick) {
+      h.index = (h.index + 1) % zones.length;
+      h.rotateTick += msToTicks(HARDPOINT_ROTATE_S * 1000);
+      h.owner = ''; h.hold = 0;
+      this.objDirty = true;
+      this.event('zone_rotated', { index: h.index, name: zones[h.index].name, rotateTick: h.rotateTick });
+    }
+    const z = zones[h.index];
+    let a = 0, b = 0;
+    const players = this.players;
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p.alive || !p.team || !this.inZone(p, z)) continue;
+      if (p.team === 'a') a++; else b++;
+    }
+    h.countA = a; h.countB = b;
+    const owner = a > 0 && b === 0 ? 'a' : b > 0 && a === 0 ? 'b' : a > 0 && b > 0 ? 'contested' : '';
+    if (owner !== h.owner) {
+      h.owner = owner; h.hold = 0;
+      this.objDirty = true;
+      if (owner === 'a' || owner === 'b') this.event('zone_taken', { team: owner });
+      else if (owner === 'contested') this.event('zone_contested', {});
+      else this.event('zone_neutral', {});
+    }
+    if (owner === 'a' || owner === 'b') {
+      if (++h.hold >= TICK_RATE) {
+        h.hold = 0;
+        for (let i = 0; i < players.length; i++) {
+          const p = players[i];
+          if (p.alive && p.team === owner && this.inZone(p, z)) p.obj++;
+        }
+        this.addScore(owner, 1);
+      }
+    }
+  }
+
 
   // ------------------------------------------------------------------ input
 
@@ -415,7 +937,7 @@ export class Room {
     if (p.alive) {
       stepPlayer(p.state, c, this.world, moveSpeedMult(p.kit, p.wstate));
       if (stepWeapon(p.wstate, c, p.kit)) this.fire(p, c, c.rt, late);
-      if (p.alive && p.state.y < MAP.killY) this.kill(p, null, 0, false);
+      if (p.alive && p.state.y < this.map.killY) this.kill(p, null, 0, false);
     }
     p.ackSeq = c.seq;
     const last = p.lastCmd;
@@ -530,6 +1052,13 @@ export class Room {
     const tick = ++this.tick;
     const players = this.players;
 
+    if (this.phase === 'lobby') {
+      // nobody is alive: only drain input queues (clients normally send nothing here)
+      for (let i = 0; i < players.length; i++) if (players[i].qLen > 0) this.consume(players[i]);
+      if (tick % MATCH_REFRESH === 0) { this.broadcastMatch(); this.lobbyChanged(); }
+      return;
+    }
+
     // bots decide (produces cmds through the normal queue)
     for (let i = 0; i < players.length; i++) {
       const p = players[i];
@@ -549,7 +1078,7 @@ export class Room {
     for (let i = 0; i < players.length; i++) {
       const p = players[i];
       if (!p.alive) {
-        if (tick >= p.respawnAt) this.respawn(p);
+        if (tick >= p.respawnAt && this.phase === 'playing') this.respawn(p);
       } else if (p.health < MAX_HEALTH && tick - p.lastDamageTick >= regenDelay) {
         p.health = Math.min(MAX_HEALTH, p.health + REGEN_PER_SEC * DT);
       }
@@ -566,13 +1095,14 @@ export class Room {
       p.histAlive[slot] = p.alive ? 1 : 0;
     }
 
-    // rounds
-    if (tick >= this.endsTick) {
-      if (this.phase === 'playing') this.endRound(); else this.startRound();
-    }
+    // modes, objectives, phase timers (may end the match / start the next phase)
+    this.stepMatch(tick);
+    if (this.phase === 'lobby') return;
 
     if (tick % SNAPSHOT_EVERY === 0) this.sendSnapshots();
     if (tick % SCORES_EVERY === 0) this.broadcast(encodeText({ t: 'scores', rows: this.scoreRows() }), null);
+    if (tick % MATCH_REFRESH === 0) this.broadcastMatch();
+    if (this.botWarm && this.botWarm.length) Bot.warmStep(this);
   }
 
   // ------------------------------------------------------------------ combat
@@ -614,6 +1144,7 @@ export class Room {
     // Rewind other players to the time the shooter was looking at.
     // History exists up to tick-1 for everyone (this tick's moves are not final yet).
     // A cmd replayed after a stall (late > 0) is honoured as if it had arrived on time.
+    p.protectedUntil = 0;               // firing ends spawn protection
     let r = renderTick;
     const newest = this.tick - 1;
     const oldest = this.tick - MAX_REWIND_TICKS - late;
@@ -625,7 +1156,8 @@ export class Room {
     const players = this.players;
     for (let i = 0; i < players.length; i++) {
       const q = players[i];
-      if (q === p || !q.alive) { this.rew[q.index * 5 + 4] = 0; continue; }
+      // friendly fire is off: shots pass through teammates
+      if (q === p || !q.alive || (p.team && q.team === p.team)) { this.rew[q.index * 5 + 4] = 0; continue; }
       this.rewind(q, r);
     }
 
@@ -671,7 +1203,7 @@ export class Room {
     for (let j = 0; j < nd; j++) {
       const v = this.dmgVictim[j];
       this.dmgVictim[j] = null;
-      if (!v.alive) continue;
+      if (!v.alive || this.isProtected(v)) continue;      // spawn protection: hit, no damage
       this.damage(v, p, Math.round(this.dmgAmount[j]), this.dmgHead[j] === 1, slot, gun);
     }
   }
@@ -695,47 +1227,34 @@ export class Room {
   }
 
   kill(victim, killer, weapon, headshot, gun = (weapon | 0) * 2) {
+    const fell = !killer;
+    if (victim.carrying) this.dropFlag(victim, fell && victim.state.y < this.map.killY);
     victim.alive = false;
     if (victim.specN > 0) {          // guessed ticks are final now; drop their late cmds later
       victim.commitN += victim.specN; victim.commitTick = this.tick; victim.specN = 0;
     }
     victim.health = 0;
-    victim.deaths++;
+    victim.protectedUntil = 0;
     victim.respawnAt = this.tick + msToTicks(RESPAWN_MS);
-    if (killer && killer !== victim && this.phase === 'playing') killer.kills++;
+    if (this.phase === 'playing') {
+      victim.deaths++;
+      const enemy = killer && killer !== victim && (!killer.team || killer.team !== victim.team);
+      if (enemy) {
+        killer.kills++;
+        if (this.config.mode === 'tdm' && killer.team) this.addScore(killer.team, 1);
+        else if (this.config.mode === 'ffa' && killer.kills >= this.config.scoreLimit) this.pendingEnd = 'score';
+      }
+    }
     this.broadcast(encodeText({
       t: 'kill', killer: killer && killer !== victim ? killer.id : 0, victim: victim.id,
       weapon: weapon | 0, gun: gun | 0, headshot: !!headshot, respawnTicks: msToTicks(RESPAWN_MS),
     }), null);
   }
 
-  pickSpawn(p) {
-    const spawns = MAP.spawns;
-    let best = -1, bestScore = -1;
-    const scores = this._spawnScores || (this._spawnScores = new Float64Array(spawns.length));
-    for (let s = 0; s < spawns.length; s++) {
-      const [sx, sy, sz] = spawns[s].pos;
-      let minD = 1e12;
-      for (const q of this.players) {
-        if (q === p || !q.alive) continue;
-        const dx = q.state.x - sx, dy = q.state.y - sy, dz = q.state.z - sz;
-        const d = dx * dx + dy * dy + dz * dz;
-        if (d < minD) minD = d;
-      }
-      scores[s] = minD;
-      if (minD > bestScore) { bestScore = minD; best = s; }
-    }
-    // a little variety: random pick among spawns nearly as safe as the best
-    const thr = bestScore * 0.7;
-    let n = 0;
-    for (let s = 0; s < spawns.length; s++) if (scores[s] >= thr) n++;
-    let pick = Math.floor(Math.random() * n);
-    for (let s = 0; s < spawns.length; s++) if (scores[s] >= thr && pick-- === 0) return spawns[s];
-    return spawns[Math.max(0, best)];
-  }
-
   respawn(p) {
-    const sp = this.pickSpawn(p);
+    const ts = this.spawnStats.enabled ? performance.now() : 0;
+    const sp = pickSpawn(this, p);
+    if (ts) { const d = performance.now() - ts; this.spawnStats.ms = (this.spawnStats.ms || 0) + d; if (d > (this.spawnStats.maxMs || 0)) this.spawnStats.maxMs = d; }
     spawnState(p.state, sp.pos[0], sp.pos[1], sp.pos[2]);
     p.specN = 0;
     if (p.botBrain) p.botBrain.beforeSpawn();       // bots may re-roll their pending loadout
@@ -745,36 +1264,24 @@ export class Room {
     p.health = MAX_HEALTH;
     p.lastDamageTick = -1e9;
     p.spawnTick = this.tick;
+    p.respawnAt = Infinity;
+    p.protectedUntil = this.tick + msToTicks(SPAWN_PROTECT_MS);
+    p.carrying = '';
+    if (this.spawnStats.enabled) {     // measurement only (tools/modes.test.js)
+      this.spawnStats.spawns++;
+      if (this.spawnStats.check(this, p, sp.pos)) this.spawnStats.visible++;
+    }
     if (p.botBrain) p.botBrain.onSpawn(sp);
     this.broadcast(encodeText({
       t: 'spawn', id: p.id, x: sp.pos[0], y: sp.pos[1], z: sp.pos[2], yaw: sp.yaw || 0, lo: p.kit.code,
+      team: p.team, prot: msToTicks(SPAWN_PROTECT_MS),
     }), null);
   }
 
-  // ------------------------------------------------------------------ rounds
+  // ------------------------------------------------------------------ scoreboard
 
   scoreRows() {
-    return this.players.map((p) => ({ id: p.id, kills: p.kills, deaths: p.deaths, ping: p.ping }));
-  }
-
-  endRound() {
-    this.phase = 'intermission';
-    this.endsTick = this.tick + msToTicks(INTERMISSION_MS);
-    let winner = null;
-    for (const p of this.players) {
-      if (!winner || p.kills > winner.kills || (p.kills === winner.kills && p.deaths < winner.deaths)) winner = p;
-    }
-    this.broadcast(encodeText({
-      t: 'round', phase: this.phase, endsTick: this.endsTick, winner: winner ? winner.id : 0, rows: this.scoreRows(),
-    }), null);
-  }
-
-  startRound() {
-    this.phase = 'playing';
-    this.endsTick = this.tick + msToTicks(ROUND_MS);
-    for (const p of this.players) { p.kills = 0; p.deaths = 0; }
-    this.broadcast(encodeText({ t: 'round', phase: this.phase, endsTick: this.endsTick }), null);
-    for (const p of this.players) this.respawn(p);
+    return this.players.map((p) => ({ id: p.id, kills: p.kills, deaths: p.deaths, ping: p.ping, team: p.team, obj: p.obj }));
   }
 
   // ------------------------------------------------------------------ output
@@ -807,6 +1314,7 @@ export class Room {
       e.alive = p.alive; e.crouching = !!s.crouching; e.sliding = !!s.sliding; e.onGround = !!s.onGround;
       e.ads = (p.lastCmd.buttons & BTN.ADS) !== 0; e.reloading = p.wstate.reload > 0;
       e.weapon = p.wstate.weapon; e.gun = p.kit.guns[p.wstate.weapon]; e.health = p.health;
+      e.team = p.team; e.protected = this.isProtected(p); e.carrier = p.carrying !== '';
       writePlayerEntry(pv, i * PLAYER_ENTRY_BYTES, e);
     }
     const shotsLen = this.shotCount * SHOT_ENTRY_BYTES;
@@ -832,6 +1340,7 @@ export class Room {
       you.state = p.specN > 0 ? p.specBase : p.state;
       you.inputBuffer = p.depthAvg; you.inputTarget = p.target; you.timeScale = p.dilation;
       you.starved = p.starvedCounter;
+      you.protected = this.isProtected(p); you.team = p.team; you.carrier = p.carrying !== '';
       writeSnapshotSelf(this.selfView, 0, this.tick, p.ackSeq, you);
       // ws may keep a reference to the buffer while the socket is busy, so each client gets
       // its own (pooled, small) Buffer; all encoding work above is shared.
@@ -867,7 +1376,8 @@ export class Room {
   status() {
     const secs = Math.max(0.001, (performance.now() - this.createdAt) / 1000);
     return {
-      name: this.name, tick: this.tick, phase: this.phase,
+      name: this.name, tick: this.tick, phase: this.phase, private: this.isPrivate,
+      mode: this.config.mode, mapId: this.map.id, hostId: this.hostId, scores: { ...this.scores },
       roundLeftS: Math.max(0, Math.round((this.endsTick - this.tick) / TICK_RATE)),
       players: this.players.length, humans: this.humans, bots: this.botCount,
       tickMs: this.timingStats(), overruns: this.overruns, catchUpDrops: this.catchUpDrops,

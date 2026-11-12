@@ -36,13 +36,14 @@ const opt = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? parseF
 const CLEAN_S = opt('clean', 20);
 const LAG_S = opt('lag', 20);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const world = createWorld(MAP);
+const world = createWorld(MAP);     // fallback only: net.js predicts on the room's map (net.world)
+const MAP_ID = args.includes('--map') ? args[args.indexOf('--map') + 1] : MAP.id;
 
 // ------------------------------------------------------------------ server child
 let server = null;
 async function startServer() {
   server = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT), BOTS: '4' }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '400' }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});
   let inUse = false;
@@ -246,7 +247,7 @@ class Client {
     }
     const p = n.pred, w = n.predWeapon;
     const o = this.ap.update({
-      world, self: p, alive: n.state.alive, remotes: this.players,
+      world: n.world, self: p, alive: n.state.alive, remotes: this.players,
       weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: n.kit.slots[w.weapon].magSize,
     });
     const fx = n.tick(o, rt);
@@ -414,6 +415,15 @@ function table(rows) {
 async function phase(label, secs, room, makeSocket, midHook) {
   const clients = [0, 1, 2].map((i) => new Client(i, room, makeSocket ? makeSocket(i) : undefined));
   for (const c of clients) await c.connect();
+  // (protocol v4) a private room starts in the lobby: the first client is host and starts an
+  // ffa match with bots filling to 4 participants on the map given by --map (default map)
+  const host = clients[0].net;
+  if (!host.state.match.isHost) throw new Error('first client is not the host');
+  host.setMatchConfig({ mode: 'ffa', mapId: MAP_ID, bots: { fill: 4 }, timeLimitS: 1800, scoreLimit: 200 });
+  await sleep(300);
+  host.startMatch();
+  for (let i = 0; i < 100 && !clients.every((c) => c.net.state.match.phase === 'playing'); i++) await sleep(50);
+  if (!clients.every((c) => c.net.state.match.phase === 'playing' && c.net.state.match.mapId === MAP_ID)) throw new Error('match did not start');
   // let clock sync / buffers settle, then measure from a clean slate
   await run(clients, 2);
   for (const c of clients) resetMeasure(c);

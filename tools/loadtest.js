@@ -3,7 +3,11 @@
 //
 //   node tools/loadtest.js [--clients 20] [--duration 20] [--warmup 3] [--port 3101]
 //                          [--host localhost] [--room name] [--spawn]
+//                          [--mode ffa|tdm|ctf|hardpoint --room name [--map id] [--bots 20]]
 //
+//   --mode    (protocol v4) the first client hosts a private match in --room: config
+//             { mode, mapId, bots: { fill } } + start, then everyone plays it (bots fill the
+//             room up to --bots participants, split evenly into teams in team modes)
 //   --spawn   start `node server/index.js` on --port for the run (killed afterwards)
 //
 // Prints server tick time p50/p95/p99/max per room (from /status, measured after warm-up),
@@ -18,7 +22,7 @@ import WebSocket from 'ws';
 import { BTN, TICK_RATE, INTERP_DELAY_MS } from '../shared/constants.js';
 import {
   encodeInput, encodeJoin, encodePing, decodeSnapshot, decodeText, createSnapshot, createCmd, sanitizeCmd,
-  INPUT_REDUNDANCY,
+  INPUT_REDUNDANCY, encodeMatchConfig, encodeStart,
 } from '../shared/protocol.js';
 
 const args = process.argv.slice(2);
@@ -35,6 +39,10 @@ const PORT = parseInt(opt('port', process.env.PORT || '3101'), 10);
 const HOST = opt('host', 'localhost');
 const ROOM = opt('room', '');
 const SPAWN = opt('spawn', false) === true;
+// (v4) --mode ffa|tdm|ctf|hardpoint [--map id] [--bots fill]: host a private match in --room
+const MODE = typeof opt('mode', '') === 'string' ? opt('mode', '') : '';
+const MAP_ID = typeof opt('map', '') === 'string' ? opt('map', '') : '';
+const BOTS_FILL = parseInt(opt('bots', '20'), 10);
 // --url https://host targets a remote (TLS) server instead of --host/--port.
 const URL_OPT = opt('url', '');
 const BASE_HTTP = typeof URL_OPT === 'string' && URL_OPT ? URL_OPT.replace(/\/+$/, '') : `http://${HOST}:${PORT}`;
@@ -107,11 +115,12 @@ class Client {
           if (s.ackSeq >= 0) this.stats.ackLagMax = Math.max(this.stats.ackLagMax, this.seq - 1 - s.ackSeq);
           return;
         }
-        const m = decodeText(data.toString());
+        const m = decodeText(data.toString(), 1 << 20);
         if (!m) return;
         this.stats.events++;
-        if (m.t === 'welcome') { this.id = m.id; this.room = m.room; this.lastSnapTick = m.tick; this.lastSnapAt = performance.now(); resolve(); }
+        if (m.t === 'welcome') { this.id = m.id; this.room = m.room; this.phase = m.match && m.match.phase; this.lastSnapTick = m.tick; this.lastSnapAt = performance.now(); resolve(); }
         else if (m.t === 'pong') this.rtt = performance.now() - m.c;
+        else if (m.t === 'match') this.phase = m.phase;
         else if (m.t === 'spawn' && m.id === this.id) this.yaw = m.yaw;
         else if (m.t === 'error') reject(new Error(m.message));
       });
@@ -184,6 +193,17 @@ async function main() {
   const rooms = {};
   for (const c of clients) rooms[c.room] = (rooms[c.room] || 0) + 1;
   console.log(`connected; room split: ${JSON.stringify(rooms)}`);
+  if (MODE) {
+    // (protocol v4) a named room starts in the lobby: client 0 is host, configures and starts
+    if (!ROOM) throw new Error('--mode needs --room');
+    const cfg = { mode: MODE, bots: { fill: BOTS_FILL }, timeLimitS: 3600, scoreLimit: 1000 };
+    if (MAP_ID) cfg.mapId = MAP_ID;
+    clients[0].send(encodeMatchConfig(cfg));
+    await sleep(200);
+    clients[0].send(encodeStart());
+    for (let i = 0; i < 100 && clients[0].phase !== 'playing'; i++) await sleep(50);
+    console.log(`match: ${MODE} on ${MAP_ID || '(room default map)'}, bots fill ${BOTS_FILL}, phase ${clients[0].phase}`);
+  }
 
   // 60 Hz input driven by an accumulator (each client sends exactly one packet per tick on average)
   const t0 = performance.now();
