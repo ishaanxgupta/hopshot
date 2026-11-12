@@ -42,8 +42,47 @@
 //   Remote players: the interpolated objects carry gun (gun id in hand), lo (that life's
 //   loadout code) and att (attachment mask of the gun in hand); roster entries carry lo.
 //   fx.gun / localView(out).gun = gun id in hand; localView(out).aim = aim progress 0..1.
+//
+// Modes, lobby, maps (protocol v4; rules in shared/modes.js):
+//   createNet({ url, world? })   world is only a fallback: net predicts on the map the server
+//                                names (welcome / 'match' mapId) and builds + caches that world
+//                                itself. net.world / net.map = the current world / map object.
+//   event 'map' ({ mapId, map, world })   on every welcome and whenever the map changes: rebuild
+//                                the renderer from `map`. Only happens while you are dead
+//                                (lobby / countdown / results), so prediction stays exact.
+//   net.state.match (same object until the next welcome; read it every frame):
+//     { phase: 'lobby'|'countdown'|'playing'|'results', mode, modeInfo (MODES[mode]), teams,
+//       private, mapId, mapName, map, config, scoreLimit, timeLimitS, scores: { a, b },
+//       startTick, endsTick, hostId, isHost, myTeam: ''|'a'|'b',
+//       lobby: [{ id, name, team, bot, host }],
+//       flags: null | { a: Flag, b: Flag }   (ctf; flags.a = team A's flag)
+//         Flag = { state: 'home'|'carried'|'dropped', carrier, pos: [x,y,z] (follows the
+//                  carrier's rendered position every sampleRemotes), returnTick, returnInS },
+//       hardpoint: null | { index, name, min, max, owner: ''|'a'|'b'|'contested', rotateTick,
+//                  rotateInS, next, count: { a, b } },
+//       result: null | { mode, mapId, winner: 'a'|'b'|<id>|null, draw, winnerName, scores,
+//                  reason: 'score'|'time', endsTick, rows: [{ id, name, team, bot, kills, deaths, obj }] },
+//       timeLeftS, countdown, resultsLeftS }   (the last three are live getters, in seconds)
+//   net.state.team / .protected / .carrier   your own team, spawn protection, carrying a flag
+//   localView(out) also sets out.team, out.protected, out.carrier; remote objects from
+//   sampleRemotes carry team ('' | 'a' | 'b'), protected and carrier; roster entries carry
+//   team and obj (captures / zone seconds).
+//   net.setMatchConfig(partial) host, lobby: edits are merged + sanitised and sent at most every
+//                                250 ms; returns the full config requested
+//   net.startMatch()             host, lobby -> countdown
+//   net.switchTeam('a'|'b')      lobby, team modes (not co-op)
+//   net.returnToLobby()          host, private rooms: abort countdown / match / results
+//   A rejected request arrives as event 'error' { code: not_host|bad_phase|bad_team|bad_config, req }.
+//   events: 'match' (state.match) any match change; 'phase' (phase, prev); 'lobby' (lobby);
+//   'team' ({ id, team }); 'objective' (state.match) flags / zone / scores changed;
+//   'ev' ({ e, ... }) flag_taken / flag_dropped / flag_returned / flag_captured / zone_rotated /
+//   zone_taken / zone_contested / zone_neutral / match_start / match_end; 'result' (result).
+//   In the lobby net.tick() returns null and sends no input (nobody is simulated there).
 
-import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER } from '../shared/constants.js';
+import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER, TICK_RATE } from '../shared/constants.js';
+import { getMap, DEFAULT_MAP_ID } from '../shared/maps/index.js';
+import { createWorld } from '../shared/physics.js';
+import { MODES, sanitizeMatchConfig, defaultMatchConfig, isTeamMode } from '../shared/modes.js';
 import {
   createWeaponState, copyWeaponState, resetWeaponState, stepWeapon, shotDir, getKit, moveSpeedMult,
   sameWeaponState, aimFraction, sanitizeLoadout, encodeLoadout, decodeLoadout, sanitizeLoadoutCode,
@@ -55,8 +94,16 @@ import {
 } from '../shared/physics.js';
 import {
   TICK_MS, SHOT, INPUT_REDUNDANCY, createCmd, sanitizeCmd, encodeInput, encodeJoin, encodePing,
-  decodeSnapshot, decodeText, createSnapshot, encodeSetLoadout,
+  decodeSnapshot, decodeText, createSnapshot, encodeSetLoadout, encodeMatchConfig, encodeStart, encodeTeam,
+  encodeReturnToLobby,
 } from '../shared/protocol.js';
+
+const worldCache = new Map();   // map id -> collision world (shared by every net instance)
+function worldForMap(map) {
+  let w = worldCache.get(map.id);
+  if (!w) { w = createWorld(map); worldCache.set(map.id, w); }
+  return w;
+}
 
 const RING = 256;                          // prediction history (power of two, ~4.3 s)
 const RING_MASK = RING - 1;
@@ -98,7 +145,8 @@ const sameWeapon = sameWeaponState;
 
 function createSample() {
   return { tick: 0, life: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, alive: false, crouching: false, sliding: false,
-    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, health: 0 };
+    onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, health: 0,
+    team: '', protected: false, carrier: false };
 }
 
 function createRemote(id) {
@@ -110,7 +158,8 @@ function createRemote(id) {
     ex: 0, ey: 0, ez: 0, lx: 0, ly: 0, lz: 0, vx: 0, vy: 0, vz: 0, lastRt: 0, lastLife: -1, lastAlive: false, fresh: true,
     wasExtrap: false, wasHold: false,
     out: { id, name: '', x: 0, y: 0, z: 0, yaw: 0, pitch: 0, crouching: false, sliding: false, alive: false,
-      onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, att: 0, health: 0, life: 0, bot: false },
+      onGround: false, ads: false, reloading: false, weapon: 0, gun: 0, lo: DEFAULT_LOADOUT_CODE, att: 0, health: 0, life: 0, bot: false,
+      team: '', protected: false, carrier: false },
   };
 }
 
@@ -122,6 +171,7 @@ function copySampleTo(o, s) {
   o.crouching = s.crouching; o.sliding = s.sliding; o.onGround = s.onGround; o.ads = s.ads;
   o.reloading = s.reloading; o.weapon = s.weapon; o.health = s.health; o.life = s.life;
   o.gun = s.gun; o.lo = s.lo; o.att = getKit(s.lo).masks[s.weapon] | 0;
+  o.team = s.team; o.protected = s.protected; o.carrier = s.carrier;
 }
 
 /** Interpolate remote r at fractional tick rt into r.out. */
@@ -168,8 +218,12 @@ function interpolate(r, rt) {
 }
 
 export function createNet(opts = {}) {
-  const world = opts.world;
-  if (!world) throw new Error('createNet: opts.world is required');
+  // The prediction world follows the room's map id (welcome / 'match'); opts.world is only the
+  // fallback for a server that sends no map id. Without opts.world the default map is used
+  // until the server names one.
+  const fallbackWorld = opts.world || null;
+  let curMap = fallbackWorld ? null : getMap(DEFAULT_MAP_ID);
+  let world = fallbackWorld || worldForMap(curMap);
   const makeSocket = opts.createSocket || ((url) => new WebSocket(url));
   const now = opts.now || (() => performance.now());
 
@@ -208,7 +262,30 @@ export function createNet(opts = {}) {
       rttMs: NaN, jitterMs: 0, interpDelayMs: INTERP_DELAY_MS, timeScale: 1, inputBufferTicks: 0,
       corrections10s: 0, starved10s: 0,
     },
+    // (v4) your team / spawn protection / carrying the enemy flag (from your own snapshots)
+    team: '', protected: false, carrier: false,
+    match: null,                 // see createMatchState (header: Modes, lobby, maps)
   };
+  st.match = createMatchState();
+
+  function createMatchState() {
+    const m = {
+      phase: 'playing', mode: 'ffa', modeInfo: MODES.ffa, teams: false, private: false,
+      mapId: curMap ? curMap.id : '', mapName: curMap ? curMap.name : '', map: curMap,
+      config: defaultMatchConfig(), scoreLimit: MODES.ffa.scoreLimit, timeLimitS: MODES.ffa.timeLimitS,
+      scores: { a: 0, b: 0 }, startTick: 0, endsTick: 0,
+      hostId: 0, isHost: false, myTeam: '',
+      lobby: [], flags: null, hardpoint: null, result: null,
+    };
+    const left = (tick) => (tick > 0 ? Math.max(0, (tick - serverTick()) / TICK_RATE) : 0);
+    Object.defineProperties(m, {
+      // seconds, computed from the synced server clock whenever read
+      timeLeftS: { enumerable: true, get() { return m.phase === 'playing' ? left(m.endsTick) : 0; } },
+      countdown: { enumerable: true, get() { return m.phase === 'countdown' ? left(m.endsTick) : 0; } },
+      resultsLeftS: { enumerable: true, get() { return m.phase === 'results' ? left(m.endsTick) : 0; } },
+    });
+    return m;
+  }
 
   const stats = {
     snapshots: 0, compared: 0, corrections: 0, maxError: 0, sumError: 0, lastError: 0,
@@ -436,9 +513,11 @@ export function createNet(opts = {}) {
     qCorr.fill(0); qStarved.fill(0); lastStarvedCounter = -1;
   }
 
+  const teamOf = (t) => (t === 'a' || t === 'b' ? t : '');
+
   function rosterEntry(p) {
     return { id: p.id | 0, name: String(p.name || ''), bot: !!p.bot, kills: p.kills | 0, deaths: p.deaths | 0, ping: p.ping | 0,
-      lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE };
+      lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE, team: teamOf(p.team), obj: p.obj | 0 };
   }
 
   function applyRows(rows) {
@@ -447,8 +526,152 @@ export function createNet(opts = {}) {
       const e = st.roster.get(r.id);
       if (!e) continue;
       e.kills = r.kills | 0; e.deaths = r.deaths | 0; e.ping = r.ping | 0;
+      if (r.team !== undefined) e.team = teamOf(r.team);
+      if (r.obj !== undefined) e.obj = r.obj | 0;
     }
   }
+
+  // ------------------------------------------------------------------ match / lobby / map (v4)
+  /** Switch the prediction world to map `id` (force: emit 'map' even if unchanged). */
+  function selectMap(id, force) {
+    if (typeof id !== 'string' || !id) { if (force && curMap) emit('map', { mapId: curMap.id, map: curMap, world }); return; }
+    const m = getMap(id);
+    if (m.id !== id) return;                       // unknown to this client: keep the current world
+    const changed = !curMap || curMap.id !== id;
+    if (changed) {
+      curMap = m;
+      world = worldForMap(m);
+      // whatever we predicted belongs to the old map
+      for (const e of ring) e.valid = false;
+      teleportPending = true;
+    }
+    const M = st.match;
+    M.mapId = m.id; M.mapName = m.name; M.map = m;
+    st.mapName = m.name;
+    if (changed || force) emit('map', { mapId: m.id, map: m, world });
+  }
+
+  function refreshLobby() {
+    const M = st.match;
+    for (const e of M.lobby) {
+      e.host = M.private && e.id === M.hostId;
+      const r = st.roster.get(e.id);
+      if (r) { e.team = r.team; e.name = r.name; }
+    }
+    M.isHost = M.private && M.hostId === st.id && st.id !== 0;
+    const me = st.roster.get(st.id);
+    if (me) M.myTeam = me.team;
+  }
+
+  function applyMatch(m, silent) {
+    const M = st.match, prev = M.phase;
+    if (typeof m.phase === 'string') M.phase = m.phase;
+    if (m.config && typeof m.config === 'object') M.config = sanitizeMatchConfig(m.config, M.config);
+    M.mode = M.config.mode; M.modeInfo = MODES[M.mode]; M.teams = isTeamMode(M.mode);
+    M.scoreLimit = M.config.scoreLimit; M.timeLimitS = M.config.timeLimitS;
+    M.private = !!m.private;
+    M.hostId = m.hostId | 0;
+    M.startTick = +m.startTick || 0; M.endsTick = +m.endsTick || 0;
+    if (m.scores) { M.scores.a = m.scores.a | 0; M.scores.b = m.scores.b | 0; }
+    if (M.phase === 'results') { if (m.result) M.result = m.result; } else M.result = null;
+    if (M.phase !== 'playing') { M.flags = null; M.hardpoint = null; st.alive = false; st.protected = false; st.carrier = false; }
+    selectMap(m.mapId, false);
+    st.round.phase = M.phase === 'playing' ? 'playing' : 'intermission';
+    st.round.endsTick = M.endsTick;
+    refreshLobby();
+    if (silent) return;
+    if (prev !== M.phase) emit('phase', M.phase, prev);
+    emit('match', M);
+  }
+
+  function applyLobby(l, silent) {
+    const M = st.match;
+    if (Number.isFinite(l.hostId)) M.hostId = l.hostId | 0;
+    M.lobby = [];
+    for (const p of Array.isArray(l.players) ? l.players : []) {
+      const team = teamOf(p.team);
+      const r = st.roster.get(p.id);
+      if (r) r.team = team;
+      M.lobby.push({ id: p.id | 0, name: String(p.name || ''), team, bot: !!p.bot, host: false });
+    }
+    refreshLobby();
+    if (!silent) emit('lobby', M.lobby);
+  }
+
+  function makeFlag() {
+    const f = { state: 'home', carrier: 0, pos: [0, 0, 0], returnTick: 0 };
+    Object.defineProperty(f, 'returnInS', { enumerable: true, get() { return f.state === 'dropped' && f.returnTick > 0 ? Math.max(0, (f.returnTick - serverTick()) / TICK_RATE) : 0; } });
+    return f;
+  }
+
+  function applyObj(o, silent) {
+    const M = st.match;
+    if (!o) { M.flags = null; M.hardpoint = null; if (!silent) emit('objective', M); return; }
+    if (o.scores) { M.scores.a = o.scores.a | 0; M.scores.b = o.scores.b | 0; }
+    if (o.flags && o.flags.a && o.flags.b) {
+      if (!M.flags) M.flags = { a: makeFlag(), b: makeFlag() };
+      for (const t of ['a', 'b']) {
+        const s = o.flags[t], f = M.flags[t];
+        f.state = s.state === 'carried' || s.state === 'dropped' ? s.state : 'home';
+        f.carrier = s.carrier | 0;
+        if (Array.isArray(s.pos)) { f.pos[0] = +s.pos[0] || 0; f.pos[1] = +s.pos[1] || 0; f.pos[2] = +s.pos[2] || 0; }
+        f.returnTick = +s.returnTick || 0;
+      }
+    } else M.flags = null;
+    if (o.hp) {
+      let h = M.hardpoint;
+      if (!h) {
+        h = M.hardpoint = { index: 0, name: '', min: [0, 0, 0], max: [0, 0, 0], owner: '', rotateTick: 0, next: 0, count: { a: 0, b: 0 } };
+        Object.defineProperty(h, 'rotateInS', { enumerable: true, get() { return h.rotateTick > 0 ? Math.max(0, (h.rotateTick - serverTick()) / TICK_RATE) : 0; } });
+      }
+      h.index = o.hp.index | 0; h.name = String(o.hp.name || '');
+      if (Array.isArray(o.hp.min)) h.min = o.hp.min.slice(0, 3);
+      if (Array.isArray(o.hp.max)) h.max = o.hp.max.slice(0, 3);
+      h.owner = o.hp.owner === 'a' || o.hp.owner === 'b' || o.hp.owner === 'contested' ? o.hp.owner : '';
+      h.rotateTick = +o.hp.rotateTick || 0; h.next = o.hp.next | 0;
+      if (o.hp.count) { h.count.a = o.hp.count.a | 0; h.count.b = o.hp.count.b | 0; }
+    } else M.hardpoint = null;
+    if (!silent) emit('objective', M);
+  }
+
+  /** Carried flags follow their carrier's rendered position (called per frame from sampleRemotes). */
+  function updateCarriedFlags() {
+    const F = st.match.flags;
+    if (!F) return;
+    for (const t of ['a', 'b']) {
+      const f = F[t];
+      if (f.state !== 'carried') continue;
+      if (f.carrier === st.id) { f.pos[0] = pred.x; f.pos[1] = pred.y; f.pos[2] = pred.z; continue; }
+      const r = remotes.get(f.carrier);
+      if (r && r.count) { f.pos[0] = r.out.x; f.pos[1] = r.out.y; f.pos[2] = r.out.z; }
+    }
+  }
+
+  // config edits are coalesced (sliders) and sent at most every CONFIG_GAP_MS
+  const CONFIG_GAP_MS = 250;
+  let cfgPending = null, cfgTimer = null, cfgSentAt = -1e9;
+  function flushConfig() {
+    cfgTimer = null;
+    if (!cfgPending || !isOpen() || !st.connected) return;
+    sendText(encodeMatchConfig(cfgPending));
+    cfgPending = null;
+    cfgSentAt = now();
+  }
+  /**
+   * Host: change the match config (lobby only). Accepts a partial config; returns the full
+   * sanitised config that will be requested (the server's 'match' reply is authoritative).
+   */
+  function setMatchConfig(partial) {
+    const full = sanitizeMatchConfig(partial, { ...st.match.config, ...(cfgPending || {}) });
+    cfgPending = full;
+    const wait = CONFIG_GAP_MS - (now() - cfgSentAt);
+    if (wait <= 0) flushConfig();
+    else if (!cfgTimer) cfgTimer = setTimeout(flushConfig, wait);
+    return full;
+  }
+  function startMatch() { if (cfgPending) flushConfig(); sendText(encodeStart()); }
+  function switchTeam(team) { sendText(encodeTeam(team)); }
+  function returnToLobby() { sendText(encodeReturnToLobby()); }
 
   function onText(m) {
     switch (m.t) {
@@ -460,6 +683,13 @@ export function createNet(opts = {}) {
         st.mapName = String(m.map || '');
         for (const p of m.players || []) st.roster.set(p.id, rosterEntry(p));
         if (m.round) { st.round.phase = m.round.phase; st.round.endsTick = m.round.endsTick; st.round.winner = 0; }
+        // (v4) match / lobby / objective state and the map to predict on
+        st.match = createMatchState();
+        if (m.match) applyMatch(m.match, true);
+        if (m.lobby) applyLobby(m.lobby, true);
+        applyObj(m.obj || null, true);
+        if (!m.match) selectMap(m.mapId, false);
+        refreshLobby();
         // the server's copy of our pending loadout; re-send ours if it changed while joining
         st.loadout.serverPendingCode = Number.isInteger(m.lo) ? m.lo : -1;
         if (st.loadout.serverPendingCode !== st.loadout.pendingCode) sendText(encodeSetLoadout(st.loadout.pendingCode));
@@ -490,8 +720,27 @@ export function createNet(opts = {}) {
           }
         }, 1000);
         emit('welcome', m);
+        selectMap(st.match.mapId, true);   // always tell the UI which map to build
+        emit('match', st.match);
+        emit('lobby', st.match.lobby);
+        emit('objective', st.match);
         return;
       }
+      case 'match': applyMatch(m, false); return;
+      case 'lobby': applyLobby(m, false); return;
+      case 'obj': if (st.match.phase === 'playing') applyObj(m, false); return;
+      case 'team': {
+        const team = teamOf(m.team);
+        const r = st.roster.get(m.id);
+        if (r) r.team = team;
+        const l = st.match.lobby.find((e) => e.id === m.id);
+        if (l) l.team = team;
+        refreshLobby();
+        emit('team', { id: m.id | 0, team });
+        return;
+      }
+      case 'result': st.match.result = m; emit('result', m); return;
+      case 'ev': emit('ev', m); return;
       case 'pong': onPong(m); return;
       case 'loadout': {
         if (Number.isInteger(m.lo)) st.loadout.serverPendingCode = sanitizeLoadoutCode(m.lo);
@@ -506,13 +755,16 @@ export function createNet(opts = {}) {
       case 'leave': {
         st.roster.delete(m.id);
         removeRemote(m.id);
+        const i = st.match.lobby.findIndex((e) => e.id === m.id);
+        if (i >= 0) st.match.lobby.splice(i, 1);
         emit('leave', m);
         return;
       }
       case 'kill': {
         const k = st.roster.get(m.killer), v = st.roster.get(m.victim);
-        if (v) v.deaths++;
-        if (k && m.killer !== m.victim && st.round.phase === 'playing') k.kills++;
+        const playing = st.match.phase === 'playing';
+        if (v && playing) v.deaths++;
+        if (k && m.killer !== m.victim && playing && (!k.team || !v || k.team !== v.team)) k.kills++;
         if (m.victim === st.id) st.alive = false;
         emit('kill', m);
         return;
@@ -520,7 +772,10 @@ export function createNet(opts = {}) {
       case 'spawn': {
         const re = st.roster.get(m.id);
         if (re && Number.isInteger(m.lo)) re.lo = sanitizeLoadoutCode(m.lo);
+        if (re && m.team !== undefined) re.team = teamOf(m.team);
         if (m.id === st.id) {
+          if (m.team !== undefined) { st.team = teamOf(m.team); st.match.myTeam = st.team; }
+          st.protected = (m.prot | 0) > 0;
           // a new life: the loadout the server activated for it (our pending one, sanitised)
           setActiveLoadout(Number.isInteger(m.lo) ? m.lo : st.loadout.pendingCode);
           spawnState(pred, +m.x || 0, +m.y || 0, +m.z || 0);
@@ -541,7 +796,7 @@ export function createNet(opts = {}) {
       case 'round': {
         st.round.phase = m.phase; st.round.endsTick = m.endsTick; st.round.winner = m.winner | 0;
         if (m.rows) applyRows(m.rows);
-        if (m.phase === 'playing') for (const e of st.roster.values()) { e.kills = 0; e.deaths = 0; }
+        if (m.phase === 'playing') for (const e of st.roster.values()) { e.kills = 0; e.deaths = 0; e.obj = 0; }
         emit('round', m);
         return;
       }
@@ -675,6 +930,12 @@ export function createNet(opts = {}) {
     updateQuality(tArr, you);
     if (!st.id) st.id = you.id;
     st.health = you.health;
+    st.protected = you.protected; st.carrier = you.carrier;
+    if (st.team !== you.team) {
+      st.team = you.team; st.match.myTeam = you.team;
+      const me = st.roster.get(st.id);
+      if (me) me.team = you.team;
+    }
     st.respawnAtTick = s.tick + you.respawnTicks;
     copyState(server, you.state);
     copyWeaponState(serverW, you.weapon);
@@ -796,6 +1057,7 @@ export function createNet(opts = {}) {
     s.x = p.x; s.y = p.y; s.z = p.z; s.yaw = p.yaw; s.pitch = p.pitch; s.alive = p.alive;
     s.crouching = p.crouching; s.sliding = p.sliding; s.onGround = p.onGround; s.ads = p.ads;
     s.reloading = p.reloading; s.weapon = p.weapon; s.gun = p.gun; s.health = p.health;
+    s.team = p.team; s.protected = p.protected; s.carrier = p.carrier;
     const re = st.roster.get(p.id);
     s.lo = re ? re.lo : DEFAULT_LOADOUT_CODE;
   }
@@ -833,6 +1095,7 @@ export function createNet(opts = {}) {
       o.bot = e ? e.bot : false;
       if (out) out.push(o);
     }
+    updateCarriedFlags();
     return out;
   }
 
@@ -887,6 +1150,8 @@ export function createNet(opts = {}) {
    */
   function tick(input, rt) {
     if (!st.connected || !isOpen()) return null;
+    // (v4) nothing is simulated in the lobby: send no input there (the server sleeps)
+    if (st.match.phase === 'lobby') return null;
     if (!Number.isFinite(rt)) rt = renderTick();
 
     fx.alive = st.alive; fx.fired = false; fx.shotCount = 0; fx.jumped = false; fx.landed = false;
@@ -998,6 +1263,7 @@ export function createNet(opts = {}) {
       for (let i = 0; i < remoteList.length; i++) {
         const o = remoteList[i].out;
         if (!o.alive || remoteList[i].count === 0) continue;
+        if (st.team && o.team === st.team) continue;        // friendly fire off: shots pass through
         const h = raycastPlayer(ox, oy, oz, dx, dy, dz, o.x, o.y, o.z, o.crouching ? PLAYER.crouchHeight : PLAYER.height, best);
         if (h && h.t < best) { best = h.t; kind = h.head ? SHOT.HEAD : SHOT.BODY; victim = o.id; }
       }
@@ -1036,14 +1302,19 @@ export function createNet(opts = {}) {
     out.gun = kit.guns[predW.weapon];
     out.aim = aimFraction(kit, predW);
     out.reloading = predW.reload > 0;
+    out.team = st.team; out.protected = st.protected && st.alive; out.carrier = st.carrier && st.alive;
     return out;
   }
 
   const api = {
     on, off, connect, close, retryNow, setLoadout,
+    setMatchConfig, startMatch, switchTeam, returnToLobby,
     tick, sampleRemotes, remoteEye, decayError, localView,
     serverTick, renderTick,
     get state() { return st; },
+    get match() { return st.match; },
+    get world() { return world; },
+    get map() { return curMap; },
     get stats() { return stats; },
     get pred() { return pred; },
     get predWeapon() { return predW; },

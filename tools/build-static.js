@@ -27,10 +27,15 @@ for (const f of fs.readdirSync(path.join(ROOT, 'client'))) {
   if (!/\.(js|css)$/.test(f)) continue;
   fs.copyFileSync(path.join(ROOT, 'client', f), path.join(DIST, 'client', f)); files++;
 }
-for (const f of fs.readdirSync(path.join(ROOT, 'shared'))) {
-  if (!f.endsWith('.js')) continue;
-  fs.copyFileSync(path.join(ROOT, 'shared', f), path.join(DIST, 'shared', f)); files++;
-}
+// shared/ recursively (shared/maps/* is imported by shared/map.js and client/net.js)
+const copyJs = (rel) => {
+  for (const e of fs.readdirSync(path.join(ROOT, rel), { withFileTypes: true })) {
+    const r = path.join(rel, e.name);
+    if (e.isDirectory()) { fs.mkdirSync(path.join(DIST, r), { recursive: true }); copyJs(r); }
+    else if (e.name.endsWith('.js')) { fs.copyFileSync(path.join(ROOT, r), path.join(DIST, r)); files++; }
+  }
+};
+copyJs('shared');
 fs.copyFileSync(
   path.join(ROOT, 'node_modules', 'three', 'build', 'three.module.min.js'),
   path.join(DIST, 'vendor', 'three.module.min.js'),

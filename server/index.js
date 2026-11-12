@@ -10,14 +10,14 @@ import http from 'node:http';
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { WebSocketServer } from 'ws';
-import { MAP } from '../shared/map.js';
 import { MAX_PLAYERS } from '../shared/constants.js';
-import { createWorld } from '../shared/physics.js';
 import {
   PROTOCOL_VERSION, MSG, MAX_TEXT_BYTES, INPUT_MAX_BYTES, createInputPacket, decodeInput, decodeText,
-  encodeText, sanitizeName, sanitizeRoomName,
+  encodeText, sanitizeName, sanitizeRoomName, parseTeam,
 } from '../shared/protocol.js';
 import { Room, BOT_MIN } from './room.js';
+import { Bot } from './bots.js';
+import { MAPS } from '../shared/maps/index.js';
 import { serveStatic } from './static.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -31,22 +31,26 @@ const BIN_RATE = 120, BIN_BURST = 60;
 const TEXT_RATE = 5, TEXT_BURST = 15;
 
 const startedAt = Date.now();
-const world = createWorld(MAP);
 const rooms = new Map();          // name -> Room
 let autoRoomSeq = 0;
 let connections = 0;
 
 function log(...args) { console.log(new Date().toISOString(), ...args); }
 
-function createRoom(name, isPrivate, botMin) {
-  const room = new Room(name, world, {
-    botMin: botMin ?? BOT_MIN,
+/**
+ * Private rooms start in the lobby; `bots` (from the creating join) is the initial
+ * config.bots.fill (default BOT_MIN). Public rooms play at once and rotate maps / modes.
+ */
+function createRoom(name, isPrivate, bots) {
+  const room = new Room(name, {
+    isPrivate,
+    botMin: BOT_MIN,
+    config: isPrivate ? { bots: { fill: bots ?? BOT_MIN } } : undefined,
     onEmpty: (r) => {
       if (rooms.get(r.name) === r) rooms.delete(r.name);
       log(`room ${r.name} closed`);
     },
   });
-  room.isPrivate = isPrivate;
   rooms.set(name, room);
   room.start();
   log(`room ${name} created`);
@@ -245,6 +249,21 @@ function handleText(conn, msg) {
       conn.room.setLoadout(conn.player, msg.lo);
       return;
     }
+    case 'config': case 'start': case 'team': case 'lobby': {
+      // (v4) lobby / match control; every request is validated by the room (host, phase, values)
+      if (!conn.player || conn.player.removed) { conn.bad++; return; }
+      const room = conn.room, p = conn.player;
+      let err;
+      if (msg.t === 'config') err = room.requestConfig(p, msg.cfg);
+      else if (msg.t === 'start') err = room.requestStart(p);
+      else if (msg.t === 'team') { const team = parseTeam(msg.team); err = team ? room.requestTeam(p, team) : 'bad_team'; }
+      else err = room.requestLobby(p);
+      if (err) {
+        conn.bad++;
+        if (ws.readyState === 1) ws.send(encodeText({ t: 'error', code: err, message: `${msg.t}: ${err.replace('_', ' ')}`, req: msg.t }));
+      }
+      return;
+    }
     case 'ping': {
       if (!conn.player || typeof msg.c !== 'number' || !Number.isFinite(msg.c)) { conn.bad++; return; }
       if (typeof msg.rtt === 'number' && Number.isFinite(msg.rtt)) {
@@ -287,4 +306,7 @@ process.on('SIGTERM', shutdown);
 
 server.listen(PORT, HOST, () => {
   log(`Hopshot server on http://${HOST || 'localhost'}:${PORT}  (ws path /ws, bots min ${BOT_MIN})`);
+  // bot navigation for every map, built in small chunks so the first match never stalls a tick
+  const t0 = performance.now();
+  Bot.prewarm(MAPS).then(() => log(`bot navigation ready for ${MAPS.length} maps (${Math.round(performance.now() - t0)} ms)`));
 });
