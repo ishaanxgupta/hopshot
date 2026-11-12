@@ -1,7 +1,8 @@
 // Hopshot client bootstrap: menu + settings, fixed 60 Hz simulation (accumulator) with render
 // interpolation, and all renderer / HUD / audio wiring.
 //
-// URL params: ?room=NAME (private room), ?name=NAME, ?autoplay=1 (synthetic input, no pointer
+// URL params: ?room=NAME (private room: lands in the lobby), ?play=1 (join straight away without the menu,
+// used by "Create private room"), ?name=NAME, ?autoplay=1 (synthetic input, no pointer
 // lock needed - for automated browsers), ?touch=1 (force the on-screen touch controls, e.g. to
 // drive them with a mouse on a desktop; ?touch=0 forces them off). Debug surface: window.__hopshot.
 //
@@ -13,11 +14,17 @@
 // gun id, .masks[slot] = attachment mask. Aim progress is net.localView().aim (0..1) - never a timer
 // here. The menu's Loadout tab edits the PENDING loadout (net.setLoadout), which applies at the next spawn.
 // ?randlo=1 (autoplay) re-rolls a random loadout on every death, to exercise all six guns.
+//
+// Modes / lobby / maps (protocol v4): the renderer is rebuilt for the map net names ('map' event); phases
+// (lobby, countdown, playing, results) drive which screen shows (lobby-ui.js, matchhud.js); the world for
+// touch assists and the autopilot is always net.world. In team modes teammates are filtered out of the
+// assist / auto-fire / autopilot target lists. ?autoplay=1 also walks toward the flag / zone.
 
 import { TICK_RATE, BTN, RESPAWN_MS } from '../shared/constants.js';
 import { GUNS, currentSpread, popcount6, SLOT_COUNT } from '../shared/weapons.js';
 import { MAP } from '../shared/map.js';
 import { createWorld, eyeHeight } from '../shared/physics.js';
+import { MODES } from '../shared/modes.js';
 import { TICK_MS, SHOT } from '../shared/protocol.js';
 import { createRenderer } from './render.js';
 import { createHud } from './hud.js';
@@ -36,6 +43,7 @@ const AUTOPLAY = params.get('autoplay') === '1' || params.get('autoplay') === 't
 const ROOM = (params.get('room') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
 // Bot fill level for a private room (0 = no bots). Undefined = server default.
 const RANDLO = params.get('randlo') === '1';
+const AUTOJOIN = params.get('play') === '1' && !!ROOM;
 const ROOM_BOTS = ROOM && params.has('bots') ? num(params.get('bots'), 0, 0, 20) | 0 : undefined;
 
 function load(key, def) {
@@ -92,6 +100,18 @@ const hud = createHud(hudRoot, {
   touch: IS_TOUCH,
   onWeapon(slot) { input.weapon = slot; },
   onScoreboardClose() { scoreboardHeld = false; input.setScoreboardActive(false); input.state.scoreboard = false; },
+  onReturnToLobby() { net.returnToLobby(); },
+  lobby: {
+    onConfig(partial) { return net.setMatchConfig(partial); },
+    onStart() {
+      audio.unlock();
+      if (!IS_TOUCH && !AUTOPLAY) input.requestLock().then((ok) => { lockHint = !ok; });
+      net.startMatch();
+    },
+    onTeam(team) { net.switchTeam(team); },
+    onLoadout() { showMenu('loadout'); },
+    onMenu() { showMenu(); },
+  },
 });
 const audio = createAudio();
 // Game server address. Defaults to the host that served this page; ?server=https://host or a
@@ -101,6 +121,7 @@ const net = createNet({ world, url: SERVER_HTTP.replace(/^http/, 'ws') + '/ws' }
 const autopilot = AUTOPLAY ? createAutopilot({ seed: (Math.random() * 1e9) | 0 }) : null;
 
 let started = false;      // joined at least once (connect requested)
+let suppressUnlockMenu = false;   // we released the pointer on purpose (lobby / results): do not open the menu
 let menuOpen = false;
 let scoreboardHeld = false;
 
@@ -108,6 +129,7 @@ const input = createInput(canvas, {
   touch: IS_TOUCH,
   onLockChange(locked) {
     if (locked) { hideMenu(); return; }
+    if (suppressUnlockMenu) { suppressUnlockMenu = false; return; }
     if (!AUTOPLAY) showMenu();
   },
   onLockError() { /* we keep playing unlocked; a canvas click retries */ },
@@ -157,9 +179,9 @@ function roomQuery(code, bots) {
   if (!code) return '';
   return `?room=${encodeURIComponent(code)}` + (bots !== undefined ? `&bots=${bots}` : '');
 }
-function goRoom(code, bots, name) {
+function goRoom(code, bots, name, play) {
   if (name) save('hopshot.name', String(name).slice(0, 16));
-  location.href = location.origin + '/' + roomQuery(code, bots);
+  location.href = location.origin + '/' + roomQuery(code, bots) + (play && code ? '&play=1' : '');
 }
 function randomRoomCode() {
   const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -169,12 +191,17 @@ function randomRoomCode() {
   for (let i = 0; i < r.length; i++) s += abc[r[i] % abc.length];
   return s;
 }
+function releaseLock() {
+  if (input.locked) { suppressUnlockMenu = true; input.exitLock(); lockHint = true; }
+}
+const phaseNow = () => net.state.match.phase;
+function syncInput() { input.enabled = !AUTOPLAY && !menuOpen && phaseNow() !== 'lobby'; }
 const roomMenu = {
   code: ROOM,
   bots: ROOM_BOTS,
   inviteUrl: ROOM ? location.origin + '/' + roomQuery(ROOM, ROOM_BOTS) : '',
   note: ROOM ? 'Send this link to your friends. Everyone who opens it lands in this room.' : '',
-  onCreate(withBots, name) { goRoom(randomRoomCode(), withBots ? 4 : 0, name); },
+  onCreate(withBots, name) { goRoom(randomRoomCode(), withBots ? 4 : 0, name, true); },
   onJoin(code, name) {
     const c = String(code).toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
     if (c) goRoom(c, undefined, name);
@@ -195,7 +222,7 @@ if (ROOM && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
 
 // ------------------------------------------------------------------ menu flow
 let menuShown = 0;
-function showMenu() {
+function showMenu(tabName) {
   menuOpen = true;
   // Refresh the server line when the menu reopens (it is not polled while idle).
   if (server.state === 'online' && !server.pending && !net.state.connected && performance.now() - server.checkedAt > 15000) probeSoon(0);
@@ -207,7 +234,8 @@ function showMenu() {
     settings: { ...settings },
     room: roomMenu,
     inGame: started,
-    tab: menuShown++ === 0 && ROOM ? 'friends' : undefined,
+    tab: typeof tabName === 'string' ? tabName : menuShown++ === 0 && ROOM ? 'friends' : undefined,
+    playLabel: started && phaseNow() === 'lobby' ? 'BACK TO LOBBY' : undefined,
     loadout: {
       saved: savedLoadout,
       status: loadoutStatus(),
@@ -222,7 +250,8 @@ function showMenu() {
       playerName = String(name || 'Player').slice(0, 16);
       save('hopshot.name', playerName);
       audio.unlock();
-      input.requestLock().then((ok) => { lockHint = !ok; });
+      if (!ROOM && phaseNow() !== 'lobby') input.requestLock().then((ok) => { lockHint = !ok; });      // private rooms start in a lobby: no lock there
+      else lockHint = true;
       hideMenu();
       if (IS_TOUCH && !FORCED_TOUCH) goFullscreen();
       if (!started) { started = true; net.connect(playerName, ROOM, { bots: ROOM_BOTS }); }
@@ -249,7 +278,7 @@ function goFullscreen() {
 function hideMenu() {
   menuOpen = false;
   hud.hideMenu();
-  input.enabled = !AUTOPLAY;
+  syncInput();
 }
 
 canvas.addEventListener('click', () => {
@@ -336,18 +365,36 @@ net.on('status', (s, extra) => {
   else if (s === 'reconnecting') reconnectInfo = { at: performance.now() + (extra ? extra.inMs : 0) };
   else if (s === 'closed') setStatus('Disconnected');
 });
+const REQUEST_ERRORS = { not_host: 'Only the host can do that.', bad_phase: 'Not possible right now.', bad_team: 'You cannot switch teams here.', bad_config: 'That setting was not accepted.' };
 net.on('error', (m) => {
   if (m.code === 'room_full') setStatus('Room is full - retrying...');
   else if (m.code === 'bad_version') setStatus('Version mismatch - reload the page');
+  else if (REQUEST_ERRORS[m.code]) hud.lobby.notice(REQUEST_ERRORS[m.code]);
   else setStatus(String(m.message || m.code || 'Server error'));
 });
 
 // ------------------------------------------------------------------ game events
-const counters = { kills: 0, hits: 0, damage: 0, spawns: 0, localDeaths: 0, remoteShots: 0, rounds: 0 };
+const counters = { kills: 0, hits: 0, damage: 0, spawns: 0, localDeaths: 0, remoteShots: 0, rounds: 0, phases: [] };
 const nameOf = (id) => { const e = net.state.roster.get(id); return e ? e.name : (id ? '#' + id : ''); };
 
 net.on('welcome', () => {
   if (autopilot) autopilot.setYaw(input.yaw);
+  syncInput();
+  if (phaseNow() === 'lobby' || phaseNow() === 'results') releaseLock();
+});
+// Rebuild the static scene for the map the server names (also applies its theme and frees the old GPU data).
+net.on('map', (m) => { renderer.setMap(m.map); });
+const teamOf = (id) => { const e = net.state.roster.get(id); return e ? e.team : ''; };
+const evCtx = { nameOf, get myTeam() { return net.state.match.myTeam; }, get match() { return net.state.match; } };
+net.on('ev', (m) => { hud.match.pushEvent(m, evCtx); if (m.e === 'flag_captured') audio.play('kill', { volume: 0.5 }); });
+net.on('phase', (phase, prev) => {
+  syncInput();
+  counters.phases.push(phase);
+  if (phase === 'lobby' || phase === 'results') releaseLock();
+  if (phase !== 'playing') { scoreboardHeld = false; input.setScoreboardActive(false); input.state.scoreboard = false; hud.setScoreboard(false); }
+  if (phase === 'playing' && !IS_TOUCH && !input.locked) lockHint = true;
+  if (phase === 'lobby' || phase === 'countdown') hud.match.hideResults();
+  void prev;
 });
 net.on('spawn', (m) => {
   counters.spawns++;
@@ -392,18 +439,8 @@ net.on('damage', (m) => {
   } else hud.damageFrom(0);
   audio.play('hurt');
 });
-net.on('round', (m) => {
-  counters.rounds++;
-  if (m.phase === 'intermission') {
-    const rows = scoreRows();
-    hud.showRoundEnd({
-      winnerName: m.winner ? nameOf(m.winner) : '',
-      rows,
-      nextIn: Math.max(0, (m.endsTick - net.serverTick()) / TICK_RATE),
-    });
-  } else hud.hideRoundEnd();
-});
-net.on('close', () => { hud.hideRoundEnd(); });
+net.on('round', () => { counters.rounds++; });     // the old round message: the match phases above replace it
+net.on('close', () => { hud.match.hideResults(); });
 
 // remote shots: tracers, impacts, muzzle flash, positional sound (own shots are predicted)
 const shotFrom = [0, 0, 0], shotTo = [0, 0, 0];
@@ -432,17 +469,47 @@ function scoreRows() {
   const me = net.state.id;
   const rows = [];
   for (const e of net.state.roster.values()) {
-    rows.push({ id: e.id, name: e.name, kills: e.kills, deaths: e.deaths, ping: e.id === me && Number.isFinite(net.state.ping) ? net.state.ping : e.ping, isLocal: e.id === me, isBot: e.bot });
+    rows.push({ id: e.id, name: e.name, team: e.team || '', kills: e.kills, deaths: e.deaths, obj: e.obj | 0, ping: e.id === me && Number.isFinite(net.state.ping) ? net.state.ping : e.ping, isLocal: e.id === me, isBot: e.bot });
   }
   return rows;
+}
+function boardData() {
+  const M = net.state.match;
+  return { mode: M.mode, teams: M.teams, myTeam: M.myTeam, scores: M.scores, limit: M.scoreLimit, mapName: M.mapName, selfId: net.state.id, match: M, rows: scoreRows() };
 }
 
 // ------------------------------------------------------------------ simulation
 const cmdInput = { buttons: 0, yaw: 0, pitch: 0, weapon: 0 };
+const targetList = [];      // remote players that may be shot at: everybody in ffa, only enemies in team modes
+const goalOut = { x: 0, z: 0 };
+// ?autoplay=1 walks toward the objective: the enemy flag (or your stand while carrying it), or the active zone
+function autopilotGoal() {
+  const M = net.state.match;
+  if (M.phase !== 'playing') return null;
+  const mine = M.myTeam === 'b' ? 'b' : 'a', en = mine === 'a' ? 'b' : 'a';
+  if (M.mode === 'ctf' && M.flags && net.map && net.map.flags) {
+    const carrying = M.flags[en].carrier === net.state.id;
+    const t = carrying ? net.map.flags[mine] : M.flags[en].pos;
+    goalOut.x = t[0]; goalOut.z = t[2];
+    return goalOut;
+  }
+  if (M.mode === 'hardpoint' && M.hardpoint) {
+    goalOut.x = (M.hardpoint.min[0] + M.hardpoint.max[0]) / 2; goalOut.z = (M.hardpoint.min[2] + M.hardpoint.max[2]) / 2;
+    return goalOut;
+  }
+  return null;
+}
+function refreshTargets(players) {
+  const M = net.state.match;
+  targetList.length = 0;
+  const teamed = M.teams && (M.myTeam === 'a' || M.myTeam === 'b');
+  for (let i = 0; i < players.length; i++) if (!teamed || players[i].team !== M.myTeam) targetList.push(players[i]);
+}
 const local = { alive: false, x: 0, y: 0, z: 0, eyeHeight: 1.62, yaw: 0, pitch: 0, vx: 0, vy: 0, vz: 0,
   onGround: true, crouching: false, sliding: false, weapon: 0, gun: 0, aim: 0, ads: 0, reloading: false,
   att: 0, adsFov: 90, swapDur: 0.3, reloadP: 0, scopeKind: 0 };
-const frame = { dt: 0, time: 0, local, players: [] };
+const objective = { flags: null, hardpoint: null, myTeam: '', selfId: 0 };
+const frame = { dt: 0, time: 0, local, players: [], objective: null };
 let stepAcc = 0;
 let adsHeld = false;
 let curRenderTick = 0;
@@ -452,7 +519,7 @@ function simTick() {
   if (autopilot) {
     const p = net.pred, w = net.predWeapon;
     const o = autopilot.update({
-      world, self: p, alive: net.state.alive, remotes: frame.players,
+      world: net.world, self: p, alive: net.state.alive, remotes: targetList, goal: autopilotGoal(),
       weapon: w.weapon, ammo: w.ammo[w.weapon], magSize: net.kit.slots[w.weapon].magSize, auto: net.kit.slots[w.weapon].auto,
     });
     input.yaw = o.yaw; input.pitch = o.pitch; input.weapon = o.weapon;
@@ -536,12 +603,16 @@ function runFrame() {
   const connected = net.state.connected;
   curRenderTick = connected ? net.renderTick(t) : 0;
   net.sampleRemotes(curRenderTick, frame.players);
+  const M = net.state.match;
+  refreshTargets(frame.players);
+  renderer.setTeamView(M.teams, M.myTeam);
+  renderer.setOverview(!connected || M.phase !== 'playing');
 
   // touch assists: gentle aim pull + auto-fire (client-side input shaping only)
   if (input.touch && !AUTOPLAY) {
     if (connected && input.enabled) {
       const pw = net.predWeapon;
-      input.applyAssist(dt, { world, self: net.pred, alive: net.state.alive, remotes: frame.players,
+      input.applyAssist(dt, { world: net.world, self: net.pred, alive: net.state.alive, remotes: targetList,
         weapon: pw.weapon, ammo: pw.ammo[pw.weapon], reloading: pw.reload > 0, ads: local.ads, range: net.kit.slots[pw.weapon].range,
         aimAssist: settings.aimAssist, autoFire: settings.autoFire });
     } else { input.state.autoFire = false; input.state.assistSlow = 1; }
@@ -580,6 +651,10 @@ function runFrame() {
 
   frame.dt = dt;
   frame.time = time;
+  if (M.phase === 'playing' && (M.flags || M.hardpoint)) {
+    objective.flags = M.flags; objective.hardpoint = M.hardpoint; objective.myTeam = M.myTeam; objective.selfId = net.state.id;
+    frame.objective = objective;
+  } else frame.objective = null;
   renderer.render(frame);
   audio.setListener(local.x, local.y + local.eyeHeight, local.z, local.yaw);
 
@@ -592,6 +667,21 @@ const hudState = { alive: true, health: 100, ammo: 0, magSize: 0, weaponKey: 'ma
   slots: hudSlots, slot: 0, scope: 0, crossGap: 7,
   ads: 0, speed: 0, kills: 0, deaths: 0, roundTimeLeft: 0, respawnIn: 0, ping: 0, fps: 60, players: 0 };
 let sbNext = 0;
+let leaderNext = 0;
+const matchCtx = { now: 0, match: null, st: null, nameOf, teamOf, view: (x, y, z, out) => renderer.viewSpace(x, y, z, out), W: 1, H: 1, fov: 90,
+  self: null, alive: false, kills: 0, deaths: 0, leader: null, myTeam: '', selfId: 0 };
+const leaderOut = { name: '', kills: 0, isMe: false };
+// free-for-all: the best other player, and whether you are ahead of all of them
+function computeLeader() {
+  const me = net.state.id;
+  let best = null;
+  for (const e of net.state.roster.values()) if (e.id !== me && (!best || e.kills > best.kills)) best = e;
+  const mine = net.state.roster.get(me);
+  const myK = mine ? mine.kills : 0;
+  if (!best) { matchCtx.leader = null; return; }
+  leaderOut.isMe = myK >= best.kills; leaderOut.name = best.name; leaderOut.kills = best.kills;
+  matchCtx.leader = leaderOut;
+}
 
 function updateHud(t) {
   const s = net.state;
@@ -600,7 +690,10 @@ function updateHud(t) {
   const w = kit.slots[pw.weapon] || kit.slots[0];
   const st = net.serverTick(t);
   const me = s.roster.get(s.id);
-  hudState.alive = s.connected ? s.alive : true;
+  const M = s.match;
+  const playing = M.phase === 'playing';
+  hudRoot.classList.toggle('hs-inlobby', s.connected && M.phase === 'lobby' && started);
+  hudState.alive = s.connected && playing ? s.alive : true;
   hudState.health = s.health;
   hudState.ammo = pw.ammo[pw.weapon];
   hudState.magSize = w.magSize;
@@ -621,16 +714,22 @@ function updateHud(t) {
   hudState.speed = Math.hypot(local.vx, local.vz);
   hudState.kills = me ? me.kills : 0;
   hudState.deaths = me ? me.deaths : 0;
-  hudState.roundTimeLeft = s.connected ? Math.max(0, (s.round.endsTick - st) / TICK_RATE) : 0;
   hudState.respawnIn = s.alive ? 0 : Math.max(0, Math.min(RESPAWN_MS / 1000, (s.respawnAtTick - st) / TICK_RATE));
   hudState.ping = Number.isFinite(s.ping) ? s.ping : null;
   hudState.fps = fps;
   hudState.quality = s.quality || null;
   hudState.players = s.connected ? s.roster.size : null;
   hud.update(hudState);
-  hud.setInGame(started && !menuOpen);
+  hud.setInGame(started && !menuOpen && s.connected && playing);
 
-  if (scoreboardHeld && !menuOpen && t >= sbNext) { sbNext = t + 250; hud.setScoreboard(true, scoreRows()); }
+  if (t >= leaderNext) { leaderNext = t + 250; computeLeader(); }
+  matchCtx.now = t; matchCtx.match = M; matchCtx.st = s; matchCtx.W = window.innerWidth; matchCtx.H = window.innerHeight;
+  matchCtx.fov = renderer.getCamera().fov; matchCtx.alive = s.alive; matchCtx.kills = hudState.kills; matchCtx.deaths = hudState.deaths;
+  matchCtx.myTeam = M.myTeam; matchCtx.selfId = s.id; matchCtx.self = local;
+  if (s.connected && started) hud.match.update(matchCtx);
+  if (s.connected && M.phase === 'lobby') hud.lobby.update(M, { selfId: s.id, inviteUrl: roomMenu.inviteUrl, code: ROOM });
+
+  if (scoreboardHeld && !menuOpen && playing && t >= sbNext) { sbNext = t + 250; hud.setScoreboard(true, boardData()); }
 
   if (t >= serverUiNext) { serverUiNext = t + 250; updateServerUi(t); }
 
@@ -641,7 +740,7 @@ function updateHud(t) {
     const txt = `Disconnected - reconnecting in ${left}s (click to retry)`;
     if (txt !== statusText) setStatus(txt);
   } else if (s.connected) {
-    const want = lockHint && !IS_TOUCH && !input.locked && !menuOpen && !AUTOPLAY ? 'Click to capture the mouse' : '';
+    const want = lockHint && !IS_TOUCH && !input.locked && !menuOpen && !AUTOPLAY && playing ? 'Click to capture the mouse' : '';
     if (want !== statusText) setStatus(want);
   }
 }
@@ -691,6 +790,11 @@ window.__hopshot = {
   setLoadout(v) { net.setLoadout(v); },
   get counters() { return { ...counters, predictedShots: net.stats.predictedShots, frameErrors: errors }; },
   get round() { return { ...net.state.round }; },
+  get match() { const M = net.state.match; return { phase: M.phase, mode: M.mode, mapId: M.mapId, teams: M.teams, myTeam: M.myTeam, isHost: M.isHost, private: M.private,
+    scores: { ...M.scores }, config: M.config, timeLeftS: M.timeLeftS, countdown: M.countdown, lobby: M.lobby.map((p) => ({ ...p })),
+    flags: M.flags ? { a: { ...M.flags.a }, b: { ...M.flags.b } } : null, hardpoint: M.hardpoint ? { ...M.hardpoint } : null, result: M.result }; },
+  get gfx() { return renderer.memory(); },
+  hud,
   net, input,
 };
 
@@ -701,6 +805,15 @@ if (AUTOPLAY) {
   input.enabled = false;
   net.connect(playerName || 'Autoplay', ROOM, { bots: ROOM_BOTS });
   setStatus('Connecting...');
+} else if (AUTOJOIN) {
+  // "Create private room": straight into the room (and its lobby) with the saved name
+  started = true;
+  menuOpen = false;
+  playerName = String(playerName || 'Player').slice(0, 16);
+  syncInput();
+  net.connect(playerName, ROOM, { bots: ROOM_BOTS });
+  setStatus('Connecting...');
+  try { history.replaceState(null, '', location.pathname + roomQuery(ROOM, ROOM_BOTS)); } catch { /* ignore */ }
 } else {
   showMenu();
 }

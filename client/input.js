@@ -640,7 +640,7 @@ function prng(seed) {
  * Synthetic player: wanders with slide-hops, avoids walls, turns toward and shoots at the
  * nearest visible enemy. One update() per sim tick:
  *   ctx = { world, self (physics state), alive, remotes: [{ id, x, y, z, alive, crouching }],
- *           ammo, magSize, weapon }
+ *           ammo, magSize, weapon, goal?: { x, z } (walk toward it while nobody is in sight) }
  *   -> { buttons, yaw, pitch, weapon }   (reused object)
  */
 export function createAutopilot(opts = {}) {
@@ -735,6 +735,11 @@ export function createAutopilot(opts = {}) {
         wanderYaw = wrapAngle(out.yaw + (dl > dr ? 1.3 : -1.3) + (blockedTicks > 60 ? Math.PI * 0.5 : 0));
         if (blockedTicks > 60) blockedTicks = 0;
       } else blockedTicks = 0;
+      // objective (flag / zone) steering when the caller gives a goal; walls still win via the avoidance above
+      if (ctx.goal && blockedTicks === 0 && knee >= look && chest >= look) {
+        const gx = ctx.goal.x - ex, gz = ctx.goal.z - ez;
+        if (gx * gx + gz * gz > 1.4) wanderYaw = Math.atan2(-gx, -gz);
+      }
       out.yaw = approach(out.yaw, wanderYaw, turnRate * 0.6);
       out.pitch += (0 - out.pitch) * 0.1;
       b |= BTN.FORWARD;

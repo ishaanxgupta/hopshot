@@ -314,8 +314,8 @@ btn(r, 'Dmg back', () => hud.damageFrom(Math.PI)); btn(r, 'Dmg right', () => hud
 btn(r, 'Scoreboard (toggle)', () => { scoreHeld = !scoreHeld; });
 btn(r, 'Menu show', () => hud.showMenu({ defaultName: 'Player' + ((Math.random() * 900 + 100) | 0), settings: { ...settings }, onPlay: (n) => { hud.hideMenu(); hud.setStatus('Play pressed as ' + n); setTimeout(() => hud.setStatus(''), 1500); }, onSettings: (s) => { Object.assign(settings, s); renderer.setFov(s.fov); audio.setVolume(s.volume); } }));
 btn(r, 'Menu hide', () => hud.hideMenu());
-btn(r, 'Round end show', () => hud.showRoundEnd({ winnerName: 'Nova', rows: scoreRows(), nextIn: 10 }));
-btn(r, 'Round end hide', () => hud.hideRoundEnd());
+btn(r, 'Lobby show', () => document.getElementById('hud').classList.add('hs-inlobby'));
+btn(r, 'Lobby hide', () => document.getElementById('hud').classList.remove('hs-inlobby'));
 btn(r, 'Status: Connecting', () => hud.setStatus('Connecting...'));
 btn(r, 'Status: Disconnected', () => hud.setStatus('Disconnected - click to retry'));
 btn(r, 'Status: hide', () => hud.setStatus(''));
@@ -361,7 +361,7 @@ function loop(now) {
   hudState.speed = Math.hypot(local.vx, local.vz); hudState.fps = fpsShown;
   hudState.roundTimeLeft = Math.max(0, 300 - (now / 1000) % 300);
   hud.update(hudState);
-  hud.setScoreboard(scoreHeld, scoreHeld ? scoreRows() : null);
+  hud.setScoreboard(scoreHeld, scoreHeld ? { mode: 'ffa', teams: false, myTeam: '', scores: { a: 0, b: 0 }, limit: 25, mapName: '', rows: scoreRows().map((r) => ({ obj: 0, team: '', ...r })) } : null);
 
   statsT += dt;
   if (statsT > 0.5) {

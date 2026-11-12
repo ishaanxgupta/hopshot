@@ -3,9 +3,18 @@
 //
 // Draw calls (typical frame): sky 1, skyline 1, clouds 1, map 1, blob shadows 1, characters 1,
 // name tags 1, tracers 1, sparks 1, viewmodel 3-4 (body, mag, pump, flash)  => about 13.
+// Team modes add at most 4 (flags + stands, zone fill, zone edges, spawn-protection shimmer).
+//
+// setMap(map) rebuilds the static scene for a map (geometry, flat box list for occlusion tests,
+// sky gradient, fog, sun, skyline) and disposes the previous GPU resources.
+// setTeamView(teamMode, myTeam): characters / tags are coloured friend (blue) vs enemy (red) from
+// the viewer's point of view. setOverview(true): orbiting map camera (menu, lobby, countdown, results).
+// render(frame): frame.objective = null | { flags, hardpoint, myTeam } draws flags, stands and the zone.
+// viewSpace(x, y, z, out) -> out { x, y, z } in camera space (for the HUD's off-screen markers).
 
 import * as THREE from 'three';
 import { buildViewmodel, buildThird, TP_PARTS, TRACER_STYLE } from './gunmodels.js';
+import { FRIEND_HEX, ENEMY_HEX, FRIEND_CSS, ENEMY_CSS, teamRel } from './teams.js';
 
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -146,59 +155,68 @@ export function createRenderer(canvas, map, opts = {}) {
   renderer.autoClear = false;
   renderer.info.autoReset = false;
 
-  const HORIZON = 0xd7ecff, ZENITH = 0x3f86e0;
+  const DEFAULT_THEME = { skyTop: 0x3f86e0, skyBottom: 0xd7ecff, fog: 0xd7ecff, fogDensity: 0.008, sun: [45, 80, 30] };
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(HORIZON, 40, 165);
+  scene.fog = new THREE.FogExp2(0xd7ecff, 0.008);
   const camera = new THREE.PerspectiveCamera(90, 1, 0.05, 400);
   camera.rotation.order = 'YXZ';
 
   const sunDir = new THREE.Vector3(0.45, 0.8, 0.3).normalize();
-  scene.add(new THREE.HemisphereLight(0xdcefff, 0x9d9272, 1.7));
+  const hemi = new THREE.HemisphereLight(0xdcefff, 0x9d9272, 1.7);
+  scene.add(hemi);
   const sun = new THREE.DirectionalLight(0xfff0d0, 2.2);
   sun.position.copy(sunDir).multiplyScalar(100);
   scene.add(sun);
 
-  // ---- sky dome (follows camera) ----
-  const sky = (() => {
-    const g = new THREE.SphereGeometry(300, 28, 18);
-    const p = g.attributes.position, cols = new Float32Array(p.count * 3);
-    const hz = new THREE.Color(HORIZON), zn = new THREE.Color(ZENITH), gr = new THREE.Color(0xc9dccb), c = new THREE.Color();
-    const d = new THREE.Vector3();
-    for (let i = 0; i < p.count; i++) {
-      d.set(p.getX(i), p.getY(i), p.getZ(i)).normalize();
-      if (d.y >= 0) c.copy(hz).lerp(zn, Math.pow(d.y, 0.55));
-      else c.copy(hz).lerp(gr, Math.min(1, -d.y * 4));
-      const glow = Math.pow(Math.max(0, d.dot(sunDir)), 24) * 0.9 + Math.pow(Math.max(0, d.dot(sunDir)), 400) * 3;
-      cols[i * 3] = c.r + glow; cols[i * 3 + 1] = c.g + glow * 0.95; cols[i * 3 + 2] = c.b + glow * 0.8;
-    }
-    g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
-    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }));
-    m.renderOrder = -10; m.frustumCulled = false;
-    return m;
-  })();
+  // ---- sky dome (follows camera; its colours are repainted in place for every map theme) ----
+  const skyGeo = new THREE.SphereGeometry(300, 28, 18);
+  const skyCols = new Float32Array(skyGeo.attributes.position.count * 3);
+  skyGeo.setAttribute('color', new THREE.BufferAttribute(skyCols, 3));
+  const sky = new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }));
+  sky.renderOrder = -10; sky.frustumCulled = false;
   scene.add(sky);
+  const _hz = new THREE.Color(), _zn = new THREE.Color(), _gr = new THREE.Color(), _sc = new THREE.Color(), _dv = new THREE.Vector3();
+  function paintSky(th) {
+    const p = skyGeo.attributes.position;
+    _hz.setHex(th.skyBottom); _zn.setHex(th.skyTop);
+    _gr.copy(_hz).multiplyScalar(0.82);
+    for (let i = 0; i < p.count; i++) {
+      _dv.set(p.getX(i), p.getY(i), p.getZ(i)).normalize();
+      if (_dv.y >= 0) _sc.copy(_hz).lerp(_zn, Math.pow(_dv.y, 0.55));
+      else _sc.copy(_hz).lerp(_gr, Math.min(1, -_dv.y * 4));
+      const glow = Math.pow(Math.max(0, _dv.dot(sunDir)), 24) * 0.9 + Math.pow(Math.max(0, _dv.dot(sunDir)), 400) * 3;
+      skyCols[i * 3] = _sc.r + glow; skyCols[i * 3 + 1] = _sc.g + glow * 0.95; skyCols[i * 3 + 2] = _sc.b + glow * 0.8;
+    }
+    skyGeo.attributes.color.needsUpdate = true;
+  }
 
-  // ---- skyline blocks outside the walls (one merged mesh) ----
+  // ---- skyline blocks outside the walls (one merged mesh, rebuilt per map) ----
   let skyline = null;
-  {
+  function buildSkyline(map, th) {
+    if (skyline) { scene.remove(skyline); skyline.geometry.dispose(); skyline.material.dispose(); skyline = null; }
+    const b = map.bounds;
+    const half = Math.max(Math.abs(b.min[0]), Math.abs(b.max[0]), Math.abs(b.min[2]), Math.abs(b.max[2]));
     const acc = newAcc();
-    const tints = [0x9cc4d6, 0x8fb8c4, 0xa8cfc0, 0x9db4d8, 0xb4cfe0, 0x8cb0a4];
+    const base = new THREE.Color(th.fog), top = new THREE.Color(th.skyTop), tc = new THREE.Color();
+    const tints = [];
+    for (let i = 0; i < 6; i++) { tc.copy(base).lerp(top, 0.08 + i * 0.07).multiplyScalar(0.78 + (i % 3) * 0.1); tints.push(tc.getHex()); }
     let s = 12345;
     const rnd = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
     const N = 30;
     for (let i = 0; i < N; i++) {
-      const a = (i / N) * TAU + rnd() * 0.1, r = 80 + rnd() * 35, w = 10 + rnd() * 14, h = 10 + rnd() * 26;
+      const a = (i / N) * TAU + rnd() * 0.1, r = half + 42 + rnd() * 36, w = 10 + rnd() * 14, h = 10 + rnd() * 26;
       const cx = Math.cos(a) * r, cz = Math.sin(a) * r;
       addBox(acc, cx - w / 2, -6, cz - w / 2, cx + w / 2, h, cz + w / 2, tints[(rnd() * tints.length) | 0], { skipBottom: true });
       if (rnd() > 0.5) addBox(acc, cx - w / 4, h, cz - w / 4, cx + w / 4, h + 5 + rnd() * 6, cz + w / 4, tints[(rnd() * tints.length) | 0], {});
     }
     const m = new THREE.Mesh(accToGeometry(acc), new THREE.MeshLambertMaterial({ vertexColors: true }));
     m.matrixAutoUpdate = false; m.frustumCulled = false;
+    m.visible = quality !== 'low';
     scene.add(m);
     skyline = m;
   }
 
-  // ---- clouds (flat boxes, unfogged, one mesh) ----
+  // ---- clouds (flat boxes, unfogged, one mesh; only the tint changes per map) ----
   const clouds = (() => {
     const acc = newAcc();
     let s = 777;
@@ -219,20 +237,10 @@ export function createRenderer(canvas, map, opts = {}) {
   })();
   scene.add(clouds);
 
-  // ---- static map: one mesh, one draw call ----
-  const flatBoxes = new Float32Array(map.boxes.length * 6);
-  {
-    const acc = newAcc();
-    map.boxes.forEach((b, i) => {
-      addBox(acc, b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], b.color, { ao: true, skipBottom: true });
-      for (let k = 0; k < 3; k++) { flatBoxes[i * 6 + k] = b.min[k]; flatBoxes[i * 6 + 3 + k] = b.max[k]; }
-    });
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, map: gridTexture(renderer) });
-    const m = new THREE.Mesh(accToGeometry(acc), mat);
-    m.matrixAutoUpdate = false; m.frustumCulled = false;
-    scene.add(m);
-  }
-  const nBoxes = map.boxes.length;
+  // ---- static map: one mesh, one draw call. setMap() rebuilds it (and the theme) and frees the old GPU data ----
+  const gridTex = gridTexture(renderer);
+  let curMap = null, mapMesh = null, flatBoxes = new Float32Array(0), nBoxes = 0;
+  let mapHalf = 36, mapCx = 0, mapCz = 0;
   function groundBelow(x, y, z) {
     let best = -1e9;
     for (let i = 0; i < nBoxes; i++) {
@@ -241,6 +249,40 @@ export function createRenderer(canvas, map, opts = {}) {
       if (top > best && top <= y + 0.4 && x >= flatBoxes[o] && x <= flatBoxes[o + 3] && z >= flatBoxes[o + 2] && z <= flatBoxes[o + 5]) best = top;
     }
     return best < -1e8 ? y : best;
+  }
+  const _fc = new THREE.Color();
+  function setMap(map) {
+    if (!map || !map.boxes || map === curMap) return;
+    curMap = map;
+    if (mapMesh) { scene.remove(mapMesh); mapMesh.geometry.dispose(); mapMesh.material.dispose(); mapMesh = null; }
+    nBoxes = map.boxes.length;
+    flatBoxes = new Float32Array(nBoxes * 6);
+    const acc = newAcc();
+    map.boxes.forEach((b, i) => {
+      addBox(acc, b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2], b.color, { ao: true, skipBottom: true });
+      for (let k = 0; k < 3; k++) { flatBoxes[i * 6 + k] = b.min[k]; flatBoxes[i * 6 + 3 + k] = b.max[k]; }
+    });
+    mapMesh = new THREE.Mesh(accToGeometry(acc), new THREE.MeshLambertMaterial({ vertexColors: true, map: gridTex }));
+    mapMesh.matrixAutoUpdate = false; mapMesh.frustumCulled = false;
+    scene.add(mapMesh);
+    const bd = map.bounds || { min: [-36, 0, -36], max: [36, 40, 36] };
+    mapCx = (bd.min[0] + bd.max[0]) / 2; mapCz = (bd.min[2] + bd.max[2]) / 2;
+    mapHalf = Math.max(bd.max[0] - bd.min[0], bd.max[2] - bd.min[2]) / 2;
+    // theme: sky gradient, fog, sun direction
+    const th = { ...DEFAULT_THEME, ...(map.theme || {}) };
+    if (Array.isArray(th.sun) && th.sun.length === 3) sunDir.set(th.sun[0], th.sun[1], th.sun[2]).normalize();
+    else sunDir.set(...DEFAULT_THEME.sun).normalize();
+    sun.position.copy(sunDir).multiplyScalar(100);
+    scene.fog.color.setHex(th.fog); scene.fog.density = th.fogDensity;
+    renderer.setClearColor(th.fog, 1);
+    paintSky(th);
+    _fc.setHex(th.skyBottom);
+    const lum = _fc.r * 0.3 + _fc.g * 0.59 + _fc.b * 0.11;
+    hemi.color.setHex(th.skyBottom).lerp(_hz.setHex(0xffffff), 0.55);
+    hemi.intensity = 1.0 + 0.8 * Math.min(1, lum * 1.5);
+    clouds.material.color.setHex(th.skyBottom).lerp(_hz.setHex(0xffffff), 0.6);
+    buildSkyline(map, th);
+    tagVis.fill(-1);
   }
 
   // ---- characters: one InstancedMesh for every part of every player ----
@@ -274,6 +316,8 @@ export function createRenderer(canvas, map, opts = {}) {
   const crouchSm = new Float32Array(MAXP), slideSm = new Float32Array(MAXP);
   const deadT = new Float32Array(MAXP), flashT = new Float32Array(MAXP), flashRot = new Float32Array(MAXP);
   const tagVis = new Int8Array(MAXP).fill(-1);   // cached wall-occlusion result per slot (-1 = unknown)
+  const slotRel = new Int8Array(MAXP).fill(-2);  // 0 no team, 1 friend, 2 enemy (the colours currently painted)
+  let teamMode = false, viewerTeam = '';
   let slotCount = 0;
 
   const ONE = new THREE.Vector3(1, 1, 1), QID = new THREE.Quaternion();
@@ -292,19 +336,33 @@ export function createRenderer(canvas, map, opts = {}) {
 
   const hsl = new THREE.Color();
   function setCol(i, part, hex) { _col.setHex(hex); chars.setColorAt(i * PARTS + part, _col); }
+  const teamCol = new THREE.Color();
+  function paintChar(i, p, rel) {
+    slotRel[i] = rel;
+    const h = (Math.abs(p.id) * 0.61803398875) % 1;
+    if (rel === 0) {
+      hsl.setHSL(h, 0.82, 0.55); chars.setColorAt(i * PARTS + P_TORSO, hsl);
+      hsl.setHSL(h, 0.8, 0.42); chars.setColorAt(i * PARTS + P_ARML, hsl); chars.setColorAt(i * PARTS + P_ARMR, hsl);
+      hsl.setHSL((h + 0.5) % 1, 0.7, 0.5); chars.setColorAt(i * PARTS + P_PACK, hsl);
+      hsl.setHSL(h, 0.3, 0.26); chars.setColorAt(i * PARTS + P_LEGL, hsl); chars.setColorAt(i * PARTS + P_LEGR, hsl);
+    } else {
+      teamCol.setHex(rel === 1 ? FRIEND_HEX : ENEMY_HEX);
+      chars.setColorAt(i * PARTS + P_TORSO, teamCol);
+      _col.copy(teamCol).multiplyScalar(0.72); chars.setColorAt(i * PARTS + P_ARML, _col); chars.setColorAt(i * PARTS + P_ARMR, _col);
+      _col.copy(teamCol).multiplyScalar(1.25); chars.setColorAt(i * PARTS + P_PACK, _col);
+      _col.copy(teamCol).multiplyScalar(0.3); chars.setColorAt(i * PARTS + P_LEGL, _col); chars.setColorAt(i * PARTS + P_LEGR, _col);
+    }
+    chars.instanceColor.needsUpdate = true;
+    slotName[i] = '';          // redraw the tag in the new colour
+  }
   function assignSlot(i, p) {
     slotId[i] = p.id; slotWeapon[i] = -1; slotThird[i] = null; slotName[i] = '';
     prevX[i] = p.x; prevZ[i] = p.z; speedSm[i] = 0; phase[i] = 0;
     crouchSm[i] = 0; slideSm[i] = 0; deadT[i] = 0; flashT[i] = 0;
-    const h = (Math.abs(p.id) * 0.61803398875) % 1;
-    hsl.setHSL(h, 0.82, 0.55); chars.setColorAt(i * PARTS + P_TORSO, hsl);
-    hsl.setHSL(h, 0.8, 0.42); chars.setColorAt(i * PARTS + P_ARML, hsl); chars.setColorAt(i * PARTS + P_ARMR, hsl);
-    hsl.setHSL((h + 0.5) % 1, 0.7, 0.5); chars.setColorAt(i * PARTS + P_PACK, hsl);
-    hsl.setHSL(h, 0.3, 0.26); chars.setColorAt(i * PARTS + P_LEGL, hsl); chars.setColorAt(i * PARTS + P_LEGR, hsl);
     setCol(i, P_HEAD, SKIN_TONES[Math.abs(p.id) % SKIN_TONES.length]);
     setCol(i, P_VISOR, 0x18212e);
     _col.setRGB(3.2, 2.5, 1.0); chars.setColorAt(i * PARTS + P_FLASH, _col);
-    chars.instanceColor.needsUpdate = true;
+    slotRel[i] = -2;           // painted by updateCharacters for the current team view
     tagDirty = true;
     tagAlpha[i] = 0; tagVis[i] = -1;
   }
@@ -352,7 +410,7 @@ export function createRenderer(canvas, map, opts = {}) {
   tagMesh.frustumCulled = false; tagMesh.renderOrder = 5;
   scene.add(tagMesh);
 
-  function drawTag(i, p) {
+  function drawTag(i, p, rel) {
     const col = i % TAG_COLS, row = (i / TAG_COLS) | 0, x = col * TAG_W, y = row * TAG_H;
     tagCtx.clearRect(x, y, TAG_W, TAG_H);
     const name = String(p.name || ('Player ' + p.id)).slice(0, 16);
@@ -363,7 +421,7 @@ export function createRenderer(canvas, map, opts = {}) {
     tagCtx.fillStyle = 'rgba(8,13,26,0.62)';
     tagCtx.beginPath(); tagCtx.roundRect(px, py, w, ph, 9); tagCtx.fill();
     const h = (Math.abs(p.id) * 0.61803398875) % 1;
-    tagCtx.fillStyle = 'hsl(' + Math.round(h * 360) + ',85%,62%)';
+    tagCtx.fillStyle = rel === 1 ? FRIEND_CSS : rel === 2 ? ENEMY_CSS : 'hsl(' + Math.round(h * 360) + ',85%,62%)';
     tagCtx.fillRect(px + 9, py + ph - 3, w - 18, 2);
     tagCtx.fillStyle = '#fff';
     tagCtx.fillText(name, x + TAG_W / 2, py + ph / 2 - 1, TAG_W - 30);
@@ -436,6 +494,97 @@ export function createRenderer(canvas, map, opts = {}) {
   }));
   spMesh.frustumCulled = false; spMesh.renderOrder = 7;
   scene.add(spMesh);
+
+  // ---- spawn-protection shimmer: one instanced translucent ellipsoid per protected player ----
+  const shieldMesh = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshBasicMaterial({
+    color: 0x9fe8ff, transparent: true, opacity: 0.28, blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+  }), MAXP);
+  shieldMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  shieldMesh.frustumCulled = false; shieldMesh.renderOrder = 3; shieldMesh.count = 0; shieldMesh.visible = false;
+  scene.add(shieldMesh);
+
+  // ---- objectives: flags + stands (one instanced mesh), the hardpoint zone (a translucent box and 12 edge bars) ----
+  const OBJ_N = 6;                       // 2 stand pads + 2 x (pole, cloth)
+  const objMesh = new THREE.InstancedMesh(unitBox, new THREE.MeshLambertMaterial({ vertexColors: false }), OBJ_N);
+  objMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  objMesh.frustumCulled = false; objMesh.visible = false;
+  for (let i = 0; i < OBJ_N; i++) objMesh.setColorAt(i, _col.setHex(0xffffff));
+  scene.add(objMesh);
+  const zoneFill = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.14, depthWrite: false, side: THREE.DoubleSide, fog: false,
+  }));
+  zoneFill.frustumCulled = false; zoneFill.renderOrder = 4; zoneFill.visible = false;
+  scene.add(zoneFill);
+  const edgeMesh = new THREE.InstancedMesh(unitBox, new THREE.MeshBasicMaterial({ fog: false }), 12);
+  edgeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  edgeMesh.frustumCulled = false; edgeMesh.visible = false;
+  for (let i = 0; i < 12; i++) edgeMesh.setColorAt(i, _col.setHex(0xffffff));
+  scene.add(edgeMesh);
+  const _qy = new THREE.Quaternion(), UP = new THREE.Vector3(0, 1, 0);
+  function putObj(idx, px, py, pz, yaw, sx, sy, sz) {
+    _v.set(px, py, pz); _qy.setFromAxisAngle(UP, yaw); _s.set(sx, sy, sz);
+    _m.compose(_v, _qy, _s); objMesh.setMatrixAt(idx, _m);
+  }
+  let zoneKey = '';
+  const ZONE_CONTEST = 0xffd23a;
+  function updateObjective(obj, time, frame) {
+    const flags = obj && obj.flags, hp = obj && obj.hardpoint;
+    const mf = curMap && curMap.flags;
+    const showFlags = !!(flags && mf);
+    objMesh.visible = showFlags;
+    if (showFlags) {
+      for (let k = 0; k < 2; k++) {
+        const t = k === 0 ? 'a' : 'b';
+        const rel = teamRel(t, obj.myTeam);
+        const hex = rel === 1 ? FRIEND_HEX : ENEMY_HEX;
+        const sp = mf[t], f = flags[t];
+        putObj(k, sp[0], sp[1] + 0.03, sp[2], 0, 1.9, 0.06, 1.9);
+        objMesh.setColorAt(k, _col.setHex(hex).multiplyScalar(0.8));
+        let px = sp[0], py = sp[1], pz = sp[2], yaw = 0, h = 2.2, w = 0.86;
+        if (f.state === 'dropped') { px = f.pos[0]; py = f.pos[1]; pz = f.pos[2]; h = 1.9; }
+        else if (f.state === 'carried') {
+          let cy = null, hide = false;
+          if (f.carrier === obj.selfId) hide = true;            // never in your own face
+          else for (let i = 0; i < frame.players.length; i++) if (frame.players[i].id === f.carrier) { cy = frame.players[i].yaw; break; }
+          if (hide || cy === null) { px = py = pz = 0; h = 0.0001; w = 0.0001; }
+          else {
+            yaw = cy; h = 1.5; w = 0.7;
+            px = f.pos[0] + Math.sin(cy) * 0.36; py = f.pos[1] + 0.25; pz = f.pos[2] + Math.cos(cy) * 0.36;
+          }
+        }
+        const wave = Math.sin(time * 3 + k * 1.7) * 0.28;
+        const a = yaw + wave;
+        putObj(2 + k * 2, px, py + h / 2, pz, yaw, 0.08, h, 0.08);
+        objMesh.setColorAt(2 + k * 2, _col.setHex(0xe8edf5));
+        putObj(3 + k * 2, px + Math.cos(a) * w * 0.5, py + h - 0.34, pz - Math.sin(a) * w * 0.5, a, w, 0.55, 0.05);
+        objMesh.setColorAt(3 + k * 2, _col.setHex(hex));
+      }
+      objMesh.instanceMatrix.needsUpdate = true;
+      objMesh.instanceColor.needsUpdate = true;
+    }
+    zoneFill.visible = edgeMesh.visible = !!hp;
+    if (hp) {
+      const key = hp.min.join(',') + '|' + hp.max.join(',') + '|' + hp.owner + '|' + obj.myTeam;
+      if (key !== zoneKey) {
+        zoneKey = key;
+        const x0 = hp.min[0], y0 = hp.min[1], z0 = hp.min[2], x1 = hp.max[0], y1 = hp.max[1], z1 = hp.max[2];
+        const hex = hp.owner === 'a' || hp.owner === 'b' ? (teamRel(hp.owner, obj.myTeam) === 1 ? FRIEND_HEX : ENEMY_HEX)
+          : hp.owner === 'contested' ? ZONE_CONTEST : 0xffffff;
+        zoneFill.position.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+        zoneFill.scale.set(x1 - x0, y1 - y0, z1 - z0);
+        zoneFill.material.color.setHex(hex);
+        const T = 0.09;
+        let n = 0;
+        const bar = (cx, cy, cz, sx, sy, sz) => { _v.set(cx, cy, cz); _s.set(sx, sy, sz); _m.compose(_v, QID, _s); edgeMesh.setMatrixAt(n, _m); edgeMesh.setColorAt(n, _col.setHex(hex)); n++; };
+        for (const y of [y0, y1]) for (const z of [z0, z1]) bar((x0 + x1) / 2, y, z, x1 - x0 + T, T, T);
+        for (const y of [y0, y1]) for (const x of [x0, x1]) bar(x, y, (z0 + z1) / 2, T, T, z1 - z0 + T);
+        for (const x of [x0, x1]) for (const z of [z0, z1]) bar(x, (y0 + y1) / 2, z, T, y1 - y0, T);
+        edgeMesh.instanceMatrix.needsUpdate = true;
+        edgeMesh.instanceColor.needsUpdate = true;
+      }
+      zoneFill.material.opacity = 0.11 + 0.05 * Math.sin(time * 3);
+    }
+  }
 
   // ---- viewmodel scene ----
   const vmScene = new THREE.Scene();
@@ -571,6 +720,20 @@ export function createRenderer(canvas, map, opts = {}) {
   }
 
   // -------------------------------------------------------------------------------------------
+  let overview = false, ovT = 0;
+  function overviewCamera(dt) {
+    ovT += dt;
+    const a = ovT * 0.1;
+    const r = mapHalf * 0.6, y = 8 + mapHalf * 0.26;
+    const x = mapCx + Math.cos(a) * r, z = mapCz + Math.sin(a) * r;
+    const dx = mapCx - x, dz = mapCz - z, dy = 1.5 - y;
+    camera.fov = baseFov; camera.updateProjectionMatrix();
+    camera.position.set(x, y, z);
+    camera.rotation.set(Math.atan2(dy, Math.hypot(dx, dz)), Math.atan2(-dx, -dz), 0);
+    camera.updateMatrixWorld(true);
+    sky.position.copy(camera.position);
+    clouds.position.set(camera.position.x, 0, camera.position.z);
+  }
   function updateCamera(L, dt) {
     const yaw = L.yaw, pitch = L.pitch;
     const sy = Math.sin(yaw), cy = Math.cos(yaw);
@@ -714,6 +877,7 @@ export function createRenderer(canvas, map, opts = {}) {
     const n = Math.min(players ? players.length : 0, MAXP);
     slotCount = n;
     const k = 1 - Math.exp(-dt * 14);
+    let shieldN = 0;
     const ce = camera.matrixWorld.elements;
     const camX = ce[12], camY = ce[13], camZ = ce[14];
     rr.set(ce[0], ce[1], ce[2]); ru.set(ce[4], ce[5], ce[6]);
@@ -722,9 +886,11 @@ export function createRenderer(canvas, map, opts = {}) {
     for (let i = 0; i < n; i++) {
       const p = players[i];
       if (slotId[i] !== p.id) assignSlot(i, p);
+      const rel = teamMode ? teamRel(p.team, viewerTeam) : 0;
+      if (slotRel[i] !== rel) paintChar(i, p, rel);
       const gkey = ((p.gun | 0) >= 0 && (p.gun | 0) < 6 ? (p.gun | 0) : 0) * 64 + ((p.att | 0) & 63);
       if (slotWeapon[i] !== gkey) setWeaponLook(i, gkey);
-      if (slotName[i] !== p.name) { slotName[i] = p.name; drawTag(i, p); }
+      if (slotName[i] !== p.name) { slotName[i] = p.name; drawTag(i, p, rel); }
 
       crouchSm[i] += ((p.crouching ? 1 : 0) - crouchSm[i]) * k;
       slideSm[i] += ((p.sliding ? 1 : 0) - slideSm[i]) * k;
@@ -784,6 +950,11 @@ export function createRenderer(canvas, map, opts = {}) {
       _v.set(p.x, gy + 0.03, p.z); _s.set(ss, 1, ss);
       _m.compose(_v, QID, _s);
       shadows.setMatrixAt(i, _m);
+      if (p.protected && p.alive) {
+        const pul = 1 + 0.05 * Math.sin(frame.time * 9 + i);
+        _v.set(p.x, p.y + 0.95, p.z); _s.set(0.8 * pul, 1.15 * pul, 0.8 * pul); _m.compose(_v, QID, _s);
+        shieldMesh.setMatrixAt(shieldN++, _m);
+      }
 
       // name tag (constant screen size, distance fade, wall + death hiding)
       {
@@ -795,7 +966,8 @@ export function createRenderer(canvas, map, opts = {}) {
         let target = 0;
         if (p.alive && depth > 0.6 && dist < TAG_FADE_FAR) {
           target = dist <= TAG_FADE_NEAR ? 1 : 1 - (dist - TAG_FADE_NEAR) / (TAG_FADE_FAR - TAG_FADE_NEAR);
-          if (frameNo % 3 === i % 3 || tagVis[i] < 0) {            // occlusion test every 3rd frame per player
+          if (rel === 1) tagVis[i] = 1;                              // teammates stay visible through walls
+          else if (frameNo % 3 === i % 3 || tagVis[i] < 0) {         // occlusion test every 3rd frame per player
             tagVis[i] = (segClear(camX, camY, camZ, p.x, headTop + 0.15, p.z) || segClear(camX, camY, camZ, p.x, headTop - 0.2, p.z)) ? 1 : 0;
           }
           if (!tagVis[i]) target = 0;
@@ -818,13 +990,15 @@ export function createRenderer(canvas, map, opts = {}) {
       }
     }
     for (let i = n; i < MAXP; i++) {
-      if (slotId[i] !== -1) { slotId[i] = -1; slotName[i] = ''; slotWeapon[i] = -1; slotThird[i] = null; }
+      if (slotId[i] !== -1) { slotId[i] = -1; slotName[i] = ''; slotWeapon[i] = -1; slotThird[i] = null; slotRel[i] = -2; }
     }
     // free the leftover slots visually
     tagPos.fill(0, n * 12);
     for (let i = n; i < MAXP; i++) { tagAlpha[i] = 0; tagVis[i] = -1; }
     chars.count = n * PARTS;
     shadows.count = n;
+    shieldMesh.count = shieldN; shieldMesh.visible = shieldN > 0;
+    if (shieldN > 0) { shieldMesh.instanceMatrix.needsUpdate = true; shieldMesh.material.opacity = 0.2 + 0.1 * Math.sin(frame.time * 8); }
     chars.instanceMatrix.needsUpdate = true;
     shadows.instanceMatrix.needsUpdate = true;
     tagGeo.attributes.position.needsUpdate = true;
@@ -886,13 +1060,22 @@ export function createRenderer(canvas, map, opts = {}) {
     spGeo.attributes.color.needsUpdate = true;
   }
 
+  const EMPTY_FRAME = { players: [], time: 0 };
   function render(frame) {
     if (frameNo === 0) renderer.info.reset();
     frameNo++;
     const dt = clamp(frame.dt || 0, 0, 0.1);
-    updateCamera(frame.local, dt);
-    updateViewmodel(frame.local, dt);
-    updateCharacters(frame, dt);
+    if (overview) {
+      overviewCamera(dt);
+      vmRoot.visible = false;
+      updateCharacters(EMPTY_FRAME, dt);
+      updateObjective(null, frame.time, EMPTY_FRAME);
+    } else {
+      updateCamera(frame.local, dt);
+      updateViewmodel(frame.local, dt);
+      updateCharacters(frame, dt);
+      updateObjective(frame.objective || null, frame.time, frame);
+    }
     updateTracers(dt);
     updateSparks(dt);
 
@@ -905,15 +1088,26 @@ export function createRenderer(canvas, map, opts = {}) {
     }
   }
 
+  setMap(map);
   setQuality(quality);
   resize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+  const _vs = new THREE.Vector3();
+  function viewSpace(x, y, z, out) {
+    _vs.set(x, y, z).applyMatrix4(camera.matrixWorldInverse);
+    out.x = _vs.x; out.y = _vs.y; out.z = _vs.z;
+    return out;
+  }
+  function setTeamView(isTeamMode, myTeam) { teamMode = !!isTeamMode; viewerTeam = myTeam === 'a' || myTeam === 'b' ? myTeam : ''; }
+  function setOverview(on) { overview = !!on; }
 
   return {
     resize, setFov, setQuality, getQuality, render, localFire, remoteFire, tracer, impact,
+    setMap, setTeamView, setOverview, viewSpace,
     // optional extras
     getCamera: () => camera,
     tagDebug: () => Array.from(tagAlpha.subarray(0, slotCount)),
     stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles }),
+    memory: () => ({ geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, mapId: curMap ? curMap.id : '' }),
     renderer,
   };
 }

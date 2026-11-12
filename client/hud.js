@@ -2,8 +2,14 @@
 // update(state) is called every frame and only touches the DOM when a value actually changed.
 
 import { createLoadoutEditor } from './loadout-ui.js';
+import { createMatchHud } from './matchhud.js';
+import { createLobby, copyToClipboard } from './lobby-ui.js';
 
-// opts for createHud(rootEl, opts): { touch: bool, onScoreboardClose(), onWeapon(slot) }
+// opts for createHud(rootEl, opts): { touch: bool, onScoreboardClose(), onWeapon(slot), onReturnToLobby(),
+//   lobby: { onConfig(partial), onStart(), onTeam(team), onLoadout(), onMenu() } }
+// Modes / lobby (protocol v4): hud.match = createMatchHud (top panel per mode, countdown, banner, objective feed,
+// markers, results, team scoreboard; see matchhud.js), hud.lobby = createLobby (private-room lobby; lobby-ui.js).
+// hud.setScoreboard(visible, boardData) takes the data main.js builds (rows with team / obj).
 // Extra methods beyond the base contract: setPrefs(settings) (crosshair, stats line), setInGame(bool)
 // (rotate hint), showMenu({ ..., inGame, tab }) -> the menu is a two-pane card (play column +
 // Loadout / Settings / Friends / Controls tabs) that fits a 640x360 landscape phone.
@@ -68,10 +74,7 @@ export function createHud(rootEl, hudOpts = {}) {
     <div class="hs-scope" data-k="0"><div class="ring"></div><div class="h"></div><div class="v"></div><div class="opt"><i></i></div></div>
 
     <div class="hs-topleft"><span class="hs-fps"></span><span class="hs-ping"></span><span class="hs-q"></span><span class="hs-pl"></span></div>
-    <div class="hs-topcenter">
-      <div class="hs-timer">0:00</div>
-      <div class="hs-kd"><span class="k"><b>0</b> KILLS</span><span class="d"><b>0</b> DEATHS</span></div>
-    </div>
+    <div class="hs-match"></div>
     <div class="hs-feed"></div>
     <div class="hs-status"></div>
 
@@ -96,17 +99,7 @@ export function createHud(rootEl, hudOpts = {}) {
 
     <div class="hs-death"><div class="hs-dtitle">ELIMINATED</div><div class="hs-dsub"></div></div>
 
-    <div class="hs-score"><div class="hs-panel">
-      <div class="hs-ptitle">SCOREBOARD</div>
-      <table><thead><tr><th class="n">#</th><th class="nm">Player</th><th>Kills</th><th>Deaths</th><th>Ping</th></tr></thead><tbody></tbody></table>
-    </div></div>
-
-    <div class="hs-round"><div class="hs-panel">
-      <div class="hs-ptitle">ROUND OVER</div>
-      <div class="hs-winner"></div>
-      <table><thead><tr><th class="n">#</th><th class="nm">Player</th><th>Kills</th><th>Deaths</th></tr></thead><tbody></tbody></table>
-      <div class="hs-next"></div>
-    </div></div>
+    <div class="hs-lb"></div>
 
     <div class="hs-wake" role="status"><div class="hs-wcard">
       <div class="hs-spin"></div><div class="hs-wtitle"></div><div class="hs-wsub"></div>
@@ -176,16 +169,16 @@ export function createHud(rootEl, hudOpts = {}) {
   const $ = (sel) => rootEl.querySelector(sel);
   const el = {
     vig: $('.hs-vignette'), dmgWrap: $('.hs-dmg-wrap'), cross: $('.hs-cross'), hit: $('.hs-hit'), scope: $('.hs-scope'),
-    fps: $('.hs-fps'), ping: $('.hs-ping'), q: $('.hs-q'), pl: $('.hs-pl'), timer: $('.hs-timer'),
-    kills: $('.hs-kd .k b'), deaths: $('.hs-kd .d b'), feed: $('.hs-feed'), status: $('.hs-status'),
+    fps: $('.hs-fps'), ping: $('.hs-ping'), q: $('.hs-q'), pl: $('.hs-pl'),
+    feed: $('.hs-feed'), status: $('.hs-status'),
     hnum: $('.hs-hnum'), hfill: $('.hs-hbar .fill'), speedNum: $('.hs-speed .num'), speedFill: $('.hs-speed .fill'),
     wname: $('.hs-wname'), cur: $('.hs-ammo .cur'), mag: $('.hs-ammo .mag'), ammo: $('.hs-ammo'),
     reload: $('.hs-reload'), death: $('.hs-death'), dsub: $('.hs-dsub'),
-    score: $('.hs-score'), scoreBody: $('.hs-score tbody'),
-    round: $('.hs-round'), roundBody: $('.hs-round tbody'), winner: $('.hs-winner'), next: $('.hs-next'),
     menu: $('.hs-menu'), name: $('.hs-name'), play: $('.hs-play'),
     rotate: $('.hs-rotate'), rotateGo: $('.hs-rgo'), card: $('.hs-card'), wbar: $('.hs-wbar'),
   };
+  const match = createMatchHud($('.hs-match'), { touch: TOUCH, onReturnToLobby: hudOpts.onReturnToLobby, onScoreboardClose: hudOpts.onScoreboardClose });
+  const lobby = createLobby($('.hs-lb'), { touch: TOUCH, ...(hudOpts.lobby || {}) });
   const wsBtns = Array.from(rootEl.querySelectorAll('.hs-ws'));
   for (const b of wsBtns) {
     // taps on the weapon bar must not reach the touch-controls layer underneath
@@ -301,9 +294,6 @@ export function createHud(rootEl, hudOpts = {}) {
     }
     setCls('fast', rootEl, 'hs-fast', sp > 11);
 
-    setText('kills', el.kills, String(s.kills || 0));
-    setText('deaths', el.deaths, String(s.deaths || 0));
-    setText('timer', el.timer, fmtTime(s.roundTimeLeft));
     setText('fps', el.fps, s.fps != null ? Math.round(s.fps) + ' FPS' : '');
     setText('ping', el.ping, s.ping != null ? Math.round(s.ping) + ' ms' : '');
     setText('q', el.q, netQualityText(s.quality));
@@ -342,44 +332,7 @@ export function createHud(rootEl, hudOpts = {}) {
     restartAnim(el.vig, 'flash');
   }
 
-  let sbSig = '';
-  // On a short screen only the top rows fit: show the leaders plus the local player's own row.
-  function maxRows() { const h = window.innerHeight; return h < 460 ? 7 : h < 620 ? 11 : 24; }
-  function fillRows(body, rows, withPing) {
-    body.textContent = '';
-    const sorted = rows.slice().sort((a, b) => (b.kills - a.kills) || (a.deaths - b.deaths));
-    const cap = maxRows();
-    const shown = [];
-    sorted.forEach((r, i) => { shown.push({ r, i }); });
-    let list = shown;
-    if (shown.length > cap) {
-      list = shown.slice(0, cap - 1);
-      const me = shown.find((x) => x.r.isLocal);
-      list.push(me && me.i >= cap - 1 ? me : shown[cap - 1]);
-    }
-    list.forEach(({ r, i }) => {
-      const tr = document.createElement('tr');
-      if (r.isLocal) tr.className = 'me';
-      const cells = [String(i + 1), null, String(r.kills | 0), String(r.deaths | 0)];
-      if (withPing) cells.push(r.isBot ? 'BOT' : String(Math.round(r.ping || 0)));
-      cells.forEach((c, ci) => {
-        const td = document.createElement('td');
-        if (ci === 1) { td.className = 'nm'; td.textContent = r.name || ''; if (r.isBot) { const t = document.createElement('em'); t.textContent = 'bot'; td.appendChild(t); } }
-        else { if (ci === 0) td.className = 'n'; td.textContent = c; }
-        tr.appendChild(td);
-      });
-      body.appendChild(tr);
-    });
-  }
-  function setScoreboard(visible, rows) {
-    el.score.classList.toggle('on', !!visible);
-    if (!visible || !rows) return;
-    let sig = '';
-    for (let i = 0; i < rows.length; i++) { const r = rows[i]; sig += r.id + '|' + r.name + '|' + r.kills + '|' + r.deaths + '|' + (r.ping | 0) + '|' + (r.isLocal ? 1 : 0) + ';'; }
-    if (sig === sbSig) return;
-    sbSig = sig;
-    fillRows(el.scoreBody, rows, true);
-  }
+  function setScoreboard(visible, data) { match.setScoreboard(visible, data); }
 
   // ---- settings controls (generated from SET_DEFS) ----
   const setHost = $('.hs-settings');
@@ -493,14 +446,14 @@ export function createHud(rootEl, hudOpts = {}) {
     el.name.value = menuCb.defaultName || '';
     for (const k in ctl) if (st[k] !== undefined) setControl(k, st[k]);
     applyPrefs(st);
-    el.play.textContent = menuCb.inGame ? 'RESUME' : 'PLAY';
+    el.play.textContent = menuCb.playLabel || (menuCb.inGame ? 'RESUME' : 'PLAY');
     editor.setPlayLabel(el.play.textContent);
     if (menuCb.loadout) { editor.setState(menuCb.loadout.saved); if (menuCb.loadout.status) editor.setStatus(menuCb.loadout.status); }
     applyRoom(menuCb.room);
     setTab(menuCb.tab || curTab);
     el.menu.classList.add('on');
     rootEl.classList.add('hs-menuopen');
-    el.score.classList.remove('on');
+    match.setScoreboard(false);
     if (!TOUCH) setTimeout(() => el.name.focus(), 0);     // a focused field would pop the keyboard on phones
   }
   function setPrefs(st) { applyPrefs(st); }
@@ -539,11 +492,7 @@ export function createHud(rootEl, hudOpts = {}) {
   fr.join.addEventListener('click', joinCode);
   fr.leave.addEventListener('click', () => { const r = roomCb(); if (r.onLeave) r.onLeave(typedName()); });
   fr.copy.addEventListener('click', async () => {
-    const text = fr.link.value;
-    if (!text) return;
-    let ok = false;
-    try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; } } catch { /* fall through */ }
-    if (!ok) { fr.link.focus(); fr.link.select(); try { ok = document.execCommand('copy'); } catch { /* manual copy */ } }
+    const ok = await copyToClipboard(fr.link.value, fr.link);
     fr.copy.textContent = ok ? 'Copied' : 'Press Ctrl/Cmd+C';
     setTimeout(() => { fr.copy.textContent = 'Copy'; }, 1800);
   });
@@ -551,25 +500,6 @@ export function createHud(rootEl, hudOpts = {}) {
     inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (inp === fr.code && e.key === 'Enter') joinCode(); });
     inp.addEventListener('keyup', (e) => e.stopPropagation());
   }
-
-  let nextTimer = 0;
-  function showRoundEnd(o) {
-    el.winner.textContent = o && o.winnerName ? o.winnerName + ' wins!' : 'Round complete';
-    fillRows(el.roundBody, (o && o.rows) || [], false);
-    el.round.classList.add('on');
-    el.score.classList.remove('on');
-    clearInterval(nextTimer);
-    let n = Math.max(0, Math.ceil((o && o.nextIn) || 0));
-    el.next.textContent = n > 0 ? 'Next round in ' + n + 's' : '';
-    if (n > 0) {
-      nextTimer = setInterval(() => {
-        n--;
-        el.next.textContent = n > 0 ? 'Next round in ' + n + 's' : 'Starting...';
-        if (n <= 0) clearInterval(nextTimer);
-      }, 1000);
-    }
-  }
-  function hideRoundEnd() { clearInterval(nextTimer); el.round.classList.remove('on'); }
 
   // ---- server availability: pill in the menu, overlay while the server is waking up
   const sv = { box: $('.hs-server'), text: $('.hs-server span'), wake: $('.hs-wake'), title: $('.hs-wtitle'), sub: $('.hs-wsub') };
@@ -601,10 +531,6 @@ export function createHud(rootEl, hudOpts = {}) {
     window.addEventListener('resize', onOrient);
     onOrient();
     el.rotateGo.addEventListener('click', () => { hintDismissed = true; syncRotate(); });
-    $('.hs-score .hs-panel').addEventListener('click', () => {
-      el.score.classList.remove('on');
-      if (hudOpts.onScoreboardClose) hudOpts.onScoreboardClose();
-    });
   }
 
   function setStatus(text) {
@@ -612,5 +538,5 @@ export function createHud(rootEl, hudOpts = {}) {
     el.status.classList.toggle('on', !!text);
   }
 
-  return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, showRoundEnd, hideRoundEnd, setStatus };
+  return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, setStatus, setTab, match, lobby };
 }
