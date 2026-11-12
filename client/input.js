@@ -10,7 +10,17 @@
 // Events. Every finger is tracked by pointer id, so move stick, look, fire and one button can all
 // be held at once. The touch path produces exactly the same cmd fields as the keyboard path:
 // the stick maps to the WASD bits (8-way), look edits yaw/pitch, buttons set BTN bits. There is
-// no pointer lock on touch. Aim assist and auto-fire (createAssist) only reshape yaw/pitch and the
+// no pointer lock on touch.
+//
+// Move stick (default "stick gestures" mode), R = base radius (56 px x button scale), floating
+// origin under the thumb at touch-down:
+//   d < R               run: 8-way WASD bits (dead zone 0.22 R)
+//   R <= d < 1.75 R     SLIDE ring: same direction bits + CROUCH held (slide when moving fast)
+//   d >= 1.75 R and within +-40 deg of straight up: JUMP zone: JUMP held (auto-hops), no crouch
+//   (the base follows the thumb past the ring / past 2.3 R in the jump zone, so travel stays short)
+// A quick upward flick that stops short of the jump zone still latches one JUMP. With the slide-hop
+// assist on, holding the thumb in the jump zone also crouches while falling fast (boosted landing slide
+// that the held jump immediately hops out of). The "buttons" mode brings back JUMP / SLIDE buttons. Aim assist and auto-fire (createAssist) only reshape yaw/pitch and the
 // FIRE bit on the client; the server sees ordinary input.
 
 import { BTN, PITCH_LIMIT } from '../shared/constants.js';
@@ -82,6 +92,9 @@ export function createInput(canvas, opts = {}) {
     touchSens: 1,
     kit: null,        // weapons.getKit(...) of the current life (so semi/auto is the real gun's)
     lookDYaw: 0, lookDPitch: 0,   // look deltas accumulated since the last applyAssist (rad)
+    stickJump: false,             // touch: the thumb is in the stick's jump zone
+    slideAssist: true,            // touch: crouch while falling in the stick's jump zone (slide-hop assist)
+    air: null,                    // { onGround, vy, hs, crouching, sliding } of the local player, set per frame by applyAssist
   };
   let lastWheel = 0;
 
@@ -195,6 +208,10 @@ export function createInput(canvas, opts = {}) {
       const w = (st.kit && st.kit.slots[st.weapon]) || WEAPONS[st.weapon] || WEAPONS[0];
       if (w.auto || st.autoPulse) b |= BTN.FIRE;
     }
+    // slide-hop assist: while the thumb holds the stick's jump zone, crouch on the way down (and while the
+    // landing slide lasts) so every landing is a boosted slide that the held jump hops straight out of
+    if (st.enabled && st.touch && st.slideAssist && st.stickJump && st.air && st.air.hs > 5
+        && ((!st.air.onGround && st.air.vy < -1.5) || (st.air.onGround && (st.air.crouching || st.air.sliding)))) b |= BTN.CROUCH;
     st.latched = 0;
     return b;
   }
@@ -212,6 +229,8 @@ export function createInput(canvas, opts = {}) {
    */
   function applyAssist(dt, ctx) {
     const aiming = !!(touchUi && touchUi.lookActive()) || (st.touchHeld & (BTN.FIRE | BTN.ADS)) !== 0;
+    const sf = ctx.self;
+    if (sf) st.air = { onGround: !!sf.onGround, vy: sf.vy || 0, hs: Math.hypot(sf.vx || 0, sf.vz || 0), crouching: !!sf.crouching, sliding: !!sf.sliding };
     ctx.yaw = st.yaw; ctx.pitch = st.pitch; ctx.aiming = aiming;
     ctx.lookDYaw = st.lookDYaw; ctx.lookDPitch = st.lookDPitch;
     st.lookDYaw = 0; st.lookDPitch = 0;
@@ -338,18 +357,16 @@ export function createAssist() {
 // --------------------------------------------------------------------------- touch controls
 
 const TOUCH_HTML = `
-  <div class="tc-hint tc-hint-move"><i></i><span>MOVE</span></div>
+  <div class="tc-hint tc-hint-move"><i></i><u class="o"></u><span>MOVE</span><em class="hs">SLIDE</em><em class="hj">&#9650; JUMP</em></div>
   <div class="tc-hint tc-hint-look"><span>DRAG TO LOOK</span></div>
-  <div class="tc-stick"><div class="tc-knob"></div></div>
+  <div class="tc-stick"><i class="tc-ring"></i><i class="tc-jz"><b>&#9650; JUMP</b></i><b class="tc-sl">SLIDE</b><div class="tc-knob"></div></div>
   <div class="tb tb-menu" data-act="menu" aria-label="Menu"><b><i class="ic-menu"></i></b></div>
   <div class="tb tb-score" data-act="score" aria-label="Scoreboard"><b><i class="ic-score"></i></b></div>
   <div class="tb tb-fire" data-act="fire" aria-label="Fire"><b>FIRE</b></div>
   <div class="tb tb-jump" data-act="jump" aria-label="Jump"><b>JUMP</b></div>
   <div class="tb tb-crouch" data-act="crouch" aria-label="Crouch or slide"><b>SLIDE</b></div>
   <div class="tb tb-ads" data-act="ads" aria-label="Aim"><b>AIM</b></div>
-  <div class="tb tb-reload" data-act="reload" aria-label="Reload"><b>RELOAD</b></div>
-  <div class="tb tb-wprev" data-act="wprev" aria-label="Previous weapon"><b>&#8249;</b></div>
-  <div class="tb tb-wnext" data-act="wnext" aria-label="Next weapon"><b>&#8250;</b></div>`;
+  <div class="tb tb-reload" data-act="reload" aria-label="Reload"><b>RELOAD</b></div>`;
 
 function createTouchControls(st, api) {
   const layer = document.createElement('div');
@@ -362,27 +379,88 @@ function createTouchControls(st, api) {
   const btnEls = {};
   layer.querySelectorAll('[data-act]').forEach((e) => { btnEls[e.dataset.act] = e; });
 
-  const cfg = { side: 'left', scale: 1 };
+  const cfg = { side: 'left', scale: 1, jumpSlide: 'stick', slideAssist: true };
   const ptrs = new Map();        // pointerId -> { role: 'stick'|'look'|'btn', act, x, y, ... }
   let stickId = null;
-  const stick = { ox: 0, oy: 0, x: 0, y: 0, mag: 0, bits: 0 };
+  const stick = { ox: 0, oy: 0, x: 0, y: 0, mag: 0, bits: 0, d: 0, zone: 'none', slide: false, jump: false, flicks: 0, downAt: 0 };
   const MOVE_BITS = BTN.FORWARD | BTN.BACK | BTN.LEFT | BTN.RIGHT;
   const DEAD = 0.22;
+  const OUTER = 1.75;                    // outer (slide) ring radius, in base radii
+  const JUMP_MAX = 0.55;                 // in the jump zone the base follows the thumb beyond OUTER + this
+  const JUMP_HALF = 40 * Math.PI / 180;  // jump zone: +-40 deg around straight up (+12 deg hysteresis once in)
+  const SLIDE_DWELL_MS = 40;             // thumb must stay in the ring this long (so a jump flick does not nick crouch)
+  const FLICK_MS = 110, FLICK_TRAVEL = 0.8, FLICK_MIN_LEN = 1.3, FLICK_COOLDOWN = 350;
   let visible = false;
+  let slideSince = 0, slideTimer = 0, lastFlick = -1e9, lastBuzz = -1e9;
+  const trail = [];                      // recent thumb samples [t, y] for flick detection
 
   function stickRadius() { return 56 * cfg.scale; }
   function setStickBits(b) { st.touchHeld = (st.touchHeld & ~MOVE_BITS) | b; stick.bits = b; }
+  function buzz(ms) {
+    const t = performance.now();
+    if (t - lastBuzz < 60) return;
+    lastBuzz = t;
+    try { if (navigator.vibrate) navigator.vibrate(ms); } catch { /* not supported / blocked */ }
+  }
+  /** Hold / release CROUCH and JUMP on behalf of the stick (never touches the JUMP / SLIDE buttons' own state). */
+  function setZoneBits(slide, jump) {
+    if (slide !== stick.slide) {
+      stick.slide = slide;
+      st.touchHeld = slide ? (st.touchHeld | BTN.CROUCH) : (st.touchHeld & ~BTN.CROUCH);
+      if (slide) { st.latched |= BTN.CROUCH; buzz(8); }
+    }
+    if (jump !== stick.jump) {
+      stick.jump = jump; st.stickJump = jump;
+      st.touchHeld = jump ? (st.touchHeld | BTN.JUMP) : (st.touchHeld & ~BTN.JUMP);
+      if (jump) { st.latched |= BTN.JUMP; buzz(14); }
+    }
+    stick.zone = jump ? 'jump' : slide ? 'slide' : (stickId !== null ? 'run' : 'none');
+    stickEl.classList.toggle('sl', slide);
+    stickEl.classList.toggle('jp', jump);
+  }
 
   function updateStick(x, y) {
-    const R = stickRadius();
+    const R = stickRadius(), R2 = R * OUTER, gest = cfg.jumpSlide === 'stick';
+    const now = performance.now();
     let vx = x - stick.ox, vy = y - stick.oy;
     let len = Math.hypot(vx, vy);
-    if (len > R) {                                   // floating stick: the base follows the thumb
-      const over = (len - R) / len;
+    // sector around straight up (0 = up, + clockwise)
+    const ang = len > 0 ? Math.atan2(vx, -vy) : 0;
+    let jumpNow = false, slideNow = false;
+    if (gest) {
+      const inJump = stick.jump;
+      const sectorOk = Math.abs(ang) <= JUMP_HALF + (inJump ? 0.21 : 0);
+      jumpNow = sectorOk && len >= (inJump ? R2 * 0.9 : R2 - 0.5);
+      if (!jumpNow) {
+        const inSlide = stick.slide;
+        const inRing = len >= (inSlide ? R * 0.94 : R * 1.06);
+        if (inRing) {
+          if (inSlide) slideNow = true;
+          else {
+            if (!slideSince) { slideSince = now; clearTimeout(slideTimer); slideTimer = setTimeout(() => { if (stickId !== null) updateStick(lastX, lastY); }, SLIDE_DWELL_MS + 6); }
+            slideNow = now - slideSince >= SLIDE_DWELL_MS;
+          }
+        } else slideSince = 0;
+      } else slideSince = 0;
+      // flick: a fast upward stroke that ends well out in the top sector counts as one jump even without dwelling
+      trail.push(now, y);
+      while (trail.length > 2 && now - trail[0] > FLICK_MS) trail.splice(0, 2);
+      if (!jumpNow && !stick.jump && now - stick.downAt > 250 && now - lastFlick > FLICK_COOLDOWN
+          && Math.abs(ang) <= JUMP_HALF + 0.17 && len >= R * FLICK_MIN_LEN && trail[1] - y >= R * FLICK_TRAVEL) {
+        lastFlick = now; stick.flicks++;
+        st.latched |= BTN.JUMP; buzz(14);
+        stickEl.classList.add('fl'); setTimeout(() => stickEl.classList.remove('fl'), 140);
+      }
+    }
+    const lim = !gest ? R : jumpNow ? R2 + R * JUMP_MAX : R2;
+    if (len > lim) {                                 // floating stick: the base follows the thumb
+      const over = (len - lim) / len;
       stick.ox += vx * over; stick.oy += vy * over;
       vx = x - stick.ox; vy = y - stick.oy; len = Math.hypot(vx, vy);
     }
+    lastX = x; lastY = y;
     stick.x = len > 0 ? vx / len : 0; stick.y = len > 0 ? vy / len : 0;
+    stick.d = len;
     stick.mag = Math.min(1, len / R);
     let b = 0;
     if (stick.mag >= DEAD) {
@@ -392,20 +470,26 @@ function createTouchControls(st, api) {
       else if (stick.x > 0.38) b |= BTN.RIGHT;
     }
     setStickBits(b);
+    if (gest) setZoneBits(slideNow, jumpNow);
     stickEl.style.transform = `translate(${stick.ox}px, ${stick.oy}px)`;
     knobEl.style.transform = `translate(${vx}px, ${vy}px)`;
   }
+  let lastX = 0, lastY = 0;
   function stickDown(x, y) {
-    stick.ox = x; stick.oy = y;
+    stick.ox = x; stick.oy = y; stick.downAt = performance.now();
+    slideSince = 0; trail.length = 0;
     stickEl.classList.add('on');
     layer.classList.add('stick-on');
     updateStick(x, y);
   }
   function stickUp() {
-    stickEl.classList.remove('on');
+    clearTimeout(slideTimer); slideSince = 0; trail.length = 0;
+    stickEl.classList.remove('on', 'sl', 'jp', 'fl');
     layer.classList.remove('stick-on');
     setStickBits(0);
-    stick.mag = 0;
+    stick.mag = 0; stick.d = 0;
+    setZoneBits(false, false);
+    stick.zone = 'none';
   }
 
   function look(dx, dy) {
@@ -424,8 +508,6 @@ function createTouchControls(st, api) {
       case 'crouch': st.touchHeld |= BTN.CROUCH; st.latched |= BTN.CROUCH; break;
       case 'reload': st.touchHeld |= BTN.RELOAD; st.latched |= BTN.RELOAD; break;
       case 'ads': adsOn = !adsOn; syncAds(); break;
-      case 'wprev': api.setWeapon(st.weapon - 1); break;
-      case 'wnext': api.setWeapon(st.weapon + 1); break;
       case 'menu': api.onMenu(); break;
       case 'score': sbOn = !sbOn; setScoreboardActive(sbOn); api.onScoreboard(sbOn); break;
     }
@@ -499,7 +581,7 @@ function createTouchControls(st, api) {
     ptrs.clear(); stickId = null; stickUp();
     adsOn = false; syncAds();
     for (const a in btnEls) if (a !== 'score') setPressed(a, false);
-    st.touchHeld = 0;
+    st.touchHeld = 0; stick.slide = false; stick.jump = false; st.stickJump = false;
     layer.classList.remove('touched');
   }
   function setVisible(v) {
@@ -509,7 +591,14 @@ function createTouchControls(st, api) {
   function configure(c) {
     if (c.side === 'left' || c.side === 'right') cfg.side = c.side;
     if (Number.isFinite(c.scale)) cfg.scale = Math.max(0.8, Math.min(1.6, c.scale));
+    if (c.jumpSlide === 'stick' || c.jumpSlide === 'buttons') {
+      const changed = c.jumpSlide !== cfg.jumpSlide;
+      cfg.jumpSlide = c.jumpSlide;
+      if (changed && stickId !== null) { setZoneBits(false, false); st.touchHeld &= ~(BTN.CROUCH | BTN.JUMP); }
+    }
+    if (typeof c.slideAssist === 'boolean') { cfg.slideAssist = c.slideAssist; st.slideAssist = c.slideAssist; }
     layer.dataset.side = cfg.side;
+    layer.dataset.js = cfg.jumpSlide;
     layer.style.setProperty('--ts', String(cfg.scale));
   }
   configure({});
@@ -518,7 +607,10 @@ function createTouchControls(st, api) {
     const held = st.touchHeld;
     return {
       visible, side: cfg.side, scale: cfg.scale, pointers: ptrs.size,
-      stick: { active: stickId !== null, x: +stick.x.toFixed(2), y: +stick.y.toFixed(2), mag: +stick.mag.toFixed(2), bits: stick.bits },
+      jumpSlide: cfg.jumpSlide, slideAssist: cfg.slideAssist,
+      stick: { active: stickId !== null, x: +stick.x.toFixed(2), y: +stick.y.toFixed(2), mag: +stick.mag.toFixed(2), bits: stick.bits,
+        zone: stick.zone, slide: stick.slide, jump: stick.jump, flicks: stick.flicks, dist: +stick.d.toFixed(1),
+        radius: +stickRadius().toFixed(1), outer: +(stickRadius() * OUTER).toFixed(1), origin: [+stick.ox.toFixed(1), +stick.oy.toFixed(1)] },
       held, fire: !!(held & BTN.FIRE), jump: !!(held & BTN.JUMP), crouch: !!(held & BTN.CROUCH), ads: !!(held & BTN.ADS),
       autoFire: st.autoFire, assistSlow: st.assistSlow,
       assist: assistOut ? { target: assistOut.target, err: +assistOut.err.toFixed(4), cone: +assistOut.cone.toFixed(4), fire: assistOut.fire } : null,

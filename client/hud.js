@@ -48,6 +48,8 @@ const SET_DEFS = [
   ] },
   { id: 'touch', title: 'Touch controls', touch: true, items: [
     { k: 'stickSide', label: 'Move stick side', type: 'select', options: [['left', 'Left (buttons right)'], ['right', 'Right (buttons left)']] },
+    { k: 'jumpSlide', label: 'Jump & slide', type: 'select', options: [['stick', 'Stick gestures'], ['buttons', 'Buttons']] },
+    { k: 'slideAssist', label: 'Slide-hop assist (stick jump zone crouches on landing)', type: 'check' },
     { k: 'btnScale', label: 'Button size', type: 'range', min: 0.9, max: 1.5, step: 0.05, fmt: fmtX },
     { k: 'aimAssist', label: 'Aim assist (gentle slow-down and pull)', type: 'check' },
     { k: 'autoFire', label: 'Auto-fire when aiming at an enemy', type: 'check' },
@@ -159,10 +161,11 @@ export function createHud(rootEl, hudOpts = {}) {
             </div>
             <div class="hs-keys-touch">
               <div><kbd>Left thumb</kbd><em>Drag to move (full push = run)</em></div>
+              <div><kbd>Ring</kbd><em>Push past the stick edge to slide</em></div>
+              <div><kbd>Up</kbd><em>Push up past the ring (or flick) to jump, hold to hop</em></div>
               <div><kbd>Right side</kbd><em>Drag to look</em></div>
               <div><kbd>FIRE</kbd><em>Hold to shoot, drag it to aim</em></div>
-              <div><kbd>JUMP</kbd><em>Hold to bunny-hop</em><kbd>SLIDE</kbd><em>Crouch / slide</em></div>
-              <div><kbd>AIM</kbd><em>Toggle scope</em><kbd>&#8249; &#8250;</kbd><em>Weapon</em></div>
+              <div><kbd>AIM</kbd><em>Toggle scope</em><kbd>1 2 3</kbd><em>Tap a weapon slot</em></div>
               <div><em>Top-left buttons: menu and scoreboard</em></div>
             </div>
           </section>
@@ -391,6 +394,7 @@ export function createHud(rootEl, hudOpts = {}) {
     if (typeof st.crosshairColor === 'string') rootEl.style.setProperty('--xh-c', st.crosshairColor);
     if (Number.isFinite(st.crosshairSize)) rootEl.style.setProperty('--xh-s', String(st.crosshairSize));
     if (st.showStats !== undefined) rootEl.classList.toggle('hs-nostats', !st.showStats);
+    if (st.stickSide !== undefined) rootEl.classList.toggle('hs-stick-right', st.stickSide === 'right');
   }
   function setControl(k, v) {
     const c = ctl[k];

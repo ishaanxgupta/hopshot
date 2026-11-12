@@ -54,7 +54,7 @@ const DEFAULTS = {
   quality: IS_TOUCH ? 'medium' : 'high',
   showStats: !IS_TOUCH,
   crosshairColor: '#ffffff', crosshairSize: 1,
-  stickSide: 'left', btnScale: 1, aimAssist: IS_TOUCH, autoFire: IS_TOUCH,
+  stickSide: 'left', btnScale: 1, aimAssist: IS_TOUCH, autoFire: IS_TOUCH, jumpSlide: 'stick', slideAssist: true,
 };
 const bool = (v, def) => (typeof v === 'boolean' ? v : def);
 const pick = (v, list, def) => (list.includes(v) ? v : def);
@@ -75,6 +75,8 @@ function sanitize(s, base) {
     btnScale: num(s.btnScale, base.btnScale, 0.8, 1.6),
     aimAssist: bool(s.aimAssist, base.aimAssist),
     autoFire: bool(s.autoFire, base.autoFire),
+    jumpSlide: pick(s.jumpSlide, ['stick', 'buttons'], base.jumpSlide),
+    slideAssist: bool(s.slideAssist, base.slideAssist),
   };
 }
 const settings = sanitize(stored, DEFAULTS);
@@ -120,7 +122,7 @@ function applySettings() {
   audio.setVolume(settings.volume);
   input.sensitivity = settings.sensitivity;
   input.invertY = settings.invertY;
-  input.configureTouch({ side: settings.stickSide, scale: settings.btnScale });
+  input.configureTouch({ side: settings.stickSide, scale: settings.btnScale, jumpSlide: settings.jumpSlide, slideAssist: settings.slideAssist });
   hud.setPrefs(settings);
 }
 applySettings();
