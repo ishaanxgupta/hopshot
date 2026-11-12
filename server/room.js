@@ -32,6 +32,11 @@
 //                     config), public -> the next map/mode of the rotation -> countdown.
 //   Public rooms never use the lobby. Score changes that end a match are applied at the end of
 //   the tick (pendingEnd), so nothing is despawned while the tick is still iterating players.
+//
+// Voice (protocol v5): private rooms only. relaySignal() forwards WebRTC signaling between two
+// humans of this room (validated + rebuilt by protocol.sanitizeSignal); setVoiceState() keeps
+// each human's mic / deaf flags and broadcasts changes. The server never touches audio, and who
+// may hear whom is enforced by the sending client (protocol.voiceAllowed).
 
 import { performance } from 'node:perf_hooks';
 import {
@@ -49,7 +54,7 @@ import {
 import {
   PROTOCOL_VERSION, SHOT, SNAP_SELF_BYTES, PLAYER_ENTRY_BYTES, SHOT_ENTRY_BYTES, MAX_SNAP_SHOTS,
   writeSnapshotSelf, writePlayerEntry, writeShotEntry, normalToAxis, createCmd, sanitizeCmd, encodeText,
-  parseLoadoutCode,
+  parseLoadoutCode, sanitizeSignal,
 } from '../shared/protocol.js';
 import {
   MODES, isTeamMode, otherTeam, sanitizeMatchConfig, defaultMatchConfig, decideWinner, MAP_SIZE_PLAYERS,
@@ -114,6 +119,8 @@ export class Room {
     this.botMin = opts.botMin ?? BOT_MIN;
     this.onEmpty = opts.onEmpty || (() => {});
     this.spawnPolicy = opts.spawnPolicy || 'smart';
+    this.iceServers = Array.isArray(opts.iceServers) ? opts.iceServers : [];
+    this.voiceStats = { relayed: 0, refused: 0, limited: 0, states: 0 };
     this.players = [];          // dense list, humans and bots
     this.byId = new Map();
     this.nextId = 1;
@@ -280,6 +287,8 @@ export class Room {
       // match: team ('' | 'a' | 'b'), spawn protection end tick, carried flag ('' | the
       // flag's team), objective score (captures / zone seconds), join order (host migration)
       team: '', protectedUntil: 0, carrying: '', obj: 0, joinSeq: ++this.joinSeq,
+      // voice (v5, private rooms): transmitting / speaker off
+      mic: false, deaf: false,
       // cmd jitter buffer
       queue, qHead: 0, qLen: 0, lastQueuedSeq: -1, ackSeq: -1,
       lastCmd: createCmd(), guess: createCmd(), starved: 0, qMin: 1e9, qWindow: 0,
@@ -461,7 +470,41 @@ export class Room {
   }
 
   rosterEntry(p) {
-    return { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code, team: p.team, obj: p.obj };
+    const e = { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code, team: p.team, obj: p.obj };
+    if (this.isPrivate) { e.mic = p.mic; e.deaf = p.deaf; }
+    return e;
+  }
+
+  // ------------------------------------------------------------------ voice (v5)
+
+  /**
+   * Relay one WebRTC signal from human p to player `to`. Only inside a private room, only between
+   * two different humans that are both in this room. Returns null (sent) or a reason string.
+   */
+  relaySignal(p, to, d) {
+    const refuse = (why) => { this.voiceStats.refused++; return why; };
+    if (!this.isPrivate) return refuse('not_private');
+    if (!p || p.bot || !p.ws || p.removed || this.byId.get(p.id) !== p) return refuse('bad_sender');
+    if (!Number.isInteger(to) || to === p.id) return refuse('bad_target');
+    const q = this.byId.get(to);
+    if (!q) return refuse('no_target');
+    if (q.bot || !q.ws || q.removed) return refuse('bad_target');
+    const sig = sanitizeSignal(d);
+    if (!sig) return refuse('bad_signal');
+    this.sendTo(q, encodeText({ t: 'rtc', from: p.id, d: sig }));
+    this.voiceStats.relayed++;
+    return null;
+  }
+
+  /** A human's voice state (mic = transmitting, deaf = speaker off). Private rooms only. */
+  setVoiceState(p, mic, deaf) {
+    if (!this.isPrivate || p.bot) { this.voiceStats.refused++; return 'not_private'; }
+    if (typeof mic !== 'boolean' || typeof deaf !== 'boolean') return 'bad_voice';
+    if (p.mic === mic && p.deaf === deaf) return null;
+    p.mic = mic; p.deaf = deaf;
+    this.voiceStats.states++;
+    this.broadcast(encodeText({ t: 'voice', id: p.id, mic, deaf }), p);
+    return null;
   }
 
   /**
@@ -483,6 +526,8 @@ export class Room {
       players: this.players.map((q) => this.rosterEntry(q)),
       round: this.roundCompat(),
       match: this.matchState(), lobby: this.lobbyState(), obj: this.objState(),
+      // (v5) voice chat: private rooms only
+      voice: !!this.isPrivate, ice: this.isPrivate ? this.iceServers : undefined,
     });
   }
 
@@ -1382,6 +1427,7 @@ export class Room {
       players: this.players.length, humans: this.humans, bots: this.botCount,
       tickMs: this.timingStats(), overruns: this.overruns, catchUpDrops: this.catchUpDrops,
       snapshotsSkipped: this.snapshotsSkipped, bytesOutPerSec: Math.round(this.bytesOut / secs),
+      voice: { ...this.voiceStats },
       cmdsDropped: this.players.reduce((s, p) => s + p.cmdsDropped, 0),
       net: this.players.filter((p) => !p.bot).map((p) => ({
         id: p.id, starved: p.starvedTotal, dropped: p.cmdsDropped, dropCommit: p.dropCommit, dropTrim: p.dropTrim, dropAlive: p.dropAlive, replays: p.specReplays, commits: p.specCommits,

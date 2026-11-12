@@ -878,3 +878,113 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: #8ec5ff; fon
 @media (max-height: 420px) {
   .hs-count .cm { letter-spacing: 3px; }
 }
+
+/* =====================================================================================
+   Voice chat (client/voice.js; buttons in hud.js and lobby-ui.js)
+   ===================================================================================== */
+/* in-game pair: top-left corner, the stats line moves right of it. Above the menu backdrop so a
+   desktop player can reach it with Esc; hidden in the lobby (the lobby header has its own pair). */
+.hs-voice { left: 12px; top: 8px; display: none; gap: 4px; pointer-events: auto; z-index: 6; text-shadow: none; }
+.hs-hasvoice .hs-voice { display: flex; }
+.hs-inlobby .hs-voice { display: none !important; }
+/* the menu card covers the corner on phones / small windows */
+.hs-touch.hs-menuopen .hs-voice { display: none !important; }
+@media (max-width: 900px), (max-height: 520px) { .hs-menuopen .hs-voice { display: none !important; } }
+.hs-vb { width: 30px; height: 30px; padding: 0; display: inline-flex; align-items: center; justify-content: center; color: #fff; background: var(--glass);
+  border: 1px solid var(--line); border-radius: 9px; cursor: pointer; touch-action: manipulation; -webkit-appearance: none; appearance: none;
+  transition: background 0.1s, border-color 0.1s, box-shadow 0.1s, opacity 0.1s; }
+.hs-vb svg { width: 17px; height: 17px; }
+.hs-vb:hover { background: rgba(40, 52, 84, 0.8); }
+.hs-vb:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.hs-vmic[data-s=off] { color: var(--ink-dim); }
+.hs-vmic[data-s=on], .hs-vmic[data-s=ptt], .lb-vmic[data-s=on], .lb-vmic[data-s=ptt] { color: #fff; background: rgba(48, 160, 92, 0.62); border-color: rgba(140, 240, 170, 0.85); }
+.hs-vmic[data-s=denied], .hs-vmic[data-s=error], .lb-vmic[data-s=denied], .lb-vmic[data-s=error] { color: #ffb0b8; border-color: rgba(255, 77, 94, 0.75); }
+.hs-vmic[data-s=nomic], .lb-vmic[data-s=nomic] { opacity: 0.5; }
+.hs-vmic[data-s=pending], .lb-vmic[data-s=pending] { animation: hs-vpend 0.9s ease-in-out infinite; }
+@keyframes hs-vpend { 50% { opacity: 0.45; } }
+.hs-vmic.talk, .lb-vmic.talk { box-shadow: 0 0 0 2px rgba(10, 15, 28, 0.9), 0 0 0 4px var(--good); }
+.hs-vspk[data-s=off], .lb-vspk[data-s=off] { color: #ffb0b8; border-color: rgba(255, 77, 94, 0.65); }
+.hs-hasvoice .hs-topleft { left: 86px; max-width: max(64px, calc(50vw - 245px)); }
+.hs-vnote { left: 12px; top: 44px; max-width: min(360px, 70vw); padding: 6px 12px; font-size: 13px; font-weight: 600; background: var(--glass-strong); border: 1px solid var(--line);
+  border-radius: 10px; opacity: 0; transform: translateY(-4px); transition: opacity 0.18s, transform 0.18s; pointer-events: none; z-index: 6; }
+.hs-vnote.on { opacity: 1; transform: none; }
+
+/* phones: 38 px squares like the menu / scoreboard buttons, scaled by the button-size setting */
+.hs-touch .hs-voice { left: calc(var(--safe-l) + 118px); top: calc(var(--safe-t) + 11px); gap: 8px; }
+.hs-touch .hs-vb { width: calc(38px * var(--vbs, 1)); height: calc(38px * var(--vbs, 1)); border-radius: 10px; background: rgba(14, 20, 36, 0.42); border: 2px solid rgba(255, 255, 255, 0.4); }
+.hs-touch .hs-vb svg { width: calc(19px * var(--vbs, 1)); height: calc(19px * var(--vbs, 1)); }
+.hs-touch.hs-hasvoice .hs-topleft { left: calc(var(--safe-l) + 128px + 84px * var(--vbs, 1)); }
+.hs-touch .hs-vnote { left: calc(var(--safe-l) + 10px); top: calc(var(--safe-t) + 60px); }
+/* portrait / narrow: the centre panel needs that space, so the pair sits under the menu + scoreboard buttons */
+@media (orientation: portrait), (max-width: 560px) {
+  .hs-touch .hs-voice { left: calc(var(--safe-l) + 11px); top: calc(var(--safe-t) + 66px); flex-direction: column; gap: 8px; }
+  .hs-touch.hs-hasvoice .hs-topleft { left: calc(var(--safe-l) + 124px); }
+  .hs-touch .hs-vnote { left: calc(var(--safe-l) + 60px); top: calc(var(--safe-t) + 66px); max-width: calc(100vw - 80px); }
+}
+
+/* speaking wave (three bars) */
+.vwave { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
+.vwave b { display: block; width: 3px; height: 4px; border-radius: 2px; background: var(--good); }
+.vs .vwave b, .hs-vt .vwave b { animation: hs-vw 0.5s ease-in-out infinite alternate; }
+.vs .vwave b:nth-child(2), .hs-vt .vwave b:nth-child(2) { animation-delay: -0.17s; }
+.vs .vwave b:nth-child(3), .hs-vt .vwave b:nth-child(3) { animation-delay: -0.33s; }
+@keyframes hs-vw { from { height: 3px; } to { height: 12px; } }
+@media (prefers-reduced-motion: reduce) { .vs .vwave b, .hs-vt .vwave b { animation: none; height: 10px; } }
+
+/* next to name tags in game */
+.hs-vtags { inset: 0; pointer-events: none; overflow: hidden; }
+.hs-vt { position: absolute; left: 0; top: 0; display: none; margin: -10px 0 0 -2px; padding: 4px 5px; border-radius: 7px; background: rgba(8, 13, 26, 0.62); line-height: 0; will-change: transform; }
+.hs-ovw .hs-vtags { display: none; }
+
+/* scoreboard voice cell */
+.hs-panel th.vc, .hs-panel td.vc { text-align: left; white-space: nowrap; width: 1px; }
+.hs-panel td.vc { display: table-cell; }
+td.vc .vwave { width: 13px; margin-right: 4px; vertical-align: middle; opacity: 0.25; }
+td.vc .vwave b { background: var(--ink-dim); }
+td.vc.vs .vwave { opacity: 1; } td.vc.vs .vwave b { background: var(--good); }
+td.vc > svg { vertical-align: middle; color: var(--ink-dim); }
+td.vc:not(.voff) > svg { display: none; }
+td.vc.vx { opacity: 0.45; }
+.hs-vmute { width: 26px; height: 24px; padding: 0; margin-right: 4px; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; color: #fff;
+  background: rgba(255, 255, 255, 0.08); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; pointer-events: auto; -webkit-appearance: none; appearance: none; }
+.hs-vmute svg { width: 15px; height: 15px; }
+.hs-vmute.on { color: #ffb0b8; border-color: rgba(255, 77, 94, 0.65); background: rgba(255, 77, 94, 0.18); }
+.hs-vvol { width: 64px; height: 20px; margin: 0; vertical-align: middle; accent-color: var(--accent-2); pointer-events: auto; cursor: pointer; }
+.hs-panel tr.me td.vc { font-weight: 400; }
+.hs-sbvhint { margin-top: 8px; text-align: center; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--ink-dim); }
+.hs-sbvhint:empty { display: none; }
+.hs-score .hs-panel { pointer-events: auto; }
+@media (max-width: 480px) { .hs-vvol { width: 44px; } .hs-vmute { width: 24px; margin-right: 2px; } }
+
+/* lobby header pair + roster chip badges + per-player popover */
+.lb-voice { display: none; align-items: center; gap: 2px; margin-right: 4px; }
+.lb-voice.on { display: inline-flex; }
+.lb-btn.lb-vb { padding: 0; width: 44px; border: 1px solid transparent; }
+.lb-btn.lb-vb[data-s=off].lb-vspk, .lb-btn.lb-vb.lb-vspk[data-s=off] { color: #ffb0b8; }
+.lb-vc { position: absolute; left: 0; top: 26px; display: none; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 3px; border-radius: 9px;
+  background: rgba(10, 15, 28, 0.92); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); color: #ffb0b8; font-style: normal; }
+.lb-vc .vwave { height: 10px; } .lb-vc .vwave b { width: 2px; }
+.lb-vc svg { display: none; }
+.lb-p.vs .lb-vc, .lb-p.vo .lb-vc, .lb-p.vm .lb-vc { display: inline-flex; }
+.lb-p.vs .lb-vc .vwave { display: inline-flex; }
+.lb-p:not(.vs) .lb-vc .vwave { display: none; }
+.lb-p.vo:not(.vs) .lb-vc svg, .lb-p.vm:not(.vs) .lb-vc svg { display: block; }
+.lb-p.vs .av { box-shadow: 0 0 0 2px rgba(10, 15, 28, 1), 0 0 0 4px var(--good); }
+.lb-p.vm .av { opacity: 0.6; }
+.lb-p.vbtn { cursor: pointer; }
+.lb-p.vbtn:hover .av { filter: brightness(1.15); }
+.lb-vpop { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; min-width: 190px; }
+.lb-vpop .lb-vname { font-size: 14px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-vmute { min-height: 40px; font: 600 14px var(--font); color: #fff; background: rgba(255, 255, 255, 0.1); border: 0; border-radius: 11px; cursor: pointer; }
+.lb-vmute.on { color: #ffc2c8; background: rgba(255, 77, 94, 0.22); }
+.lb-vvol { display: grid; grid-template-columns: auto minmax(0, 1fr) 42px; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-dim); }
+.lb-vvol input { width: 100%; accent-color: var(--accent-2); }
+.lb-vvol output { text-align: right; font-weight: 700; color: #fff; font-variant-numeric: tabular-nums; }
+@media (max-width: 700px) { .lb-voice { margin-right: 0; } }
+@media (max-width: 420px) {
+  .lb-room span { display: none; }
+  .lb-btn.lb-invite .lb-t { display: none; }
+  .lb-btn { padding: 0 10px; }
+  .lb-btn.lb-vb { width: 38px; min-width: 38px; }
+  .lb-acts { gap: 0; }
+}

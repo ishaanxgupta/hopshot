@@ -6,6 +6,10 @@
 //   lobby.update(match, ctx)   match = net.state.match, ctx = { selfId, inviteUrl, inviteNote, code }
 //                              (cheap: DOM is touched only when something changed)
 //   lobby.notice(text)         a short toast (rejected request, ...)
+//   lobby.attachVoice(voice)   (voice chat, private rooms) mic + speaker buttons in the header, a
+//                              speaking wave / muted-mic badge on each human chip, and a tap on
+//                              another human's chip opens a mute + volume popover. `voice` is the
+//                              client/voice.js object; update() keeps all of it current cheaply.
 //
 // The host edits mode / map / bots / limits; everybody else sees the same controls read-only with
 // "Waiting for host". The lobby never sends anything by itself: it calls the callbacks, and shows what
@@ -93,6 +97,30 @@ const ICON = {
   crown: '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M2.5 8l4.8 4.2L12 4.5l4.7 7.7L21.5 8 19.6 19.5H4.4z"/></svg>',
   botGlyph: SVG('<rect x="5" y="8.5" width="14" height="10" rx="3"/><path d="M12 8.5V5"/><circle cx="9.3" cy="13.5" r="1.1" fill="currentColor"/><circle cx="14.7" cy="13.5" r="1.1" fill="currentColor"/>', 20),
 };
+// voice chat icons (also used by hud.js)
+export const VOICE_ICON = {
+  mic: SVG('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/>', 18),
+  micOff: SVG('<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/><path d="M3.5 3.5l17 17"/>', 18),
+  spk: SVG('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>', 18),
+  spkOff: SVG('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>', 18),
+  wave: '<i class="vwave" aria-hidden="true"><b></b><b></b><b></b></i>',
+  micTiny: '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/><path d="M3.5 3.5l17 17"/></svg>',
+};
+/** Mic button state -> [icon, label]. */
+export function micLabel(state, pttKey) {
+  const key = pttKey ? pttKey.replace(/^Key/, '').replace(/^Backquote$/, '`') : '';
+  const ptt = key ? ' (or hold ' + key + ' to talk)' : '';
+  switch (state) {
+    case 'on': return 'Microphone on - tap to mute';
+    case 'ptt': return 'Talking (push-to-talk)';
+    case 'pending': return 'Starting the microphone\u2026';
+    case 'denied': return 'Microphone blocked - allow it in the browser\u2019s site settings, then tap again';
+    case 'nomic': return 'No microphone available';
+    case 'error': return 'Microphone error - tap to retry';
+    default: return 'Microphone off - tap to talk' + ptt;
+  }
+}
+
 const hexCss = (c, dflt) => '#' + ((typeof c === 'number' ? c : dflt) & 0xffffff).toString(16).padStart(6, '0');
 const hueOf = (id) => ((Number(id) || 0) * 137 + 40) % 360;
 
@@ -102,6 +130,10 @@ export function createLobby(host, o = {}) {
       <header class="lb-top">
         <div class="lb-room"><span>Room</span><b class="lb-code"></b></div>
         <div class="lb-acts">
+          <div class="lb-voice" role="group" aria-label="Voice chat">
+            <button type="button" class="lb-btn lb-vb lb-vmic" data-s="off" aria-label="Microphone">${VOICE_ICON.micOff}</button>
+            <button type="button" class="lb-btn lb-vb lb-vspk" data-s="on" aria-label="Speaker">${VOICE_ICON.spk}</button>
+          </div>
           <button type="button" class="lb-btn lb-invite" aria-label="Copy invite link">${ICON.link}<span class="lb-t">Invite</span></button>
           <button type="button" class="lb-btn lb-loadout" aria-label="Loadout" title="Loadout">${ICON.loadout}<span class="lb-t">Loadout</span></button>
           <button type="button" class="lb-btn lb-menu" aria-label="Menu" title="Menu">${ICON.menu}<span class="lb-t">Menu</span></button>
@@ -135,6 +167,11 @@ export function createLobby(host, o = {}) {
       </div>
       <div class="lb-pop" data-k="time" role="dialog"><div class="lb-step lb-time"><button type="button" data-d="-1" aria-label="Shorter">&minus;</button><output></output><button type="button" data-d="1" aria-label="Longer">+</button></div></div>
       <div class="lb-pop" data-k="score" role="dialog"><div class="lb-step lb-score"><button type="button" data-d="-1" aria-label="Lower">&minus;</button><output></output><button type="button" data-d="1" aria-label="Higher">+</button></div></div>
+      <div class="lb-pop lb-vpop" data-k="voice" role="dialog" aria-label="Player voice">
+        <b class="lb-vname"></b>
+        <button type="button" class="lb-vmute"></button>
+        <label class="lb-vvol"><span>Volume</span><input type="range" min="0" max="2" step="0.05" /><output></output></label>
+      </div>
       <div class="lb-toast" role="status"></div>
     </div>`;
   const $ = (s) => host.querySelector(s);
@@ -148,7 +185,7 @@ export function createLobby(host, o = {}) {
   const chipBtn = {};
   for (const b of el.chips.children) chipBtn[b.dataset.k] = b;
   const pops = {};
-  for (const p of host.querySelectorAll('.lb-pop')) pops[p.dataset.k] = p;
+  for (const p of host.querySelectorAll('.lb-pop:not(.lb-vpop)')) pops[p.dataset.k] = p;
 
   // ---- static pickers (read from the registries every time: any number of maps / modes) ----
   const modeBtns = {};
@@ -302,6 +339,12 @@ export function createLobby(host, o = {}) {
   function chip(p, rel, mine) {
     const d = document.createElement('div');
     d.className = 'lb-p' + (p.bot ? ' bot' : '') + (p.ghost ? ' ghost' : '') + (mine ? ' me' : '');
+    if (!p.bot && !p.ghost && p.id) {
+      d.dataset.id = String(p.id);
+      const v = document.createElement('i'); v.className = 'lb-vc'; v.innerHTML = VOICE_ICON.wave + VOICE_ICON.micTiny;
+      d.appendChild(v);
+      chipEls.set(p.id, d);
+    }
     const av = document.createElement('span'); av.className = 'av';
     if (p.ghost) d.title = 'Open slot';
     else if (p.bot) { av.innerHTML = ICON.botGlyph; if (rel) av.style.color = relCss(rel); d.title = 'Bot'; }
@@ -328,6 +371,7 @@ export function createLobby(host, o = {}) {
     if (sig === plSig) return;
     plSig = sig;
     el.roster.textContent = '';
+    chipEls.clear(); vSig = '';
     const real = (p) => ({ ...p, crown: p.id === M.hostId && M.private && !p.bot });
     if (M.teams) {
       const order = my === 'b' ? ['b', 'a'] : ['a', 'b'];
@@ -426,10 +470,98 @@ export function createLobby(host, o = {}) {
     if (openKey) syncPop();
   }
 
+  // ---- voice chat (private rooms) ----
+  let voice = null, vSig = '', vVer = -1, vSpeak = -1, vpopId = 0;
+  const chipEls = new Map();          // human id -> chip element (rebuilt with the roster)
+  const vb = { box: $('.lb-voice'), mic: $('.lb-vmic'), spk: $('.lb-vspk'), pop: $('.lb-vpop'), name: $('.lb-vname'), mute: $('.lb-vmute'),
+    range: $('.lb-vvol input'), out: $('.lb-vvol output') };
+  function attachVoice(v) { voice = v; vVer = -1; }
+  vb.mic.addEventListener('click', () => { if (voice) voice.toggleMic(); });
+  vb.spk.addEventListener('click', () => { if (voice) voice.toggleSpeaker(); });
+  el.roster.addEventListener('click', (e) => {
+    const c = e.target.closest('.lb-p[data-id]');
+    if (!c || !voice || !voice.enabled) return;
+    const id = +c.dataset.id;
+    const inf = voice.info(id);
+    if (!inf || inf.self) return;
+    openVpop(vpopId === id ? 0 : id, c);
+  });
+  function openVpop(id, chipEl) {
+    vpopId = id;
+    vb.pop.classList.toggle('on', !!id);
+    if (!id) return;
+    closePop();
+    renderVpop();
+    const cr = el.card.getBoundingClientRect(), b = chipEl.getBoundingClientRect();
+    const pw = vb.pop.offsetWidth;
+    vb.pop.style.left = Math.max(8, Math.min(cr.width - pw - 8, b.left - cr.left + b.width / 2 - pw / 2)) + 'px';
+    vb.pop.style.bottom = 'auto';
+    vb.pop.style.top = Math.min(cr.height - vb.pop.offsetHeight - 8, b.bottom - cr.top + 6) + 'px';
+  }
+  function renderVpop() {
+    const inf = voice && vpopId ? voice.info(vpopId) : null;
+    if (!inf) { vpopId = 0; vb.pop.classList.remove('on'); return; }
+    const p = M && M.lobby.find((q) => q.id === vpopId);
+    vb.name.textContent = p ? p.name : '';
+    vb.mute.textContent = inf.muted ? 'Unmute' : 'Mute';
+    vb.mute.classList.toggle('on', inf.muted);
+    if (document.activeElement !== vb.range) vb.range.value = String(inf.volume);
+    vb.out.textContent = Math.round(inf.volume * 100) + '%';
+  }
+  vb.mute.addEventListener('click', () => { const inf = voice && voice.info(vpopId); if (inf) { voice.setPeerMuted(vpopId, !inf.muted); renderVpop(); } });
+  vb.range.addEventListener('input', () => { if (voice && vpopId) { voice.setPeerVolume(vpopId, +vb.range.value); vb.out.textContent = Math.round(+vb.range.value * 100) + '%'; } });
+  for (const ev of ['keydown', 'keyup']) vb.range.addEventListener(ev, (e) => e.stopPropagation());
+  host.addEventListener('pointerdown', (e) => { if (vpopId && !e.target.closest('.lb-vpop') && !e.target.closest('.lb-p[data-id]')) openVpop(0); });
+
+  function renderVoice() {
+    const on = !!(voice && voice.enabled);
+    cls('vOn', vb.box, 'on', on);
+    if (!on) { if (vpopId) openVpop(0); return; }
+    const v = voice.view;
+    if (voice.version !== vVer) {
+      vVer = voice.version;
+      const ms = v.mic;
+      if (vb.mic.dataset.s !== ms) {
+        vb.mic.dataset.s = ms;
+        vb.mic.innerHTML = ms === 'on' || ms === 'ptt' || ms === 'pending' ? VOICE_ICON.mic : VOICE_ICON.micOff;
+      }
+      const lab = micLabel(ms, v.pttKey);
+      if (vb.mic.title !== lab) { vb.mic.title = lab; vb.mic.setAttribute('aria-label', lab); }
+      const ss = v.spk ? 'on' : 'off';
+      if (vb.spk.dataset.s !== ss) {
+        vb.spk.dataset.s = ss;
+        vb.spk.innerHTML = v.spk ? VOICE_ICON.spk : VOICE_ICON.spkOff;
+        const sl = v.spk ? 'Speaker on - tap to stop hearing others' : 'Speaker off - tap to hear others';
+        vb.spk.title = sl; vb.spk.setAttribute('aria-label', sl);
+      }
+      vSig = '';
+      if (vpopId) renderVpop();
+    }
+    cls('vTalk', vb.mic, 'talk', v.selfSpeaking);
+    // chip badges: speaking wave / muted mic / muted-by-you
+    if (vSig === '' || voice.speakVersion !== vSpeak) {
+      vSpeak = voice.speakVersion;
+      let sig = '';
+      for (const [id, c] of chipEls) {
+        const inf = voice.info(id);
+        const sp = !!(inf && inf.speaking), off = !!(inf && !inf.mic), mu = !!(inf && inf.muted);
+        const k = (sp ? 's' : '') + (off ? 'o' : '') + (mu ? 'm' : '') + (inf && !inf.self && !inf.allowed ? 'x' : '');
+        sig += id + k + ';';
+        if (c.dataset.v !== k) {
+          c.dataset.v = k;
+          c.classList.toggle('vs', sp); c.classList.toggle('vo', off && !sp); c.classList.toggle('vm', mu);
+          c.classList.toggle('vbtn', !!(inf && !inf.self));
+        }
+      }
+      vSig = sig || 'x';
+    }
+  }
+
   function update(match, c) {
     M = match; ctx = c || {};
     render();
+    renderVoice();
   }
 
-  return { update, notice, el: host };
+  return { update, notice, attachVoice, el: host };
 }

@@ -30,7 +30,7 @@ const { spawnVisible } = await import('../server/spawns.js');
 const { MAPS, MAP_IDS } = await import('../shared/maps/index.js');
 const { MODES, MODE_IDS, sanitizeMatchConfig, decideWinner, TIME_LIMIT_MIN_S } = await import('../shared/modes.js');
 const { eyeHeight } = await import('../shared/physics.js');
-const { createCmd, PLAYER_ENTRY_BYTES } = await import('../shared/protocol.js');
+const { createCmd, PLAYER_ENTRY_BYTES, PROTOCOL_VERSION } = await import('../shared/protocol.js');
 const { MAX_PLAYERS } = await import('../shared/constants.js');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -110,7 +110,7 @@ function testLobby() {
   const A = fakeHuman(room, 'Ann'), B = fakeHuman(room, 'Ben');
   check(room.phase === 'lobby' && room.hostId === A.p.id, 'private room starts in the lobby; first human is host');
   const w = A.msgs[0];
-  check(w.t === 'welcome' && w.match && w.match.phase === 'lobby' && w.mapId === 'crate_cove' && w.lobby.hostId === A.p.id && w.v === 4,
+  check(w.t === 'welcome' && w.match && w.match.phase === 'lobby' && w.mapId === 'crate_cove' && w.lobby.hostId === A.p.id && w.v === PROTOCOL_VERSION && w.v >= 4,
     'welcome carries match (phase, config), lobby roster with host, map id');
   check(room.botCount === 0 && !room.players.some((p) => p.alive), 'lobby: no bots, nobody alive');
   steps(room, 240);

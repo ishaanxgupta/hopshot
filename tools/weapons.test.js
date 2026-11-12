@@ -94,7 +94,7 @@ test('loadout encoding: 3 bytes, exact round trip for every legal per-slot choic
   assert.equal(JSON.parse(encodeJoin('a', 'r', undefined, 0x020103)).lo, sanitizeLoadoutCode(0x020103));
   assert.equal(JSON.parse(encodeJoin('a')).lo, undefined);
   assert.deepEqual(JSON.parse(encodeSetLoadout(0x0b)), { t: 'loadout', lo: 0x0b });
-  assert.equal(PROTOCOL_VERSION, 4);   // v4: modes / teams / lobby (loadout encoding unchanged since v3)
+  assert.equal(PROTOCOL_VERSION, 5);   // v4: modes / teams / lobby, v5: voice signaling (loadout encoding unchanged since v3)
 });
 
 test('effective stats: cached + frozen; bare = base; every attachment\'s gain and cost are real on every gun', () => {

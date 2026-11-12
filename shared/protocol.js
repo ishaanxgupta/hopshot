@@ -157,6 +157,29 @@
 //   'round' is still sent for old clients: phase 'playing' while playing, else 'intermission'.
 //   { t:'error', code, message }  also non-fatal: not_host, bad_phase, bad_team, bad_config
 //
+// VOICE CHAT (v5) - peer-to-peer WebRTC audio between the humans of a PRIVATE room. The server
+//   only relays signaling (it never sees audio). Public rooms have no voice at all: the server
+//   drops every 'rtc' / 'voice' message there and sends no ICE servers.
+//   welcome gains: voice (bool, true in private rooms) and ice (RTCIceServer list, private rooms
+//   only: public STUN, plus TURN when the server has TURN_URLS / TURN_USER / TURN_PASS set).
+//   Roster entries ('welcome'.players, 'join'.player) in private rooms gain mic and deaf (bools).
+// client -> server:
+//   { t:'rtc', to:<player id>, d:<signal> }   relayed to `to` ONLY if sender and target are both
+//                                             humans in the SAME private room (else dropped)
+//     <signal> = { k:'sdp', type:'offer'|'answer', sdp:<string, <= MAX_SDP_CHARS> }
+//              | { k:'ice', c:{ candidate, sdpMid, sdpMLineIndex, usernameFragment } | null }
+//     The whole frame is at most MAX_SIGNAL_BYTES; the server re-builds the signal from these
+//     fields only (anything else is dropped) and rate-limits signaling per connection.
+//   { t:'voice', mic:<bool>, deaf:<bool> }    your voice state: mic = you are transmitting (mic
+//                                             toggle on or push-to-talk held), deaf = you turned
+//                                             your speaker off (others may stop sending to you)
+// server -> client:
+//   { t:'rtc', from:<player id>, d:<signal> }
+//   { t:'voice', id, mic, deaf }              a player's voice state changed (private rooms)
+//   Who may hear whom is decided by each SENDER's client (shared rule voiceAllowed() below):
+//   team modes in phase countdown / playing -> teammates only; otherwise everyone in the room.
+//   A client never sends its microphone track to a peer that is not allowed to hear it.
+//
 // CLOCK SYNC (client side; client/net.js implements all of this)
 //   v2: the render clock for remote players is derived from SNAPSHOT ARRIVAL TIMES, not from
 //   the ping clock: base = max over a few seconds of (snapshot.tick - arrivalMs / TICK_MS)
@@ -192,7 +215,7 @@ import {
 } from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
-export const PROTOCOL_VERSION = 4;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps
+export const PROTOCOL_VERSION = 5;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps; v5: voice chat signaling
 export const MSG = { INPUT: 1, SNAPSHOT: 2 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
@@ -208,6 +231,9 @@ export const INPUT_HEADER_BYTES = 14;
 export const INPUT_CMD_BYTES = 11;
 export const INPUT_MAX_BYTES = INPUT_HEADER_BYTES + INPUT_CMD_BYTES * INPUT_MAX_CMDS;
 export const MAX_TEXT_BYTES = 2048;
+// (v5) voice signaling: an SDP offer / answer is bigger than ordinary text messages
+export const MAX_SIGNAL_BYTES = 8192;
+export const MAX_SDP_CHARS = 7600;
 
 export const SNAP_HEADER_BYTES = 18;   // type..starved
 export const SNAP_SELF_BYTES = SNAP_HEADER_BYTES + STATE_BYTES + WSTATE_BYTES;
@@ -619,6 +645,54 @@ export function encodeTeam(team) { return JSON.stringify({ t: 'team', team: team
 export function encodeReturnToLobby() { return '{"t":"lobby"}'; }
 /** Server-side: 'a' | 'b' or null. */
 export function parseTeam(v) { return v === 'a' || v === 'b' ? v : null; }
+
+// ------------------------------------------------------------------------------- VOICE (v5)
+
+/**
+ * Who may hear whom (the sender enforces it). teams = the room plays a team mode, phase = match
+ * phase, a / b = the two players' teams. Team modes during countdown / playing: same team only;
+ * free-for-all and the lobby / results phases of any mode: everyone.
+ */
+export function voiceAllowed(teams, phase, a, b) {
+  if (teams && (phase === 'countdown' || phase === 'playing')) return (a === 'a' || a === 'b') && a === b;
+  return true;
+}
+
+/** CLIENT. A signaling message for peer `to`: d = { k:'sdp', type, sdp } | { k:'ice', c }. */
+export function encodeRtc(to, d) { return JSON.stringify({ t: 'rtc', to: to | 0, d }); }
+/** CLIENT. Your voice state (mic = transmitting, deaf = speaker off). */
+export function encodeVoiceState(mic, deaf) { return JSON.stringify({ t: 'voice', mic: !!mic, deaf: !!deaf }); }
+
+const str = (v, max) => (typeof v === 'string' && v.length <= max ? v : null);
+/**
+ * Validate a signal (the `d` of an 'rtc' message) and rebuild it from the known fields only.
+ * Returns the clean signal or null. Used by the server before relaying and by the client on receipt.
+ */
+export function sanitizeSignal(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  if (d.k === 'sdp') {
+    if (d.type !== 'offer' && d.type !== 'answer') return null;
+    const sdp = str(d.sdp, MAX_SDP_CHARS);
+    if (!sdp || !sdp.startsWith('v=0')) return null;
+    return { k: 'sdp', type: d.type, sdp };
+  }
+  if (d.k === 'ice') {
+    if (d.c === null || d.c === undefined) return { k: 'ice', c: null };
+    const c = d.c;
+    if (!c || typeof c !== 'object' || Array.isArray(c)) return null;
+    const candidate = str(c.candidate, 600);
+    if (candidate === null) return null;
+    const out = { candidate };
+    if (c.sdpMid !== undefined && c.sdpMid !== null) { const m = str(c.sdpMid, 32); if (m === null) return null; out.sdpMid = m; } else out.sdpMid = null;
+    if (c.sdpMLineIndex !== undefined && c.sdpMLineIndex !== null) {
+      if (!Number.isInteger(c.sdpMLineIndex) || c.sdpMLineIndex < 0 || c.sdpMLineIndex > 63) return null;
+      out.sdpMLineIndex = c.sdpMLineIndex;
+    } else out.sdpMLineIndex = null;
+    if (c.usernameFragment !== undefined && c.usernameFragment !== null) { const u = str(c.usernameFragment, 256); if (u === null) return null; out.usernameFragment = u; }
+    return { k: 'ice', c: out };
+  }
+  return null;
+}
 
 export function encodePing(clientMs, rtt) {
   const m = { t: 'ping', c: clientMs };

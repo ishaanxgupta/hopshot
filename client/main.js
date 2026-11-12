@@ -19,6 +19,12 @@
 // (lobby, countdown, playing, results) drive which screen shows (lobby-ui.js, matchhud.js); the world for
 // touch assists and the autopilot is always net.world. In team modes teammates are filtered out of the
 // assist / auto-fire / autopilot target lists. ?autoplay=1 also walks toward the flag / zone.
+//
+// Voice chat (protocol v5, private rooms only; client/voice.js): net events -> voice (welcome, roster /
+// team / phase changes, signaling, voice states), voice.frame() every frame with the interpolated remote
+// players + the camera (proximity), hud.voiceFrame() for buttons / speaking indicators, push-to-talk from
+// input.js. Desktop: while the Tab scoreboard is up, a click frees the cursor and pins the board so its
+// per-player voice controls can be used (click the game again to carry on). Debug: window.__hopshot.voice.
 
 import { TICK_RATE, BTN, RESPAWN_MS } from '../shared/constants.js';
 import { GUNS, currentSpread, popcount6, SLOT_COUNT } from '../shared/weapons.js';
@@ -31,6 +37,7 @@ import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
 import { createInput, createAutopilot, wrapAngle, detectTouch } from './input.js';
 import { createNet } from './net.js';
+import { createVoice } from './voice.js';
 import { normalizeSaved } from './loadout-ui.js';
 
 const MAX_CATCHUP_TICKS = 6;           // at most this many sim ticks per frame
@@ -63,7 +70,9 @@ const DEFAULTS = {
   showStats: !IS_TOUCH,
   crosshairColor: '#ffffff', crosshairSize: 1,
   stickSide: 'left', btnScale: 1, aimAssist: IS_TOUCH, autoFire: IS_TOUCH, jumpSlide: 'stick', slideAssist: true,
+  voiceVolume: 0.9, micDefault: false, pttKey: 'KeyV', proximity: true, noiseSuppression: true, echoCancellation: true,
 };
+const PTT_KEYS = ['KeyV', 'KeyB', 'KeyT', 'KeyG', 'KeyX', 'KeyZ', 'CapsLock', 'Backquote', ''];
 const bool = (v, def) => (typeof v === 'boolean' ? v : def);
 const pick = (v, list, def) => (list.includes(v) ? v : def);
 // Validate a (possibly partial or hostile) settings object against `base`; missing fields keep base.
@@ -85,6 +94,12 @@ function sanitize(s, base) {
     autoFire: bool(s.autoFire, base.autoFire),
     jumpSlide: pick(s.jumpSlide, ['stick', 'buttons'], base.jumpSlide),
     slideAssist: bool(s.slideAssist, base.slideAssist),
+    voiceVolume: num(s.voiceVolume, base.voiceVolume, 0, 1),
+    micDefault: bool(s.micDefault, base.micDefault),
+    pttKey: pick(s.pttKey, PTT_KEYS, base.pttKey),
+    proximity: bool(s.proximity, base.proximity),
+    noiseSuppression: bool(s.noiseSuppression, base.noiseSuppression),
+    echoCancellation: bool(s.echoCancellation, base.echoCancellation),
   };
 }
 const settings = sanitize(stored, DEFAULTS);
@@ -118,12 +133,20 @@ const audio = createAudio();
 // global HOPSHOT_SERVER lets a separately hosted page point at the game server.
 const SERVER_HTTP = String(params.get('server') || window.HOPSHOT_SERVER || location.origin).replace(/\/+$/, '');
 const net = createNet({ world, url: SERVER_HTTP.replace(/^http/, 'ws') + '/ws' });
+// voice notices: the lobby has its own toast, in game a small one under the voice buttons
+function voiceNotice(text) {
+  if (net.state.connected && net.state.match.phase === 'lobby') hud.lobby.notice(text, !/reconnected/i.test(text));
+  else hud.voiceNotice(text);
+}
+const voice = createVoice({ net, audio, touch: IS_TOUCH, onNotice: voiceNotice });
+hud.attachVoice(voice);
 const autopilot = AUTOPLAY ? createAutopilot({ seed: (Math.random() * 1e9) | 0 }) : null;
 
 let started = false;      // joined at least once (connect requested)
 let suppressUnlockMenu = false;   // we released the pointer on purpose (lobby / results): do not open the menu
 let menuOpen = false;
 let scoreboardHeld = false;
+let sbPinned = false;     // desktop: scoreboard kept open with a free cursor (voice controls)
 
 const input = createInput(canvas, {
   touch: IS_TOUCH,
@@ -133,7 +156,12 @@ const input = createInput(canvas, {
     if (!AUTOPLAY) showMenu();
   },
   onLockError() { /* we keep playing unlocked; a canvas click retries */ },
-  onScoreboard(held) { scoreboardHeld = held; if (!held) hud.setScoreboard(false); },
+  onScoreboard(held) {
+    if (held && sbPinned) { sbPinned = false; held = false; input.state.scoreboard = false; }   // Tab again closes a pinned board
+    scoreboardHeld = held;
+    if (!held && !sbPinned) hud.setScoreboard(false);
+  },
+  onPushToTalk(down) { voice.setPtt(down); },
   onEscape() { if (!AUTOPLAY && !menuOpen) showMenu(); },       // Esc key, or the on-screen menu button
   onGesture() { audio.unlock(); if (net.state.status === 'reconnecting') net.retryNow(); },
 });
@@ -146,6 +174,8 @@ function applySettings() {
   input.invertY = settings.invertY;
   input.configureTouch({ side: settings.stickSide, scale: settings.btnScale, jumpSlide: settings.jumpSlide, slideAssist: settings.slideAssist });
   hud.setPrefs(settings);
+  voice.configure(settings);
+  input.pttKey = IS_TOUCH ? '' : settings.pttKey;
 }
 applySettings();
 
@@ -224,6 +254,7 @@ if (ROOM && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
 let menuShown = 0;
 function showMenu(tabName) {
   menuOpen = true;
+  sbPinned = false;
   // Refresh the server line when the menu reopens (it is not polled while idle).
   if (server.state === 'online' && !server.pending && !net.state.connected && performance.now() - server.checkedAt > 15000) probeSoon(0);
   input.enabled = false;
@@ -281,8 +312,16 @@ function hideMenu() {
   syncInput();
 }
 
+// Desktop: a click while the Tab scoreboard is up frees the cursor and pins the board (voice controls)
+window.addEventListener('mousedown', (e) => {
+  if (IS_TOUCH || AUTOPLAY || !scoreboardHeld || !input.locked || !voice.enabled || phaseNow() !== 'playing') return;
+  e.stopPropagation(); e.preventDefault();
+  sbPinned = true;
+  releaseLock();
+}, { capture: true });
 canvas.addEventListener('click', () => {
   if (IS_TOUCH) return;     // touch: the overlay handles taps, there is no pointer lock
+  if (sbPinned) { sbPinned = false; hud.setScoreboard(false); }
   audio.unlock();
   if (net.state.status === 'reconnecting') net.retryNow();
   if (!AUTOPLAY && !menuOpen && !input.locked) input.requestLock().then((ok) => { lockHint = !ok; });
@@ -377,6 +416,15 @@ net.on('error', (m) => {
 const counters = { kills: 0, hits: 0, damage: 0, spawns: 0, localDeaths: 0, remoteShots: 0, rounds: 0, phases: [] };
 const nameOf = (id) => { const e = net.state.roster.get(id); return e ? e.name : (id ? '#' + id : ''); };
 
+// voice chat: everything that can change who is in the room, their team or the phase re-evaluates it
+net.on('welcome', () => voice.onWelcome());
+for (const ev of ['join', 'team', 'lobby', 'match', 'spawn']) net.on(ev, () => voice.sync());
+net.on('leave', (m) => voice.onLeave(m.id));
+net.on('rtc', (m) => voice.onSignal(m));
+net.on('voice', (m) => voice.onVoiceState(m));
+net.on('close', () => voice.onClose());
+window.addEventListener('pagehide', () => voice.shutdown());
+
 net.on('welcome', () => {
   if (autopilot) autopilot.setYaw(input.yaw);
   syncInput();
@@ -391,7 +439,7 @@ net.on('phase', (phase, prev) => {
   syncInput();
   counters.phases.push(phase);
   if (phase === 'lobby' || phase === 'results') releaseLock();
-  if (phase !== 'playing') { scoreboardHeld = false; input.setScoreboardActive(false); input.state.scoreboard = false; hud.setScoreboard(false); }
+  if (phase !== 'playing') { scoreboardHeld = false; sbPinned = false; input.setScoreboardActive(false); input.state.scoreboard = false; hud.setScoreboard(false); }
   if (phase === 'playing' && !IS_TOUCH && !input.locked) lockHint = true;
   if (phase === 'lobby' || phase === 'countdown') hud.match.hideResults();
   void prev;
@@ -657,6 +705,7 @@ function runFrame() {
   } else frame.objective = null;
   renderer.render(frame);
   audio.setListener(local.x, local.y + local.eyeHeight, local.z, local.yaw);
+  voice.frame(t, frame.players, local);
 
   // HUD
   updateHud(t);
@@ -671,6 +720,7 @@ let leaderNext = 0;
 const matchCtx = { now: 0, match: null, st: null, nameOf, teamOf, view: (x, y, z, out) => renderer.viewSpace(x, y, z, out), W: 1, H: 1, fov: 90,
   self: null, alive: false, kills: 0, deaths: 0, leader: null, myTeam: '', selfId: 0 };
 const leaderOut = { name: '', kills: 0, isMe: false };
+const voiceCtx = { now: 0, playing: false, players: frame.players, view: matchCtx.view, W: 1, H: 1, fov: 90, tagAlpha: () => renderer.tagDebug() };
 // free-for-all: the best other player, and whether you are ahead of all of them
 function computeLeader() {
   const me = net.state.id;
@@ -729,7 +779,13 @@ function updateHud(t) {
   if (s.connected && started) hud.match.update(matchCtx);
   if (s.connected && M.phase === 'lobby') hud.lobby.update(M, { selfId: s.id, inviteUrl: roomMenu.inviteUrl, code: ROOM });
 
-  if (scoreboardHeld && !menuOpen && playing && t >= sbNext) { sbNext = t + 250; hud.setScoreboard(true, boardData()); }
+  if ((scoreboardHeld || sbPinned) && !menuOpen && playing && t >= sbNext) {
+    sbNext = t + 250;
+    hud.setScoreboard(true, boardData());
+    hud.setBoardHint(!IS_TOUCH && voice.enabled ? (sbPinned ? 'Click the game to carry on \u00b7 Tab closes' : 'Click to use the cursor (voice volume / mute)') : '');
+  }
+  voiceCtx.now = t; voiceCtx.playing = playing && s.connected; voiceCtx.W = matchCtx.W; voiceCtx.H = matchCtx.H; voiceCtx.fov = matchCtx.fov;
+  hud.voiceFrame(voiceCtx);
 
   if (t >= serverUiNext) { serverUiNext = t + 250; updateServerUi(t); }
 
@@ -740,7 +796,7 @@ function updateHud(t) {
     const txt = `Disconnected - reconnecting in ${left}s (click to retry)`;
     if (txt !== statusText) setStatus(txt);
   } else if (s.connected) {
-    const want = lockHint && !IS_TOUCH && !input.locked && !menuOpen && !AUTOPLAY && playing ? 'Click to capture the mouse' : '';
+    const want = lockHint && !IS_TOUCH && !input.locked && !menuOpen && !AUTOPLAY && playing && !sbPinned ? 'Click to capture the mouse' : '';
     if (want !== statusText) setStatus(want);
   }
 }
@@ -795,7 +851,7 @@ window.__hopshot = {
     flags: M.flags ? { a: { ...M.flags.a }, b: { ...M.flags.b } } : null, hardpoint: M.hardpoint ? { ...M.hardpoint } : null, result: M.result }; },
   get gfx() { return renderer.memory(); },
   hud,
-  net, input,
+  net, input, voice,
 };
 
 // ------------------------------------------------------------------ go

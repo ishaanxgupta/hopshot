@@ -5,6 +5,10 @@
 //   HOST             listen address (default: all interfaces)
 //   BOTS             keep at least this many participants per room using bots (default 4, 0 = off)
 //   MAX_CONNECTIONS  total WebSocket connections accepted (default 1000)
+//   STUN_URLS        (v5 voice) comma-separated STUN urls sent to private rooms
+//                    (default stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302)
+//   TURN_URLS        (v5 voice) comma-separated TURN urls (e.g. turn:relay.example.com:3478?transport=udp);
+//   TURN_USER, TURN_PASS  its credentials. Unset = STUN only (peers behind strict NATs cannot connect).
 
 import http from 'node:http';
 import os from 'node:os';
@@ -12,7 +16,7 @@ import { performance } from 'node:perf_hooks';
 import { WebSocketServer } from 'ws';
 import { MAX_PLAYERS } from '../shared/constants.js';
 import {
-  PROTOCOL_VERSION, MSG, MAX_TEXT_BYTES, INPUT_MAX_BYTES, createInputPacket, decodeInput, decodeText,
+  PROTOCOL_VERSION, MSG, MAX_TEXT_BYTES, MAX_SIGNAL_BYTES, INPUT_MAX_BYTES, createInputPacket, decodeInput, decodeText,
   encodeText, sanitizeName, sanitizeRoomName, parseTeam,
 } from '../shared/protocol.js';
 import { Room, BOT_MIN } from './room.js';
@@ -29,6 +33,28 @@ const MAX_BAD_MESSAGES = 50;
 // token buckets: input packets (60/s nominal, bursts after a hitch are fine) and text messages
 const BIN_RATE = 120, BIN_BURST = 60;
 const TEXT_RATE = 5, TEXT_BURST = 15;
+// (v5) every text frame first passes RAW (bounds the JSON parse work); voice signaling ('rtc',
+// 'voice') then has its own message + byte buckets so negotiating with 7 peers at once fits,
+// while a flood is still cut off. Everything else keeps the TEXT bucket.
+const RAW_RATE = 60, RAW_BURST = 160;
+const SIG_RATE = 25, SIG_BURST = 120;
+const SIG_BYTES_RATE = 24000, SIG_BYTES_BURST = 80000;
+
+function splitList(v) { return String(v || '').split(',').map((s) => s.trim()).filter(Boolean); }
+/** RTCIceServer list for private rooms (welcome.ice). */
+function buildIceServers() {
+  const stun = splitList(process.env.STUN_URLS);
+  const list = [{ urls: stun.length ? stun : ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  const turn = splitList(process.env.TURN_URLS);
+  if (turn.length) {
+    const t = { urls: turn };
+    if (process.env.TURN_USER) t.username = process.env.TURN_USER;
+    if (process.env.TURN_PASS) t.credential = process.env.TURN_PASS;
+    list.push(t);
+  }
+  return list;
+}
+const ICE_SERVERS = buildIceServers();
 
 const startedAt = Date.now();
 const rooms = new Map();          // name -> Room
@@ -45,6 +71,7 @@ function createRoom(name, isPrivate, bots) {
   const room = new Room(name, {
     isPrivate,
     botMin: BOT_MIN,
+    iceServers: ICE_SERVERS,
     config: isPrivate ? { bots: { fill: bots ?? BOT_MIN } } : undefined,
     onEmpty: (r) => {
       if (rooms.get(r.name) === r) rooms.delete(r.name);
@@ -145,17 +172,17 @@ const server = http.createServer((req, res) => {
 // ------------------------------------------------------------------ WebSocket
 
 const wss = new WebSocketServer({
-  server, path: '/ws', maxPayload: Math.max(MAX_TEXT_BYTES, INPUT_MAX_BYTES) * 2, perMessageDeflate: false,
+  server, path: '/ws', maxPayload: Math.max(MAX_SIGNAL_BYTES + 512, MAX_TEXT_BYTES * 2, INPUT_MAX_BYTES * 2), perMessageDeflate: false,
   clientTracking: true,
 });
 
 function bucket(rate, burst) { return { tokens: burst, rate, burst, at: performance.now() }; }
-function take(b) {
+function take(b, n = 1) {
   const now = performance.now();
   b.tokens = Math.min(b.burst, b.tokens + (now - b.at) * b.rate / 1000);
   b.at = now;
-  if (b.tokens < 1) return false;
-  b.tokens -= 1;
+  if (b.tokens < n) return false;
+  b.tokens -= n;
   return true;
 }
 
@@ -168,6 +195,7 @@ wss.on('connection', (ws, req) => {
   const conn = {
     ws, room: null, player: null, bad: 0, alive: true,
     bin: bucket(BIN_RATE, BIN_BURST), text: bucket(TEXT_RATE, TEXT_BURST),
+    raw: bucket(RAW_RATE, RAW_BURST), sig: bucket(SIG_RATE, SIG_BURST), sigBytes: bucket(SIG_BYTES_RATE, SIG_BYTES_BURST),
     pkt: createInputPacket(),
   };
   const joinTimer = setTimeout(() => { if (!conn.player) ws.close(1008, 'join timeout'); }, JOIN_TIMEOUT_MS);
@@ -188,9 +216,18 @@ wss.on('connection', (ws, req) => {
         if (!conn.player.removed) conn.room.ingestInput(conn.player, pkt);
         return;
       }
-      if (!take(conn.text)) return;
-      const msg = decodeText(data);
+      if (!take(conn.raw)) return;
+      const len = data.length | 0;
+      const msg = decodeText(data, MAX_SIGNAL_BYTES);
       if (!msg) { misbehave(); return; }
+      if (msg.t === 'rtc' || msg.t === 'voice') {
+        // (v5) voice signaling: own buckets; only 'rtc' may exceed the normal text size
+        if (len > MAX_TEXT_BYTES && msg.t !== 'rtc') { misbehave(); return; }
+        if (!take(conn.sig) || !take(conn.sigBytes, len)) { if (conn.room) conn.room.voiceStats.limited++; return; }
+      } else {
+        if (len > MAX_TEXT_BYTES) { misbehave(); return; }
+        if (!take(conn.text)) return;
+      }
       handleText(conn, msg);
     } catch (err) {
       console.error('message handler error:', err);
@@ -262,6 +299,18 @@ function handleText(conn, msg) {
         conn.bad++;
         if (ws.readyState === 1) ws.send(encodeText({ t: 'error', code: err, message: `${msg.t}: ${err.replace('_', ' ')}`, req: msg.t }));
       }
+      return;
+    }
+    case 'rtc': {
+      // (v5) WebRTC signaling, relayed only between two humans of the same private room
+      if (!conn.player || conn.player.removed) { conn.bad++; return; }
+      const err = conn.room.relaySignal(conn.player, msg.to, msg.d);
+      if (err && err !== 'no_target') conn.bad++;     // a peer that just left is a normal race
+      return;
+    }
+    case 'voice': {
+      if (!conn.player || conn.player.removed) { conn.bad++; return; }
+      if (conn.room.setVoiceState(conn.player, msg.mic, msg.deaf)) conn.bad++;
       return;
     }
     case 'ping': {

@@ -78,6 +78,15 @@
 //   'ev' ({ e, ... }) flag_taken / flag_dropped / flag_returned / flag_captured / zone_rotated /
 //   zone_taken / zone_contested / zone_neutral / match_start / match_end; 'result' (result).
 //   In the lobby net.tick() returns null and sends no input (nobody is simulated there).
+//
+// Voice chat signaling (protocol v5; client/voice.js does the WebRTC part):
+//   net.state.voice = { enabled, ice }   from the welcome: enabled only in private rooms, ice =
+//                                the RTCIceServer list the server hands out (STUN, maybe TURN)
+//   roster entries carry mic / deaf (that player is transmitting / has the speaker off)
+//   net.sendRtc(to, d)           signal for peer `to` (protocol.encodeRtc); dropped unless connected
+//   net.sendVoiceState(mic, deaf)
+//   events: 'rtc' ({ from, d })  d already passed protocol.sanitizeSignal
+//           'voice' ({ id, mic, deaf })   a player's voice state changed (roster updated first)
 
 import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER, TICK_RATE } from '../shared/constants.js';
 import { getMap, DEFAULT_MAP_ID } from '../shared/maps/index.js';
@@ -95,7 +104,7 @@ import {
 import {
   TICK_MS, SHOT, INPUT_REDUNDANCY, createCmd, sanitizeCmd, encodeInput, encodeJoin, encodePing,
   decodeSnapshot, decodeText, createSnapshot, encodeSetLoadout, encodeMatchConfig, encodeStart, encodeTeam,
-  encodeReturnToLobby,
+  encodeReturnToLobby, encodeRtc, encodeVoiceState, sanitizeSignal,
 } from '../shared/protocol.js';
 
 const worldCache = new Map();   // map id -> collision world (shared by every net instance)
@@ -265,6 +274,7 @@ export function createNet(opts = {}) {
     // (v4) your team / spawn protection / carrying the enemy flag (from your own snapshots)
     team: '', protected: false, carrier: false,
     match: null,                 // see createMatchState (header: Modes, lobby, maps)
+    voice: { enabled: false, ice: [] },   // (v5) see header (Voice chat signaling)
   };
   st.match = createMatchState();
 
@@ -517,7 +527,8 @@ export function createNet(opts = {}) {
 
   function rosterEntry(p) {
     return { id: p.id | 0, name: String(p.name || ''), bot: !!p.bot, kills: p.kills | 0, deaths: p.deaths | 0, ping: p.ping | 0,
-      lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE, team: teamOf(p.team), obj: p.obj | 0 };
+      lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE, team: teamOf(p.team), obj: p.obj | 0,
+      mic: p.mic === true, deaf: p.deaf === true };
   }
 
   function applyRows(rows) {
@@ -672,6 +683,9 @@ export function createNet(opts = {}) {
   function startMatch() { if (cfgPending) flushConfig(); sendText(encodeStart()); }
   function switchTeam(team) { sendText(encodeTeam(team)); }
   function returnToLobby() { sendText(encodeReturnToLobby()); }
+  // (v5) voice signaling
+  function sendRtc(to, d) { if (st.connected) sendText(encodeRtc(to, d)); }
+  function sendVoiceState(mic, deaf) { if (st.connected) sendText(encodeVoiceState(mic, deaf)); }
 
   function onText(m) {
     switch (m.t) {
@@ -681,6 +695,7 @@ export function createNet(opts = {}) {
         st.id = m.id | 0;
         st.roomName = String(m.room || '');
         st.mapName = String(m.map || '');
+        st.voice = { enabled: m.voice === true, ice: m.voice === true && Array.isArray(m.ice) ? m.ice : [] };
         for (const p of m.players || []) st.roster.set(p.id, rosterEntry(p));
         if (m.round) { st.round.phase = m.round.phase; st.round.endsTick = m.round.endsTick; st.round.winner = 0; }
         // (v4) match / lobby / objective state and the map to predict on
@@ -805,6 +820,17 @@ export function createNet(opts = {}) {
       case 'damage': {
         if (Number.isFinite(m.health)) st.health = m.health;
         emit('damage', m);
+        return;
+      }
+      case 'rtc': {
+        const d = sanitizeSignal(m.d);
+        if (d && Number.isInteger(m.from) && m.from !== st.id) emit('rtc', { from: m.from, d });
+        return;
+      }
+      case 'voice': {
+        const e = st.roster.get(m.id);
+        if (e) { e.mic = m.mic === true; e.deaf = m.deaf === true; }
+        emit('voice', { id: m.id | 0, mic: m.mic === true, deaf: m.deaf === true });
         return;
       }
       case 'error': st.lastError = m.message || m.code; emit('error', m);
@@ -1308,7 +1334,7 @@ export function createNet(opts = {}) {
 
   const api = {
     on, off, connect, close, retryNow, setLoadout,
-    setMatchConfig, startMatch, switchTeam, returnToLobby,
+    setMatchConfig, startMatch, switchTeam, returnToLobby, sendRtc, sendVoiceState,
     tick, sampleRemotes, remoteEye, decayError, localView,
     serverTick, renderTick,
     get state() { return st; },

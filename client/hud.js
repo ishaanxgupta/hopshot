@@ -3,7 +3,7 @@
 
 import { createLoadoutEditor } from './loadout-ui.js';
 import { createMatchHud } from './matchhud.js';
-import { createLobby, copyToClipboard } from './lobby-ui.js';
+import { createLobby, copyToClipboard, VOICE_ICON, micLabel } from './lobby-ui.js';
 
 // opts for createHud(rootEl, opts): { touch: bool, onScoreboardClose(), onWeapon(slot), onReturnToLobby(),
 //   lobby: { onConfig(partial), onStart(), onTeam(team), onLoadout(), onMenu() } }
@@ -17,6 +17,11 @@ import { createLobby, copyToClipboard } from './lobby-ui.js';
 // bar, state.scope (0 none | 1 optic | 2 sniper scope overlay), state.crossGap (px) for the crosshair
 // bloom. showMenu({ loadout: { saved, onChange({code, builds}) } }); setLoadoutStatus({ pendingCode,
 // activeCode, joined }) keeps the "applies on your next spawn" line honest.
+// Voice chat (private rooms): attachVoice(voice) (client/voice.js) adds a small mic + speaker pair at the top
+// left (shown only while voice is available; the lobby has its own pair in its header), voiceFrame(ctx) per
+// frame (button state, a speaking wave next to talking players' name tags, scoreboard voice cells),
+// voiceNotice(text) (short toast under the buttons), setBoardHint(text) (a line under the scoreboard).
+// The scoreboard rows (rendered by matchhud.js) get a Voice cell: speaking wave + per-player mute + volume.
 
 const MAX_FEED = 6;
 const FEED_MS = 5500;
@@ -36,6 +41,7 @@ function fmtTime(s) {
 // Settings model: drives both the menu controls and the validation in main.js (keep keys in sync).
 export const CROSSHAIR_COLORS = ['#ffffff', '#ffd23a', '#5dff8a', '#3fe6ff', '#ff6bd6', '#ff4d5e'];
 const fmtX = (v) => Number(v).toFixed(2) + 'x';
+const pct = (v) => Math.round(v * 100) + '%';
 const SET_DEFS = [
   { id: 'controls', title: 'Controls', items: [
     { k: 'sensitivity', label: 'Sensitivity', type: 'range', min: 0.05, max: 5, step: 0.05, fmt: (v) => Number(v).toFixed(2) },
@@ -51,6 +57,14 @@ const SET_DEFS = [
   { id: 'crosshair', title: 'Crosshair', items: [
     { k: 'crosshairColor', label: 'Colour', type: 'swatch' },
     { k: 'crosshairSize', label: 'Size', type: 'range', min: 0.5, max: 2.5, step: 0.05, fmt: fmtX },
+  ] },
+  { id: 'voice', title: 'Voice chat (private rooms)', items: [
+    { k: 'voiceVolume', label: 'Voice volume', type: 'range', min: 0, max: 1, step: 0.01, fmt: pct },
+    { k: 'micDefault', label: 'Microphone on when I join a room', type: 'check' },
+    { k: 'pttKey', label: 'Push-to-talk (hold)', type: 'select', desktop: true, options: [['KeyV', 'V'], ['KeyB', 'B'], ['KeyT', 'T'], ['KeyG', 'G'], ['KeyX', 'X'], ['KeyZ', 'Z'], ['CapsLock', 'Caps Lock'], ['Backquote', '` (backquote)'], ['', 'Off']] },
+    { k: 'proximity', label: 'Proximity voice (louder when close, from their direction)', type: 'check' },
+    { k: 'noiseSuppression', label: 'Noise suppression', type: 'check' },
+    { k: 'echoCancellation', label: 'Echo cancellation', type: 'check' },
   ] },
   { id: 'touch', title: 'Touch controls', touch: true, items: [
     { k: 'stickSide', label: 'Move stick side', type: 'select', options: [['left', 'Left (buttons right)'], ['right', 'Right (buttons left)']] },
@@ -74,6 +88,7 @@ export function createHud(rootEl, hudOpts = {}) {
     <div class="hs-scope" data-k="0"><div class="ring"></div><div class="h"></div><div class="v"></div><div class="opt"><i></i></div></div>
 
     <div class="hs-topleft"><span class="hs-fps"></span><span class="hs-ping"></span><span class="hs-q"></span><span class="hs-pl"></span></div>
+    <div class="hs-vtags" aria-hidden="true"></div>
     <div class="hs-match"></div>
     <div class="hs-feed"></div>
     <div class="hs-status"></div>
@@ -164,7 +179,13 @@ export function createHud(rootEl, hudOpts = {}) {
           </section>
         </div>
       </div>
-    </div></div>`;
+    </div></div>
+
+    <div class="hs-voice" role="group" aria-label="Voice chat">
+      <button type="button" class="hs-vb hs-vmic" data-s="off" aria-label="Microphone">${VOICE_ICON.micOff}</button>
+      <button type="button" class="hs-vb hs-vspk" data-s="on" aria-label="Speaker">${VOICE_ICON.spk}</button>
+    </div>
+    <div class="hs-vnote" role="status"></div>`;
 
   const $ = (sel) => rootEl.querySelector(sel);
   const el = {
@@ -332,7 +353,184 @@ export function createHud(rootEl, hudOpts = {}) {
     restartAnim(el.vig, 'flash');
   }
 
-  function setScoreboard(visible, data) { match.setScoreboard(visible, data); }
+  function setScoreboard(visible, data) {
+    match.setScoreboard(visible, data);
+    sbVisible = !!visible;
+    if (visible && data) { sbData = data; augmentBoard(); }
+  }
+
+  // ---- voice chat ----
+  let voice = null, vVer = -1;
+  const vb = { box: $('.hs-voice'), mic: $('.hs-vmic'), spk: $('.hs-vspk'), note: $('.hs-vnote'), tags: $('.hs-vtags') };
+  function attachVoice(v) { voice = v; vVer = -1; lobby.attachVoice(v); }
+  // same pattern as the weapon bar: act on pointerdown (phones may never send a click past the touch layer)
+  for (const [b, act] of [[vb.mic, () => voice && voice.toggleMic()], [vb.spk, () => voice && voice.toggleSpeaker()]]) {
+    let at = -1e9;
+    b.addEventListener('pointerdown', (e) => { e.stopPropagation(); e.preventDefault(); at = e.timeStamp; act(); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); if (e.timeStamp - at < 800) return; act(); });
+  }
+  function renderVoiceBar() {
+    const v = voice.view;
+    const ms = v.mic;
+    if (vb.mic.dataset.s !== ms) {
+      vb.mic.dataset.s = ms;
+      vb.mic.innerHTML = ms === 'on' || ms === 'ptt' || ms === 'pending' ? VOICE_ICON.mic : VOICE_ICON.micOff;
+    }
+    const lab = micLabel(ms, v.pttKey);
+    if (vb.mic.title !== lab) { vb.mic.title = lab; vb.mic.setAttribute('aria-label', lab); }
+    const ss = v.spk ? 'on' : 'off';
+    if (vb.spk.dataset.s !== ss) {
+      vb.spk.dataset.s = ss;
+      vb.spk.innerHTML = v.spk ? VOICE_ICON.spk : VOICE_ICON.spkOff;
+      const sl = v.spk ? 'Speaker on - tap to stop hearing others' : 'Speaker off - tap to hear others';
+      vb.spk.title = sl; vb.spk.setAttribute('aria-label', sl);
+    }
+  }
+  let noteTimer = 0;
+  function voiceNotice(text) {
+    vb.note.textContent = text || '';
+    vb.note.classList.toggle('on', !!text);
+    clearTimeout(noteTimer);
+    if (text) noteTimer = setTimeout(() => vb.note.classList.remove('on'), 4500);
+  }
+
+  // speaking wave next to a talking player's name tag (HTML overlay over the WebGL tag atlas)
+  const VT = 10, vt = [];
+  for (let i = 0; i < VT; i++) {
+    const d = document.createElement('div');
+    d.className = 'hs-vt'; d.innerHTML = VOICE_ICON.wave;
+    vb.tags.appendChild(d);
+    vt.push({ d, on: false, x: -1, y: -1, a: -1 });
+  }
+  const tagW = new Map();
+  let measure = null;
+  /** Half the on-screen width of a name tag (mirrors render.js drawTag: 24px bold text + 26 px, 0.5 px per texel). */
+  function tagHalf(name) {
+    let w = tagW.get(name);
+    if (w === undefined) {
+      if (!measure) { measure = document.createElement('canvas').getContext('2d'); measure.font = '700 24px system-ui, -apple-system, "Segoe UI", sans-serif'; }
+      w = Math.min(314, measure.measureText(name || '').width + 26) * 0.25;
+      if (tagW.size > 64) tagW.clear();
+      tagW.set(name, w);
+    }
+    return w;
+  }
+  const _vs = { x: 0, y: 0, z: 0 };
+  let alphas = null, alphasAt = -1e9;
+  function updateTags(c) {
+    let n = 0;
+    if (c.playing && c.players) {
+      const ps = c.players;
+      for (let i = 0; i < ps.length && n < VT; i++) {
+        const p = ps[i];
+        if (!p.alive || !voice.isSpeaking(p.id)) continue;
+        if (c.now - alphasAt > 100) { alphas = c.tagAlpha ? c.tagAlpha() : null; alphasAt = c.now; }
+        const a = alphas && i < alphas.length ? alphas[i] : 1;
+        if (a < 0.05) continue;
+        const head = p.y + 1.8 - (p.sliding ? 0.9 : p.crouching ? 0.7 : 0) + 0.1;
+        c.view(p.x, head, p.z, _vs);
+        if (_vs.z > -0.6) continue;
+        const f = (c.H / 2) / Math.tan((c.fov * Math.PI) / 360);
+        const x = Math.round(c.W / 2 + f * _vs.x / -_vs.z + tagHalf(p.name) + 10), y = Math.round(c.H / 2 - f * _vs.y / -_vs.z - 16);
+        const t = vt[n++];
+        if (!t.on) { t.on = true; t.d.style.display = 'block'; }
+        if (t.x !== x || t.y !== y) { t.x = x; t.y = y; t.d.style.transform = 'translate(' + x + 'px,' + y + 'px)'; }
+        const aq = Math.round(a * 20) / 20;
+        if (t.a !== aq) { t.a = aq; t.d.style.opacity = String(aq); }
+      }
+    }
+    for (let i = n; i < VT; i++) if (vt[i].on) { vt[i].on = false; vt[i].d.style.display = 'none'; }
+  }
+
+  // scoreboard: a Voice cell per row (speaking wave, mute, volume). matchhud.js renders the rows without
+  // ids, so rows are matched back to the board data by name + K/D within their table.
+  let sbData = null, sbVisible = false;
+  const sbCells = new Map();          // id -> { td, mute, range }
+  const sbBoard = $('.hs-score .hs-board');
+  const sbHint = document.createElement('div');
+  sbHint.className = 'hs-sbvhint';
+  sbBoard.parentNode.appendChild(sbHint);
+  function setBoardHint(text) { if (sbHint.textContent !== (text || '')) sbHint.textContent = text || ''; }
+  function syncCell(id, c) {
+    const inf = voice.info(id);
+    if (!inf) return;
+    c.td.classList.toggle('vs', inf.speaking);
+    if (c.mute) {
+      if (c.muted !== inf.muted) {
+        c.muted = inf.muted;
+        c.mute.innerHTML = inf.muted ? VOICE_ICON.spkOff : VOICE_ICON.spk;
+        c.mute.classList.toggle('on', inf.muted);
+        c.mute.title = (inf.muted ? 'Unmute ' : 'Mute ') + c.name;
+      }
+      if (document.activeElement !== c.range && +c.range.value !== inf.volume) c.range.value = String(inf.volume);
+      c.td.classList.toggle('vx', !inf.allowed);
+    } else c.td.classList.toggle('voff', !inf.mic);
+  }
+  function augmentBoard() {
+    if (!voice || !voice.enabled || !sbData) return;
+    const tables = sbBoard.getElementsByTagName('table');
+    let fresh = false;
+    for (let i = 0; i < tables.length; i++) if (!tables[i].dataset.v) { fresh = true; break; }
+    if (!fresh) return;
+    sbCells.clear();
+    const order = sbData.myTeam === 'b' ? ['b', 'a'] : ['a', 'b'];
+    for (let ti = 0; ti < tables.length; ti++) {
+      const t = tables[ti];
+      t.dataset.v = '1';
+      const team = sbData.teams ? order[ti] : null;
+      const cand = sbData.rows.filter((r) => !sbData.teams || r.team === team);
+      const used = new Set();
+      const htr = t.tHead && t.tHead.rows[0];
+      if (htr) { const th = document.createElement('th'); th.className = 'vc'; th.textContent = 'Voice'; htr.appendChild(th); }
+      const body = t.tBodies[0];
+      if (!body) continue;
+      for (const tr of body.rows) {
+        const nm = tr.cells[1] && tr.cells[1].firstChild ? tr.cells[1].firstChild.textContent : '';
+        const k = +(tr.cells[2] ? tr.cells[2].textContent : 0), dd = +(tr.cells[3] ? tr.cells[3].textContent : 0);
+        const r = cand.find((x) => !used.has(x) && x.name === nm && (x.kills | 0) === k && (x.deaths | 0) === dd) || cand.find((x) => !used.has(x) && x.name === nm);
+        const td = document.createElement('td');
+        td.className = 'vc';
+        tr.appendChild(td);
+        if (!r) continue;
+        used.add(r);
+        if (r.isBot) continue;
+        const inf = voice.info(r.id);
+        if (!inf) continue;
+        td.innerHTML = VOICE_ICON.wave + (inf.self ? VOICE_ICON.micTiny : '');
+        const c = { td, mute: null, range: null, muted: null, name: r.name };
+        if (!inf.self) {
+          const b = document.createElement('button'); b.type = 'button'; b.className = 'hs-vmute';
+          const rg = document.createElement('input'); rg.type = 'range'; rg.min = '0'; rg.max = '2'; rg.step = '0.05'; rg.className = 'hs-vvol';
+          rg.setAttribute('aria-label', 'Volume of ' + r.name);
+          b.addEventListener('click', () => { const i2 = voice.info(r.id); if (i2) { voice.setPeerMuted(r.id, !i2.muted); syncCell(r.id, c); } });
+          rg.addEventListener('input', () => voice.setPeerVolume(r.id, +rg.value));
+          for (const ev of ['keydown', 'keyup']) rg.addEventListener(ev, (e) => e.stopPropagation());
+          td.append(b, rg);
+          c.mute = b; c.range = rg;
+        }
+        // the touch scoreboard closes on a tap anywhere in the panel: not on these controls
+        td.addEventListener('click', (e) => e.stopPropagation());
+        td.addEventListener('pointerdown', (e) => e.stopPropagation());
+        sbCells.set(r.id, c);
+        syncCell(r.id, c);
+      }
+    }
+  }
+
+  let vSpeak = -1, sbVer = -1;
+  /** Per frame. c = { now, playing, players, view(x,y,z,out), W, H, fov, tagAlpha() } */
+  function voiceFrame(c) {
+    const on = !!(voice && voice.enabled);
+    setCls('hasvoice', rootEl, 'hs-hasvoice', on);
+    if (!on) { if (vt[0].on || vt[1].on) for (const t of vt) if (t.on) { t.on = false; t.d.style.display = 'none'; } return; }
+    if (voice.version !== vVer) { vVer = voice.version; renderVoiceBar(); }
+    setCls('vtalk', vb.mic, 'talk', voice.view.selfSpeaking);
+    updateTags(c);
+    if (sbVisible && sbCells.size && (voice.speakVersion !== vSpeak || voice.version !== sbVer)) {
+      vSpeak = voice.speakVersion; sbVer = voice.version;
+      for (const [id, cell] of sbCells) syncCell(id, cell);
+    }
+  }
 
   // ---- settings controls (generated from SET_DEFS) ----
   const setHost = $('.hs-settings');
@@ -348,6 +546,7 @@ export function createHud(rootEl, hudOpts = {}) {
     if (Number.isFinite(st.crosshairSize)) rootEl.style.setProperty('--xh-s', String(st.crosshairSize));
     if (st.showStats !== undefined) rootEl.classList.toggle('hs-nostats', !st.showStats);
     if (st.stickSide !== undefined) rootEl.classList.toggle('hs-stick-right', st.stickSide === 'right');
+    if (Number.isFinite(st.btnScale)) rootEl.style.setProperty('--vbs', String(Math.max(0.9, Math.min(1.5, st.btnScale))));
   }
   function setControl(k, v) {
     const c = ctl[k];
@@ -375,6 +574,7 @@ export function createHud(rootEl, hudOpts = {}) {
       body.className = 'hs-sbody';
       d.appendChild(body);
       for (const it of g.items) {
+        if (it.desktop && TOUCH) continue;
         let row = document.createElement('label');
         row.className = 'hs-set hs-set-' + it.type;
         const name = document.createElement('span');
@@ -538,5 +738,6 @@ export function createHud(rootEl, hudOpts = {}) {
     el.status.classList.toggle('on', !!text);
   }
 
-  return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, setStatus, setTab, match, lobby };
+  return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, setStatus, setTab, match, lobby,
+    attachVoice, voiceFrame, voiceNotice, setBoardHint };
 }

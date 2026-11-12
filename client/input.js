@@ -5,6 +5,8 @@
 //
 // Controls: WASD move, Space jump, Shift or C crouch/slide, LMB fire, RMB ADS, R reload,
 // 1/2/3 + wheel weapon, Tab scoreboard (held), Esc menu (releases pointer lock).
+// Voice push-to-talk: hold input.pttKey (a KeyboardEvent.code, default 'KeyV'; '' = off) ->
+// opts.onPushToTalk(true / false). Works in the lobby and menus too (not while typing in a field).
 //
 // Touch (createInput(canvas, { touch: true })): a full-screen overlay (.hs-tc) built with Pointer
 // Events. Every finger is tracked by pointer id, so move stick, look, fire and one button can all
@@ -83,6 +85,7 @@ export function createInput(canvas, opts = {}) {
     held: 0,          // buttons currently held
     latched: 0,       // buttons pressed since the last sample (so a quick tap is never missed)
     scoreboard: false,
+    pttCode: 'KeyV', ptt: false,    // voice push-to-talk key (KeyboardEvent.code) and whether it is held
     touch: !!opts.touch,
     touchHeld: 0,     // buttons held by touch (stick bits, jump, crouch, fire, ads toggle)
     invertY: false,
@@ -106,6 +109,7 @@ export function createInput(canvas, opts = {}) {
   function release(bit) { st.held &= ~bit; }
   let touchUi = null;
   function clear() { st.held = 0; st.latched = 0; st.touchHeld = 0; st.autoFire = false; if (touchUi) touchUi.clear(); }
+  function setPtt(v) { if (st.ptt !== v) { st.ptt = v; opts.onPushToTalk && opts.onPushToTalk(v); } }
 
   function onKeyDown(e) {
     if (e.code === 'Tab') {             // never let Tab move focus
@@ -114,6 +118,7 @@ export function createInput(canvas, opts = {}) {
       return;
     }
     if (isTyping(e)) return;
+    if (st.pttCode && e.code === st.pttCode) { e.preventDefault(); setPtt(true); return; }
     if (e.code === 'Escape' && !st.locked) { opts.onEscape && opts.onEscape(); return; }
     if (!st.enabled) return;
     const bit = KEYMAP[e.code];
@@ -130,6 +135,7 @@ export function createInput(canvas, opts = {}) {
       if (st.scoreboard) { st.scoreboard = false; opts.onScoreboard && opts.onScoreboard(false); }
       return;
     }
+    if (st.pttCode && e.code === st.pttCode) { setPtt(false); return; }
     const bit = KEYMAP[e.code];
     if (bit) release(bit);
   }
@@ -169,6 +175,7 @@ export function createInput(canvas, opts = {}) {
   }
   function onBlur() {
     clear();
+    setPtt(false);
     if (st.scoreboard) { st.scoreboard = false; opts.onScoreboard && opts.onScoreboard(false); }
   }
 
@@ -259,6 +266,8 @@ export function createInput(canvas, opts = {}) {
     get touch() { return st.touch; },
     get kit() { return st.kit; }, set kit(v) { st.kit = v || null; },
     get invertY() { return st.invertY; }, set invertY(v) { st.invertY = !!v; },
+    get pttKey() { return st.pttCode; }, set pttKey(v) { const c = typeof v === 'string' && !KEYMAP[v] ? v : ''; if (c !== st.pttCode) { setPtt(false); st.pttCode = c; } },
+    get pttHeld() { return st.ptt; },
     configureTouch(c) { if (touchUi) touchUi.configure(c); },
     setScoreboardActive(v) { if (touchUi) touchUi.setScoreboardActive(v); },
     applyAssist, assist,
