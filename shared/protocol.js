@@ -180,6 +180,37 @@
 //   team modes in phase countdown / playing -> teammates only; otherwise everyone in the room.
 //   A client never sends its microphone track to a peer that is not allowed to hear it.
 //
+// VOICE RELAY (server feature, no PROTOCOL_VERSION change) - when a peer-to-peer link cannot be
+//   made (UDP blocked, symmetric / carrier-grade NAT, no TURN), Opus frames go over the game
+//   WebSocket instead and the server forwards them. Feature-detected both ways, so old clients
+//   and old servers keep working: a client uses it only when the welcome says
+//   voiceRelay === VOICE_RELAY_VERSION, and only sends to peers whose roster entry says relay.
+//   welcome gains (private rooms): voiceRelay:<VOICE_RELAY_VERSION>
+//   roster entries + 'voice' gain relay:<bool> = that client can encode AND decode relay frames
+//   'voice' (client -> server) gains relay:<bool> (optional; omitted = unchanged)
+//   Binary, client -> server  (MSG.VOICE = 3), at most VOICE_IN_MAX_BYTES:
+//     u8  type = 3
+//     u8  version = VOICE_RELAY_VERSION
+//     u8  count            number of targets, 1..VOICE_MAX_TARGETS
+//     count x u8           target player ids (humans of the same private room, not yourself)
+//     u16 seq              sender's frame counter (wraps), +1 per frame sent
+//     ...                  one Opus packet (48 kHz mono, 20 ms), 1..VOICE_MAX_PAYLOAD bytes
+//   Binary, server -> client  (MSG.VOICE = 3):
+//     u8  type = 3,  u8 version,  u8 from (set by the SERVER from the connection, never trusted
+//     from the client),  u16 seq,  Opus packet
+//   The server forwards only inside private rooms, only between humans, never back to the
+//   sender, rate- and size-limited per connection (over the limit = dropped silently, counted).
+//   Each side decides alone, from its own RTCPeerConnection state, whether a pair uses the
+//   relay; a receiver plays relayed audio only while its own P2P link to that sender is NOT
+//   connected, so a pair never plays both.
+//   { t:'vstat', to, state:'p2p'|'relay'|'failed', why?, local?, remote?, pair?, ms?, nr? }
+//     client -> server diagnostics for one pair, sent on each change of outcome (rate limited).
+//     why = 'timeout'|'failed'|'disconnected'|'forced' (why P2P is not in use), local / remote =
+//     comma lists of ICE candidate TYPES seen (host, srflx, prflx, relay), pair = selected pair
+//     types ('srflx-host'), ms = time from the P2P attempt to this outcome, nr = why there is no
+//     relay ('self'|'peer'|'off') for 'failed'. Types only: never addresses, ports or SDP.
+//     The server logs one line per pair transition.
+//
 // MEMORY (v6) - an OPTIONAL long-term memory layer (server/memory, powered by Supermemory). It is on
 //   only when the server runs with MEMORY_ENABLED=1 and a SUPERMEMORY_API_KEY (or SUPERMEMORY_MOCK=1).
 //   Off, nothing below is ever sent and the server ignores `pc`.
@@ -228,14 +259,14 @@
 //     stepWeapon(ws, cmd, kit) - with kit = getKit(the lo of your latest own 'spawn').
 // ============================================================================================
 
-import { BTN_MASK, PITCH_LIMIT, MAX_DILATION_PERMILLE } from './constants.js';
+import { BTN_MASK, PITCH_LIMIT, MAX_DILATION_PERMILLE, MAX_PLAYERS } from './constants.js';
 import {
   SLOT_COUNT, WSTATE_BYTES, writeWeaponState, readWeaponState, createWeaponState, sanitizeLoadoutCode,
 } from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
 export const PROTOCOL_VERSION = 6;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps; v5: voice chat signaling; v6: optional memory (player code, AI bots, suggestions)
-export const MSG = { INPUT: 1, SNAPSHOT: 2 };
+export const MSG = { INPUT: 1, SNAPSHOT: 2, VOICE: 3 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
 export const POS_SCALE = 128;
@@ -253,6 +284,13 @@ export const MAX_TEXT_BYTES = 2048;
 // (v5) voice signaling: an SDP offer / answer is bigger than ordinary text messages
 export const MAX_SIGNAL_BYTES = 8192;
 export const MAX_SDP_CHARS = 7600;
+// voice relay (binary MSG.VOICE, see VOICE RELAY above)
+export const VOICE_RELAY_VERSION = 1;
+export const VOICE_FRAME_MS = 20;
+export const VOICE_MAX_PAYLOAD = 400;          // one 20 ms Opus packet at ~24 kbps is ~60 bytes
+export const VOICE_MAX_TARGETS = MAX_PLAYERS - 1;
+export const VOICE_IN_MAX_BYTES = 3 + VOICE_MAX_TARGETS + 2 + VOICE_MAX_PAYLOAD;
+export const VOICE_OUT_HEADER_BYTES = 5;
 
 export const SNAP_HEADER_BYTES = 18;   // type..starved
 export const SNAP_SELF_BYTES = SNAP_HEADER_BYTES + STATE_BYTES + WSTATE_BYTES;
@@ -686,8 +724,15 @@ export function voiceAllowed(teams, phase, a, b) {
 
 /** CLIENT. A signaling message for peer `to`: d = { k:'sdp', type, sdp } | { k:'ice', c }. */
 export function encodeRtc(to, d) { return JSON.stringify({ t: 'rtc', to: to | 0, d }); }
-/** CLIENT. Your voice state (mic = transmitting, deaf = speaker off). */
-export function encodeVoiceState(mic, deaf) { return JSON.stringify({ t: 'voice', mic: !!mic, deaf: !!deaf }); }
+/**
+ * CLIENT. Your voice state (mic = transmitting, deaf = speaker off; relay = you can send and play
+ * relayed voice frames - optional, only sent when a boolean is given).
+ */
+export function encodeVoiceState(mic, deaf, relay) {
+  const m = { t: 'voice', mic: !!mic, deaf: !!deaf };
+  if (typeof relay === 'boolean') m.relay = relay;
+  return JSON.stringify(m);
+}
 
 const str = (v, max) => (typeof v === 'string' && v.length <= max ? v : null);
 /**
@@ -718,6 +763,146 @@ export function sanitizeSignal(d) {
     return { k: 'ice', c: out };
   }
   return null;
+}
+
+// ------------------------------------------------------------------------------- VOICE RELAY
+
+/**
+ * CLIENT. One Opus packet for the relay. targets = player ids (0 and duplicates are skipped, at
+ * most VOICE_MAX_TARGETS), seq = frame counter (u16), payload = Uint8Array of 1..VOICE_MAX_PAYLOAD
+ * bytes. Returns a NEW Uint8Array, or null when there is nothing valid to send.
+ */
+export function encodeVoiceFrame(targets, seq, payload) {
+  const plen = payload ? payload.byteLength : 0;
+  if (plen < 1 || plen > VOICE_MAX_PAYLOAD || !targets) return null;
+  const ids = [];
+  for (let i = 0; i < targets.length && ids.length < VOICE_MAX_TARGETS; i++) {
+    const id = targets[i] | 0;
+    if (id > 0 && id < 256 && !ids.includes(id)) ids.push(id);
+  }
+  if (!ids.length) return null;
+  const n = ids.length;
+  const buf = new Uint8Array(3 + n + 2 + plen);
+  buf[0] = MSG.VOICE; buf[1] = VOICE_RELAY_VERSION; buf[2] = n;
+  for (let i = 0; i < n; i++) buf[3 + i] = ids[i];
+  buf[3 + n] = seq & 0xff; buf[4 + n] = (seq >>> 8) & 0xff;
+  buf.set(payload instanceof Uint8Array ? payload : new Uint8Array(payload.buffer || payload, payload.byteOffset || 0, plen), 5 + n);
+  return buf;
+}
+
+/** Reusable output object for decodeVoiceFrame. */
+export function createVoiceFrame() {
+  return { count: 0, targets: new Uint8Array(VOICE_MAX_TARGETS), seq: 0, offset: 0, length: 0 };
+}
+
+/**
+ * SERVER. Validate a client voice frame (Buffer / typed array / ArrayBuffer) into `out`:
+ * targets[0..count-1], seq, and the Opus packet at data[offset .. offset + length). Returns out,
+ * or null for anything malformed (wrong type / version, no or too many targets, id 0, empty or
+ * oversized payload). Never throws. Duplicate targets are left to the caller.
+ */
+export function decodeVoiceFrame(data, out = createVoiceFrame()) {
+  const v = toView(data);
+  if (!v || v.byteLength < 7 || v.byteLength > VOICE_IN_MAX_BYTES) return null;
+  if (v.getUint8(0) !== MSG.VOICE || v.getUint8(1) !== VOICE_RELAY_VERSION) return null;
+  const n = v.getUint8(2);
+  if (n < 1 || n > VOICE_MAX_TARGETS) return null;
+  const plen = v.byteLength - 5 - n;
+  if (plen < 1 || plen > VOICE_MAX_PAYLOAD) return null;
+  for (let i = 0; i < n; i++) {
+    const id = v.getUint8(3 + i);
+    if (id === 0) return null;
+    out.targets[i] = id;
+  }
+  out.count = n;
+  out.seq = v.getUint16(3 + n, true);
+  out.offset = 5 + n;
+  out.length = plen;
+  return out;
+}
+
+/**
+ * SERVER. The frame a target receives: `from` is the sender's id as the SERVER knows it.
+ * src = the client frame (Uint8Array / Buffer), offset / length = its payload (decodeVoiceFrame).
+ * Returns a NEW Uint8Array (one per incoming frame; the same bytes go to every target).
+ */
+export function encodeVoiceRelay(from, seq, src, offset, length) {
+  const buf = new Uint8Array(VOICE_OUT_HEADER_BYTES + length);
+  buf[0] = MSG.VOICE; buf[1] = VOICE_RELAY_VERSION; buf[2] = from & 0xff;
+  buf[3] = seq & 0xff; buf[4] = (seq >>> 8) & 0xff;
+  buf.set(src.subarray(offset, offset + length), VOICE_OUT_HEADER_BYTES);
+  return buf;
+}
+
+/**
+ * CLIENT. Decode a relayed frame into `out` = { from, seq, payload } (payload is a VIEW into
+ * data: copy it if you keep it). Returns out or null.
+ */
+export function decodeVoiceRelay(data, out = { from: 0, seq: 0, payload: null }) {
+  let u8;
+  if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+  else if (ArrayBuffer.isView(data)) u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  else return null;
+  if (u8.length < VOICE_OUT_HEADER_BYTES + 1 || u8.length > VOICE_OUT_HEADER_BYTES + VOICE_MAX_PAYLOAD) return null;
+  if (u8[0] !== MSG.VOICE || u8[1] !== VOICE_RELAY_VERSION || u8[2] === 0) return null;
+  out.from = u8[2];
+  out.seq = u8[3] | (u8[4] << 8);
+  out.payload = u8.subarray(VOICE_OUT_HEADER_BYTES);
+  return out;
+}
+
+export const VSTAT_STATES = ['p2p', 'relay', 'failed'];
+const VSTAT_WHY = ['timeout', 'failed', 'disconnected', 'forced'];
+const VSTAT_NR = ['self', 'peer', 'off'];
+const CAND_TYPES = ['host', 'srflx', 'prflx', 'relay'];
+function candList(v) {
+  if (v === undefined || v === null || v === '') return '';
+  if (typeof v !== 'string' || v.length > 40) return null;
+  const out = [];
+  for (const t of v.split(',')) {
+    if (!CAND_TYPES.includes(t)) return null;
+    if (!out.includes(t)) out.push(t);
+  }
+  return out.join(',');
+}
+
+/** CLIENT. Voice pair diagnostics: s = { to, state, why?, local?, remote?, pair?, ms?, nr? } (VOICE RELAY). */
+export function encodeVoiceStat(s) {
+  const m = { t: 'vstat', to: s.to | 0, state: s.state };
+  if (s.why) m.why = s.why;
+  if (s.local) m.local = s.local;
+  if (s.remote) m.remote = s.remote;
+  if (s.pair) m.pair = s.pair;
+  if (Number.isFinite(s.ms)) m.ms = Math.max(0, Math.round(s.ms));
+  if (s.nr) m.nr = s.nr;
+  return JSON.stringify(m);
+}
+
+/**
+ * SERVER. Validate a 'vstat' message and rebuild it from known values only (candidate TYPES,
+ * never addresses). Returns { to, state, why, local, remote, pair, ms (-1 = unknown), nr } or null.
+ */
+export function sanitizeVoiceStat(m) {
+  if (!m || typeof m !== 'object') return null;
+  if (!Number.isInteger(m.to) || m.to < 1 || m.to > 255) return null;
+  if (!VSTAT_STATES.includes(m.state)) return null;
+  const why = m.why === undefined || m.why === '' ? '' : VSTAT_WHY.includes(m.why) ? m.why : null;
+  const nr = m.nr === undefined || m.nr === '' ? '' : VSTAT_NR.includes(m.nr) ? m.nr : null;
+  const local = candList(m.local), remote = candList(m.remote);
+  if (why === null || nr === null || local === null || remote === null) return null;
+  let pair = '';
+  if (m.pair !== undefined && m.pair !== '') {
+    if (typeof m.pair !== 'string' || m.pair.length > 16) return null;
+    const ab = m.pair.split('-');
+    if (ab.length !== 2 || !CAND_TYPES.includes(ab[0]) || !CAND_TYPES.includes(ab[1])) return null;
+    pair = ab[0] + '-' + ab[1];
+  }
+  let ms = -1;
+  if (m.ms !== undefined) {
+    if (!Number.isInteger(m.ms) || m.ms < 0 || m.ms > 86400000) return null;
+    ms = m.ms;
+  }
+  return { to: m.to, state: m.state, why, local, remote, pair, ms, nr };
 }
 
 export function encodePing(clientMs, rtt) {

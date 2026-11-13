@@ -7,6 +7,9 @@
 //     min(distance to the nearest living enemy, 45 m)
 //     + 20 for a home spawn (team modes)          - 30 if an enemy is within 8 m
 //     - 100 if anyone is standing on it (< 1.2 m)  + 0..4 m random (variety)
+//   In team modes the distance term is capped at TEAM_SAFE (20 m) instead, the random part is
+//   0..10, a spawn used in the last 6 s loses up to 18 and one with a teammate within 3 m loses
+//   12: the home spawns rotate instead of the one farthest from the fight winning every time.
 //   Candidates are then tested in preference order for VISIBILITY: a ray from each living
 //   enemy's eye to the candidate's chest (1.2 m) and head (1.7 m) with raycastWorld; the first
 //   candidate no enemy can see wins. When every designed spawn is seen (crowded ffa), up to 16
@@ -69,24 +72,41 @@ export function spawnVisible(room, p, pos) {
 
 const scoreBuf = new Float64Array(256), order = new Int32Array(256);
 
+// Team modes: once enemies are TEAM_SAFE m away, distance stops mattering, so the home spawns
+// share the load at random instead of the one farthest from the fight winning every time. A spawn
+// used in the last RECENT_TICKS is pushed down, and so is one with a living teammate near it.
+const TEAM_SAFE = 20, TEAM_JITTER = 10, RECENT_TICKS = 6 * 60, RECENT_PENALTY = 18, MATE_NEAR = 3, MATE_PENALTY = 12;
+const lastUsed = new WeakMap();   // room -> Map(candidate -> tick)
+
 export function pickSpawn(room, p, policy = room.spawnPolicy || 'smart') {
   const map = room.map;
   const team = p.team || '';
   if (policy === 'legacy') return legacy(room, p, map.spawns);
   const cand = candidates(map, team);
   const n = Math.min(cand.length, 256);
+  let used = null;
+  if (team) { used = lastUsed.get(room); if (!used) { used = new Map(); lastUsed.set(room, used); } }
+  const tick = room.tick | 0;
   for (let i = 0; i < n; i++) {
     const c = cand[i];
     const [sx, sy, sz] = c.pos;
-    let minE = 1e9, minAny = 1e9;
+    let minE = 1e9, minAny = 1e9, minMate = 1e9;
     for (const q of room.players) {
       if (q === p || !q.alive) continue;
       const dx = q.state.x - sx, dy = q.state.y - sy, dz = q.state.z - sz;
       const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
       if (d < minAny) minAny = d;
-      if (isEnemy(p, q) && d < minE) minE = d;
+      if (isEnemy(p, q)) { if (d < minE) minE = d; } else if (d < minMate) minMate = d;
     }
-    let s = (minE < 45 ? minE : 45) + (c.home ? 20 : 0) + Math.random() * 4;
+    let s;
+    if (team) {
+      s = (minE < TEAM_SAFE ? minE : TEAM_SAFE) + (c.home ? 20 : 0) + Math.random() * TEAM_JITTER;
+      const t = used.get(c);
+      if (t !== undefined && tick - t >= 0 && tick - t < RECENT_TICKS) s -= RECENT_PENALTY * (1 - (tick - t) / RECENT_TICKS);
+      if (minMate < MATE_NEAR) s -= MATE_PENALTY;
+    } else {
+      s = (minE < 45 ? minE : 45) + (c.home ? 20 : 0) + Math.random() * 4;
+    }
     if (minE < 8) s -= 30;
     if (minAny < 1.2) s -= 100;
     scoreBuf[i] = s;
@@ -101,7 +121,7 @@ export function pickSpawn(room, p, policy = room.spawnPolicy || 'smart') {
   }
   for (let k = 0; k < n; k++) {
     const c = cand[order[k]];
-    if (!spawnVisible(room, p, c.pos)) return c;
+    if (!spawnVisible(room, p, c.pos)) { if (used) used.set(c, tick); return c; }
   }
   // every designed spawn is seen (crowded match): try up to EXTRA_TRIES fallback points from
   // the nav grid (reachable floor on a 3 m lattice), best scored first
@@ -132,6 +152,7 @@ export function pickSpawn(room, p, policy = room.spawnPolicy || 'smart') {
     }
   }
   if (room.spawnStats && room.spawnStats.enabled) room.spawnStats.unavoidable = (room.spawnStats.unavoidable || 0) + 1;
+  if (used) used.set(cand[order[0]], tick);
   return cand[order[0]];
 }
 

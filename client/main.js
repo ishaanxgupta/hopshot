@@ -25,6 +25,7 @@
 // players + the camera (proximity), hud.voiceFrame() for buttons / speaking indicators, push-to-talk from
 // input.js. Desktop: while the Tab scoreboard is up, a click frees the cursor and pins the board so its
 // per-player voice controls can be used (click the game again to carry on). Debug: window.__hopshot.voice.
+// When P2P cannot connect, voice falls back to the relay over the game socket (net 'voiceframe').
 //
 // Memory (protocol v6, only when the server has it on): a random secret player code (32 bytes, base64url) is
 // kept in localStorage 'hopshot.playerCode' and sent with every join; the Settings tab shows it (masked,
@@ -144,7 +145,10 @@ function voiceNotice(text) {
   if (net.state.connected && net.state.match.phase === 'lobby') hud.lobby.notice(text, !/reconnected/i.test(text));
   else hud.voiceNotice(text);
 }
-const voice = createVoice({ net, audio, touch: IS_TOUCH, onNotice: voiceNotice });
+// test hooks: ?voicetest=1 = an oscillator tone instead of the microphone (no prompt);
+// ?voice=relay = voice relay only (no peer-to-peer), ?voice=p2p = relay off
+const VOICE_MODE = params.get('voice') === 'relay' || params.get('voice') === 'p2p' ? params.get('voice') : '';
+const voice = createVoice({ net, audio, touch: IS_TOUCH, onNotice: voiceNotice, mode: VOICE_MODE, testTone: params.get('voicetest') === '1' });
 hud.attachVoice(voice);
 const autopilot = AUTOPLAY ? createAutopilot({ seed: (Math.random() * 1e9) | 0 }) : null;
 
@@ -464,6 +468,7 @@ net.on('welcome', () => voice.onWelcome());
 for (const ev of ['join', 'team', 'lobby', 'match', 'spawn']) net.on(ev, () => voice.sync());
 net.on('leave', (m) => voice.onLeave(m.id));
 net.on('rtc', (m) => voice.onSignal(m));
+net.on('voiceframe', (f) => voice.onRelayFrame(f));
 net.on('voice', (m) => voice.onVoiceState(m));
 net.on('close', () => voice.onClose());
 window.addEventListener('pagehide', () => voice.shutdown());

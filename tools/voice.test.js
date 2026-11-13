@@ -207,7 +207,7 @@ async function main() {
       A.clear(); B.clear(); C.clear();
       A.send(encodeVoiceState(true, false));
       await sleep(150);
-      assert.deepEqual(B.of('voice'), [{ t: 'voice', id: A.id, mic: true, deaf: false }]);
+      assert.deepEqual(B.of('voice'), [{ t: 'voice', id: A.id, mic: true, deaf: false, relay: false }]);
       assert.equal(A.of('voice').length, 0, 'no echo to the sender');
       assert.equal(C.of('voice').length, 0, 'other rooms see nothing');
       // unchanged state is not re-broadcast; non-boolean is refused

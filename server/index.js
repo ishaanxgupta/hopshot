@@ -8,7 +8,8 @@
 //   STUN_URLS        (v5 voice) comma-separated STUN urls sent to private rooms
 //                    (default stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302)
 //   TURN_URLS        (v5 voice) comma-separated TURN urls (e.g. turn:relay.example.com:3478?transport=udp);
-//   TURN_USER, TURN_PASS  its credentials. Unset = STUN only (peers behind strict NATs cannot connect).
+//   TURN_USER, TURN_PASS  its credentials. Unset = STUN only: pairs that cannot connect peer-to-peer
+//                    fall back to the voice relay over the game WebSocket (protocol.js VOICE RELAY).
 //   (v6, optional long-term memory, server/memory; OFF by default)
 //   MEMORY_ENABLED        1 = on (needs SUPERMEMORY_API_KEY, or SUPERMEMORY_MOCK=1). Off = no network calls,
 //                         no AI bots, no suggestions: the game runs exactly as without it.
@@ -25,7 +26,7 @@ import { WebSocketServer } from 'ws';
 import { MAX_PLAYERS } from '../shared/constants.js';
 import {
   PROTOCOL_VERSION, MSG, MAX_TEXT_BYTES, MAX_SIGNAL_BYTES, INPUT_MAX_BYTES, createInputPacket, decodeInput, decodeText,
-  encodeText, sanitizeName, sanitizeRoomName, parseTeam,
+  encodeText, sanitizeName, sanitizeRoomName, parseTeam, VOICE_IN_MAX_BYTES, createVoiceFrame, decodeVoiceFrame,
 } from '../shared/protocol.js';
 import { Room, BOT_MIN } from './room.js';
 import { Bot } from './bots.js';
@@ -48,6 +49,11 @@ const TEXT_RATE = 5, TEXT_BURST = 15;
 const RAW_RATE = 60, RAW_BURST = 160;
 const SIG_RATE = 25, SIG_BURST = 120;
 const SIG_BYTES_RATE = 24000, SIG_BYTES_BURST = 80000;
+// voice relay frames (binary MSG.VOICE): 50 frames/s of ~60-byte Opus packets nominal (24 kbps,
+// 20 ms). Own buckets with headroom for VBR peaks and the burst a TCP stall releases; anything
+// over is dropped silently (room.voiceStats.relayDropped). Each frame is at most VOICE_IN_MAX_BYTES.
+const VOICE_RATE = 75, VOICE_BURST = 150;
+const VOICE_BYTES_RATE = 12000, VOICE_BYTES_BURST = 24000;
 
 function splitList(v) { return String(v || '').split(',').map((s) => s.trim()).filter(Boolean); }
 /** RTCIceServer list for private rooms (welcome.ice). */
@@ -88,6 +94,8 @@ function createRoom(name, isPrivate, bots) {
     onEmpty: (r) => {
       if (rooms.get(r.name) === r) rooms.delete(r.name);
       log(`room ${r.name} closed`);
+      const vs = r.voiceSummary();
+      if (vs) log(vs);
     },
   });
   rooms.set(name, room);
@@ -211,6 +219,7 @@ wss.on('connection', (ws, req) => {
     ws, room: null, player: null, bad: 0, alive: true,
     bin: bucket(BIN_RATE, BIN_BURST), text: bucket(TEXT_RATE, TEXT_BURST),
     raw: bucket(RAW_RATE, RAW_BURST), sig: bucket(SIG_RATE, SIG_BURST), sigBytes: bucket(SIG_BYTES_RATE, SIG_BYTES_BURST),
+    vf: bucket(VOICE_RATE, VOICE_BURST), vb: bucket(VOICE_BYTES_RATE, VOICE_BYTES_BURST), vframe: createVoiceFrame(),
     pkt: createInputPacket(),
   };
   const joinTimer = setTimeout(() => { if (!conn.player) ws.close(1008, 'join timeout'); }, JOIN_TIMEOUT_MS);
@@ -224,6 +233,16 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data, isBinary) => {
     try {
       if (isBinary) {
+        if (conn.player && data.length > 0 && data[0] === MSG.VOICE) {
+          // voice relay frame: own size cap + buckets, never the input bucket
+          const room = conn.room;
+          if (data.length > VOICE_IN_MAX_BYTES) { room.voiceStats.relayDropped++; misbehave(); return; }
+          if (!take(conn.vf) || !take(conn.vb, data.length)) { room.voiceStats.relayDropped++; return; }
+          const f = decodeVoiceFrame(data, conn.vframe);
+          if (!f) { room.voiceStats.relayDropped++; misbehave(); return; }
+          if (!conn.player.removed) room.relayVoice(conn.player, f, data);
+          return;
+        }
         if (!conn.player || !take(conn.bin)) return;
         if (data.length === 0 || data[0] !== MSG.INPUT) { misbehave(); return; }
         const pkt = decodeInput(data, conn.pkt);
@@ -235,8 +254,8 @@ wss.on('connection', (ws, req) => {
       const len = data.length | 0;
       const msg = decodeText(data, MAX_SIGNAL_BYTES);
       if (!msg) { misbehave(); return; }
-      if (msg.t === 'rtc' || msg.t === 'voice') {
-        // (v5) voice signaling: own buckets; only 'rtc' may exceed the normal text size
+      if (msg.t === 'rtc' || msg.t === 'voice' || msg.t === 'vstat') {
+        // (v5) voice signaling (+ relay diagnostics): own buckets; only 'rtc' may exceed the normal text size
         if (len > MAX_TEXT_BYTES && msg.t !== 'rtc') { misbehave(); return; }
         if (!take(conn.sig) || !take(conn.sigBytes, len)) { if (conn.room) conn.room.voiceStats.limited++; return; }
       } else {
@@ -325,7 +344,14 @@ function handleText(conn, msg) {
     }
     case 'voice': {
       if (!conn.player || conn.player.removed) { conn.bad++; return; }
-      if (conn.room.setVoiceState(conn.player, msg.mic, msg.deaf)) conn.bad++;
+      if (conn.room.setVoiceState(conn.player, msg.mic, msg.deaf, msg.relay)) conn.bad++;
+      return;
+    }
+    case 'vstat': {
+      // voice relay diagnostics: one pair's outcome (candidate types only); logged per transition
+      if (!conn.player || conn.player.removed) { conn.bad++; return; }
+      const err = conn.room.voiceReport(conn.player, msg);
+      if (err && err !== 'no_target') conn.bad++;
       return;
     }
     case 'ping': {

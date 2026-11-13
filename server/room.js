@@ -43,6 +43,11 @@
 // humans of this room (validated + rebuilt by protocol.sanitizeSignal); setVoiceState() keeps
 // each human's mic / deaf flags and broadcasts changes. The server never touches audio, and who
 // may hear whom is enforced by the sending client (protocol.voiceAllowed).
+// Voice relay (protocol.js VOICE RELAY): when a pair cannot connect peer-to-peer, relayVoice()
+// forwards Opus frames (binary MSG.VOICE) between humans of this private room, re-stamped with
+// the sender id the server knows. Size / rate limits are applied by index.js before this.
+// voiceReport() takes the clients' per-pair 'vstat' diagnostics and logs one line per pair
+// transition (candidate types only, never addresses); voiceSummary() is logged when the room closes.
 
 import { performance } from 'node:perf_hooks';
 import {
@@ -60,7 +65,7 @@ import {
 import {
   PROTOCOL_VERSION, SHOT, SNAP_SELF_BYTES, PLAYER_ENTRY_BYTES, SHOT_ENTRY_BYTES, MAX_SNAP_SHOTS,
   writeSnapshotSelf, writePlayerEntry, writeShotEntry, normalToAxis, createCmd, sanitizeCmd, encodeText,
-  parseLoadoutCode, sanitizeSignal,
+  parseLoadoutCode, sanitizeSignal, encodeVoiceRelay, sanitizeVoiceStat, VOICE_RELAY_VERSION,
 } from '../shared/protocol.js';
 import {
   MODES, isTeamMode, otherTeam, sanitizeMatchConfig, defaultMatchConfig, decideWinner, MAP_SIZE_PLAYERS,
@@ -110,6 +115,13 @@ const DEAD_CLIENT_BYTES = 1024 * 1024;             // terminate above this
 const TIMING_SAMPLES = 3600;
 const MAX_CATCHUP = 5;
 const SCORES_EVERY = TICK_RATE;                    // scoreboard broadcast period
+const VOICE_SLOW_BYTES = 16 * 1024;                // relayed voice to a socket with more queued is dropped (stale anyway)
+const VOICE_PAIRS_MAX = 512;                       // vstat pairs tracked per room
+const VLOG_BURST = 30, VLOG_EVERY_MS = 10000;      // vstat log lines per reporter: burst, then one per 10 s
+
+function vlog(...args) { console.log(new Date().toISOString(), ...args); }
+const fmtSecs = (ms) => (ms < 10000 ? (Math.round(ms / 100) / 10) : Math.round(ms / 1000)) + 's';
+const fmtKB = (b) => (b < 1048576 ? Math.round(b / 102.4) / 10 + ' kB' : Math.round(b / 104857.6) / 10 + ' MB');
 
 export const BOT_MIN = process.env.BOTS !== undefined && process.env.BOTS !== ''
   ? Math.max(0, Math.min(MAX_PLAYERS, parseInt(process.env.BOTS, 10) || 0)) : 4;
@@ -126,7 +138,13 @@ export class Room {
     this.onEmpty = opts.onEmpty || (() => {});
     this.spawnPolicy = opts.spawnPolicy || 'smart';
     this.iceServers = Array.isArray(opts.iceServers) ? opts.iceServers : [];
-    this.voiceStats = { relayed: 0, refused: 0, limited: 0, states: 0 };
+    this.voiceStats = { relayed: 0, refused: 0, limited: 0, states: 0,
+      // voice relay: frames / bytes forwarded (one per target), dropped (rate / size / slow target),
+      // refused (target not a human of this room, yourself, duplicate), vstat reports, mic-on events
+      relayFrames: 0, relayBytes: 0, relayDropped: 0, relayRefused: 0, reports: 0, micOn: 0 };
+    this.voicePairs = new Map();      // reporter id * 256 + peer id -> { state, names... } (vstat)
+    this.voicePairTotals = { p2p: 0, relay: 0, failed: 0 };   // pairs that ever reached each outcome
+    this.voiceStamp = new Uint32Array(256); this.voiceGen = 0;   // relay target de-duplication
     this.memory = opts.memory || null;
     this.mem = this.memory ? this.memory.createRoom(this) : null;
     this.players = [];          // dense list, humans and bots
@@ -296,8 +314,8 @@ export class Room {
       // match: team ('' | 'a' | 'b'), spawn protection end tick, carried flag ('' | the
       // flag's team), objective score (captures / zone seconds), join order (host migration)
       team: '', protectedUntil: 0, carrying: '', obj: 0, joinSeq: ++this.joinSeq,
-      // voice (v5, private rooms): transmitting / speaker off
-      mic: false, deaf: false,
+      // voice (v5, private rooms): transmitting / speaker off; vrelay = can use the voice relay
+      mic: false, deaf: false, vrelay: false, vlogTokens: VLOG_BURST, vlogAt: 0,
       // cmd jitter buffer
       queue, qHead: 0, qLen: 0, lastQueuedSeq: -1, ackSeq: -1,
       lastCmd: createCmd(), guess: createCmd(), starved: 0, qMin: 1e9, qWindow: 0,
@@ -380,6 +398,7 @@ export class Room {
     this.broadcast(encodeText({ t: 'leave', id: p.id }), null);
     if (!p.bot) {
       if (this.mem) this.mem.removeHuman(p);
+      if (this.voicePairs.size) this.forgetVoicePairs(p.id);
       if (this.humans === 0) { this.destroy(); this.onEmpty(this); return; }
       if (this.hostId === p.id) this.migrateHost();
       this.updateBots();
@@ -488,7 +507,7 @@ export class Room {
 
   rosterEntry(p) {
     const e = { id: p.id, name: p.name, bot: p.bot, kills: p.kills, deaths: p.deaths, ping: p.ping, lo: p.kit.code, team: p.team, obj: p.obj };
-    if (this.isPrivate) { e.mic = p.mic; e.deaf = p.deaf; }
+    if (this.isPrivate) { e.mic = p.mic; e.deaf = p.deaf; e.relay = p.vrelay; }
     return e;
   }
 
@@ -513,15 +532,99 @@ export class Room {
     return null;
   }
 
-  /** A human's voice state (mic = transmitting, deaf = speaker off). Private rooms only. */
-  setVoiceState(p, mic, deaf) {
+  /**
+   * A human's voice state (mic = transmitting, deaf = speaker off, relay = can use the voice relay;
+   * relay undefined = unchanged). Private rooms only.
+   */
+  setVoiceState(p, mic, deaf, relay) {
     if (!this.isPrivate || p.bot) { this.voiceStats.refused++; return 'not_private'; }
     if (typeof mic !== 'boolean' || typeof deaf !== 'boolean') return 'bad_voice';
-    if (p.mic === mic && p.deaf === deaf) return null;
-    p.mic = mic; p.deaf = deaf;
+    if (relay !== undefined && typeof relay !== 'boolean') return 'bad_voice';
+    const rl = relay === undefined ? p.vrelay : relay;
+    if (p.mic === mic && p.deaf === deaf && p.vrelay === rl) return null;
+    if (mic && !p.mic) this.voiceStats.micOn++;
+    p.mic = mic; p.deaf = deaf; p.vrelay = rl;
     this.voiceStats.states++;
-    this.broadcast(encodeText({ t: 'voice', id: p.id, mic, deaf }), p);
+    this.broadcast(encodeText({ t: 'voice', id: p.id, mic, deaf, relay: rl }), p);
     return null;
+  }
+
+  /**
+   * Forward one voice frame (protocol.decodeVoiceFrame result `f`, raw bytes `data`) from human p
+   * to its targets: only in a private room, only to humans of this room, never to p itself, each
+   * target at most once. The outgoing frame carries p.id (never a client-supplied sender).
+   * Returns null, or a reason when nothing could be forwarded at all.
+   */
+  relayVoice(p, f, data) {
+    const vs = this.voiceStats;
+    if (!this.isPrivate) { vs.relayRefused++; return 'not_private'; }
+    if (!p || p.bot || !p.ws || p.removed || this.byId.get(p.id) !== p) { vs.relayRefused++; return 'bad_sender'; }
+    const stamp = this.voiceStamp;
+    const gen = this.voiceGen = (this.voiceGen + 1) >>> 0 || 1;
+    let out = null;
+    for (let i = 0; i < f.count; i++) {
+      const id = f.targets[i];
+      if (id === p.id || stamp[id] === gen) { vs.relayRefused++; continue; }
+      stamp[id] = gen;
+      const q = this.byId.get(id);
+      if (!q || q.bot || q.removed || !q.ws) { vs.relayRefused++; continue; }
+      const ws = q.ws;
+      if (ws.readyState !== 1) continue;
+      if (ws.bufferedAmount > VOICE_SLOW_BYTES) { vs.relayDropped++; continue; }
+      if (!out) out = encodeVoiceRelay(p.id, f.seq, data, f.offset, f.length);
+      ws.send(out, { binary: true });
+      vs.relayFrames++; vs.relayBytes += out.length; this.bytesOut += out.length;
+    }
+    return out ? null : 'no_target';
+  }
+
+  /**
+   * A client's diagnostics for its voice link to one peer ('vstat', protocol.sanitizeVoiceStat).
+   * Logs one line when that pair's outcome changes (each side reports its own view), never on a
+   * repeat; per reporter the log lines are rate limited. Returns null or a reason string.
+   */
+  voiceReport(p, m) {
+    if (!this.isPrivate || p.bot) return 'not_private';
+    const s = sanitizeVoiceStat(m);
+    if (!s) return 'bad_vstat';
+    const q = this.byId.get(s.to);
+    if (!q) return 'no_target';
+    if (q === p || q.bot) return 'bad_target';
+    const key = p.id * 256 + q.id;
+    let e = this.voicePairs.get(key);
+    if (!e) {
+      if (this.voicePairs.size >= VOICE_PAIRS_MAX) return null;
+      e = { state: '', p2p: false, relay: false, failed: false };
+      this.voicePairs.set(key, e);
+    }
+    if (e.state === s.state) return null;
+    const prev = e.state;
+    e.state = s.state;
+    if (!e[s.state]) { e[s.state] = true; this.voicePairTotals[s.state]++; }
+    this.voiceStats.reports++;
+    // log budget per reporter
+    const now = performance.now();
+    if (p.vlogTokens < VLOG_BURST) {
+      p.vlogTokens = Math.min(VLOG_BURST, p.vlogTokens + (now - p.vlogAt) / VLOG_EVERY_MS);
+    }
+    p.vlogAt = now;
+    if (p.vlogTokens < 1) return null;
+    p.vlogTokens--;
+    vlog(`voice ${p.name}#${p.id} -> ${q.name}#${q.id}: ${describeVoiceStat(s, prev)}`);
+    return null;
+  }
+
+  forgetVoicePairs(id) {
+    for (const k of Array.from(this.voicePairs.keys())) if ((k >> 8) === id || (k & 255) === id) this.voicePairs.delete(k);
+  }
+
+  /** One line for the room-closed log, or '' when nobody used voice here. */
+  voiceSummary() {
+    const vs = this.voiceStats, t = this.voicePairTotals;
+    if (!this.isPrivate || (vs.relayFrames === 0 && vs.reports === 0 && vs.micOn === 0)) return '';
+    return `voice room ${this.name}: pairs p2p ${t.p2p} / relay ${t.relay} / failed ${t.failed}, ` +
+      `relay ${vs.relayFrames} frames ${fmtKB(vs.relayBytes)} (dropped ${vs.relayDropped}), ` +
+      `mic on ${vs.micOn}x, signals ${vs.relayed} (limited ${vs.limited})`;
   }
 
   /**
@@ -543,8 +646,9 @@ export class Room {
       players: this.players.map((q) => this.rosterEntry(q)),
       round: this.roundCompat(),
       match: this.matchState(), lobby: this.lobbyState(), obj: this.objState(),
-      // (v5) voice chat: private rooms only
+      // (v5) voice chat: private rooms only (+ the voice relay fallback over this socket)
       voice: !!this.isPrivate, ice: this.isPrivate ? this.iceServers : undefined,
+      voiceRelay: this.isPrivate ? VOICE_RELAY_VERSION : undefined,
       // (v6) optional memory layer: AI bots + suggestions available
       memory: !!this.mem,
     });
@@ -1467,3 +1571,14 @@ export class Room {
 }
 
 function round2(v) { return Math.round(v * 100) / 100; }
+
+/** Log text for one sanitised vstat (candidate types only), e.g. "p2p failed after 5s (local host,srflx / remote host), using relay". */
+function describeVoiceStat(s, prev) {
+  const after = s.ms >= 0 ? ` after ${fmtSecs(s.ms)}` : '';
+  const cands = `(local ${s.local || '-'} / remote ${s.remote || '-'})`;
+  const down = s.why === 'failed' ? 'p2p failed' : s.why === 'disconnected' ? 'p2p lost' : s.why === 'timeout' ? 'p2p not connected' : 'p2p down';
+  if (s.state === 'p2p') return `p2p connected${after}${s.pair ? ` (pair ${s.pair})` : ''}${prev === 'relay' ? ', relay off' : ''}`;
+  if (s.state === 'relay') return s.why === 'forced' ? `relay forced by the client ${cands}` : `${down}${after} ${cands}, using relay`;
+  const nr = s.nr === 'peer' ? 'the other side has none' : s.nr === 'off' ? 'turned off' : 'this browser has none';
+  return `${s.why === 'forced' ? 'relay forced' : down}${after} ${cands}, no relay (${nr})`;
+}

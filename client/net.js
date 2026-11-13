@@ -86,7 +86,14 @@
 //   net.sendRtc(to, d)           signal for peer `to` (protocol.encodeRtc); dropped unless connected
 //   net.sendVoiceState(mic, deaf)
 //   events: 'rtc' ({ from, d })  d already passed protocol.sanitizeSignal
-//           'voice' ({ id, mic, deaf })   a player's voice state changed (roster updated first)
+//           'voice' ({ id, mic, deaf, relay })   a player's voice state changed (roster updated first)
+// Voice relay (protocol.js VOICE RELAY; used by voice.js when P2P cannot connect):
+//   net.state.voice.relay        the server forwards voice frames (welcome.voiceRelay) and takes 'vstat'
+//   roster entries carry relay   that player can send + play relayed voice
+//   net.sendVoiceFrame(targets, seq, opusBytes) -> bool   skipped (false) while the socket is backed up
+//   net.sendVoiceStat({ to, state, why, local, remote, pair, ms, nr })   pair diagnostics for the server log
+//   net.sendVoiceState(mic, deaf, relay)
+//   event 'voiceframe' ({ from, seq, payload })   payload is a view: copy it if you keep it
 //
 // Memory (protocol v6, optional on the server):
 //   net.connect(name, room, { bots, playerCode })   playerCode = the secret player code (main.js keeps
@@ -113,7 +120,10 @@ import {
   TICK_MS, SHOT, INPUT_REDUNDANCY, createCmd, sanitizeCmd, encodeInput, encodeJoin, encodePing,
   decodeSnapshot, decodeText, createSnapshot, encodeSetLoadout, encodeMatchConfig, encodeStart, encodeTeam,
   encodeReturnToLobby, encodeRtc, encodeVoiceState, sanitizeSignal,
+  MSG, VOICE_RELAY_VERSION, encodeVoiceFrame, decodeVoiceRelay, encodeVoiceStat,
 } from '../shared/protocol.js';
+
+const VOICE_MAX_BUFFERED = 32 * 1024;   // socket backlog above which voice frames are skipped (stale + would delay input)
 
 const worldCache = new Map();   // map id -> collision world (shared by every net instance)
 function worldForMap(map) {
@@ -282,7 +292,7 @@ export function createNet(opts = {}) {
     // (v4) your team / spawn protection / carrying the enemy flag (from your own snapshots)
     team: '', protected: false, carrier: false,
     match: null,                 // see createMatchState (header: Modes, lobby, maps)
-    voice: { enabled: false, ice: [] },   // (v5) see header (Voice chat signaling)
+    voice: { enabled: false, ice: [], relay: false },   // (v5) see header (Voice chat signaling / Voice relay)
     memory: { enabled: false, host: null, lobby: '', loadout: '' },   // (v6) see header (Memory)
     playerCode: '',
   };
@@ -312,6 +322,7 @@ export function createNet(opts = {}) {
     replays: 0, replayedCmds: 0, maxReplay: 0, snaps: 0, maxVisualError: 0,
     cmdsSent: 0, packetsSent: 0, bytesUp: 0, bytesDown: 0, remoteShots: 0, predictedShots: 0,
     connects: 0,
+    voiceIn: 0, voiceOut: 0, voiceSkipped: 0,   // voice relay frames received / sent / skipped (socket backed up)
     corrWeapon: 0,               // corrections where only the weapon state differed (ammo/cooldown/aim/heat)
     // instrumentation (measurement only)
     corrSum: 0, corrBig: 0, corrMax: 0, corrPos: 0,   // corrections: summed size, > 10 cm, max, with position error
@@ -513,6 +524,8 @@ export function createNet(opts = {}) {
     }
     if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
       stats.bytesDown += data.byteLength;
+      const u8 = data instanceof ArrayBuffer ? new Uint8Array(data, 0, Math.min(1, data.byteLength)) : data;
+      if (u8.length && u8[0] === MSG.VOICE) { onVoiceFrame(data); return; }
       onSnapshot(data);
     }
   }
@@ -539,7 +552,7 @@ export function createNet(opts = {}) {
   function rosterEntry(p) {
     return { id: p.id | 0, name: String(p.name || ''), bot: !!p.bot, kills: p.kills | 0, deaths: p.deaths | 0, ping: p.ping | 0,
       lo: Number.isInteger(p.lo) ? sanitizeLoadoutCode(p.lo) : DEFAULT_LOADOUT_CODE, team: teamOf(p.team), obj: p.obj | 0,
-      mic: p.mic === true, deaf: p.deaf === true };
+      mic: p.mic === true, deaf: p.deaf === true, relay: p.relay === true };
   }
 
   function applyRows(rows) {
@@ -696,7 +709,25 @@ export function createNet(opts = {}) {
   function returnToLobby() { sendText(encodeReturnToLobby()); }
   // (v5) voice signaling
   function sendRtc(to, d) { if (st.connected) sendText(encodeRtc(to, d)); }
-  function sendVoiceState(mic, deaf) { if (st.connected) sendText(encodeVoiceState(mic, deaf)); }
+  function sendVoiceState(mic, deaf, relay) { if (st.connected) sendText(encodeVoiceState(mic, deaf, st.voice.relay ? relay : undefined)); }
+  // voice relay
+  const vframe = { from: 0, seq: 0, payload: null };
+  function onVoiceFrame(data) {
+    const f = decodeVoiceRelay(data, vframe);
+    if (!f || !st.connected || !st.voice.relay || f.from === st.id) return;
+    stats.voiceIn++;
+    emit('voiceframe', f);
+  }
+  function sendVoiceFrame(targets, seq, payload) {
+    if (!st.connected || !st.voice.relay || !isOpen()) return false;
+    if ((ws.bufferedAmount || 0) > VOICE_MAX_BUFFERED) { stats.voiceSkipped++; return false; }
+    const pkt = encodeVoiceFrame(targets, seq, payload);
+    if (!pkt) return false;
+    ws.send(pkt);
+    stats.voiceOut++; stats.bytesUp += pkt.byteLength;
+    return true;
+  }
+  function sendVoiceStat(s) { if (st.connected && st.voice.relay) sendText(encodeVoiceStat(s)); }
 
   function onText(m) {
     switch (m.t) {
@@ -706,7 +737,8 @@ export function createNet(opts = {}) {
         st.id = m.id | 0;
         st.roomName = String(m.room || '');
         st.mapName = String(m.map || '');
-        st.voice = { enabled: m.voice === true, ice: m.voice === true && Array.isArray(m.ice) ? m.ice : [] };
+        st.voice = { enabled: m.voice === true, ice: m.voice === true && Array.isArray(m.ice) ? m.ice : [],
+          relay: m.voice === true && m.voiceRelay === VOICE_RELAY_VERSION };
         st.memory = { enabled: m.memory === true, host: null, lobby: '', loadout: '' };
         for (const p of m.players || []) st.roster.set(p.id, rosterEntry(p));
         if (m.round) { st.round.phase = m.round.phase; st.round.endsTick = m.round.endsTick; st.round.winner = 0; }
@@ -854,8 +886,8 @@ export function createNet(opts = {}) {
       }
       case 'voice': {
         const e = st.roster.get(m.id);
-        if (e) { e.mic = m.mic === true; e.deaf = m.deaf === true; }
-        emit('voice', { id: m.id | 0, mic: m.mic === true, deaf: m.deaf === true });
+        if (e) { e.mic = m.mic === true; e.deaf = m.deaf === true; e.relay = m.relay === true; }
+        emit('voice', { id: m.id | 0, mic: m.mic === true, deaf: m.deaf === true, relay: m.relay === true });
         return;
       }
       case 'error': st.lastError = m.message || m.code; emit('error', m);
@@ -1359,7 +1391,7 @@ export function createNet(opts = {}) {
 
   const api = {
     on, off, connect, close, retryNow, setLoadout,
-    setMatchConfig, startMatch, switchTeam, returnToLobby, sendRtc, sendVoiceState,
+    setMatchConfig, startMatch, switchTeam, returnToLobby, sendRtc, sendVoiceState, sendVoiceFrame, sendVoiceStat,
     tick, sampleRemotes, remoteEye, decayError, localView,
     serverTick, renderTick,
     get state() { return st; },
