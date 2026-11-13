@@ -25,8 +25,10 @@
 //              highest score wins. TIES: team modes -> a draw (winner null). FFA -> the player
 //              with more kills, then fewer deaths wins; still equal -> a draw.
 //
-// sanitizeMatchConfig(input, prev?) -> a complete, valid config:
-//   { mode, mapId, bots: { fill }, coop, timeLimitS, scoreLimit }
+// sanitizeMatchConfig(input, prev?, opts?) -> a complete, valid config:
+//   { mode, mapId, bots: { fill, level }, coop, timeLimitS, scoreLimit }
+//   - bots.level 'easy' | 'normal' | 'hard', or (v6) 'ai' only when opts.allowAi (the server's
+//                optional memory layer is on); otherwise 'ai' becomes 'hard'
 //   - mode       one of MODE_IDS (unknown -> prev.mode -> 'ffa')
 //   - mapId      one of MAP_IDS (unknown -> prev.mapId -> DEFAULT_MAP_ID)
 //   - bots.fill  0..MAX_PLAYERS: bots are added until there are `fill` participants (0 = no
@@ -82,6 +84,13 @@ export function otherTeam(t) { return t === 'a' ? 'b' : t === 'b' ? 'a' : ''; }
 /** Bot difficulty. 'hard' is the original tuning. */
 export const BOT_LEVELS = ['easy', 'normal', 'hard'];
 export const DEFAULT_BOT_LEVEL = 'hard';
+/**
+ * (v6) AI bots: a separate bot category that adapts to each human opponent and remembers who beat
+ * it (server/memory). Only valid while the server's optional memory layer is on: sanitizeMatchConfig
+ * downgrades it to 'hard' unless opts.allowAi is true (the server passes its flag, the client the
+ * welcome's `memory`). The three BOT_LEVELS never adapt.
+ */
+export const AI_BOT_LEVEL = 'ai';
 
 export function defaultMatchConfig(mode = DEFAULT_MODE, mapId = DEFAULT_MAP_ID) {
   const m = MODES[mode] || MODES[DEFAULT_MODE];
@@ -92,7 +101,9 @@ export function defaultMatchConfig(mode = DEFAULT_MODE, mapId = DEFAULT_MAP_ID) 
 function int(v) { return typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : null; }
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-export function sanitizeMatchConfig(input, prev) {
+export function sanitizeMatchConfig(input, prev, opts) {
+  const allowAi = !!(opts && opts.allowAi);
+  const okLevel = (l) => BOT_LEVELS.includes(l) || (allowAi && l === AI_BOT_LEVEL);
   const base = prev && typeof prev === 'object' ? prev : null;
   const src = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const prevMode = base && MODES[base.mode] ? base.mode : DEFAULT_MODE;
@@ -107,7 +118,11 @@ export function sanitizeMatchConfig(input, prev) {
   if (fill === null) fill = base && base.bots ? int(base.bots.fill) : 0;
   fill = clamp(fill ?? 0, 0, MAX_PLAYERS);
   let level = src.bots && typeof src.bots === 'object' ? src.bots.level : undefined;
-  if (!BOT_LEVELS.includes(level)) level = base && base.bots && BOT_LEVELS.includes(base.bots.level) ? base.bots.level : DEFAULT_BOT_LEVEL;
+  if (level === AI_BOT_LEVEL && !allowAi) level = 'hard';          // memory off: AI bots fall back to Hard
+  if (!okLevel(level)) {
+    const pl = base && base.bots ? base.bots.level : undefined;
+    level = okLevel(pl) ? pl : pl === AI_BOT_LEVEL ? 'hard' : DEFAULT_BOT_LEVEL;
+  }
 
   let coop = typeof src.coop === 'boolean' ? src.coop : !!(base && base.coop);
   if (!M.teams) coop = false;

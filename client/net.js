@@ -87,6 +87,14 @@
 //   net.sendVoiceState(mic, deaf)
 //   events: 'rtc' ({ from, d })  d already passed protocol.sanitizeSignal
 //           'voice' ({ id, mic, deaf })   a player's voice state changed (roster updated first)
+//
+// Memory (protocol v6, optional on the server):
+//   net.connect(name, room, { bots, playerCode })   playerCode = the secret player code (main.js keeps
+//                                it in localStorage); sent with every join, used only by a server with memory on
+//   net.state.memory = { enabled, host, lobby, loadout }   enabled from the welcome; host / lobby /
+//                                loadout = the latest suggestions ('memory' message; null / '' = none)
+//   event 'memory' (state.memory) whenever enabled or a suggestion changes. With memory on the
+//   config sanitiser allows bots.level 'ai'.
 
 import { INTERP_DELAY_MS, INTERP_DELAY_MAX_MS, MAX_DILATION_PERMILLE, BTN, BTN_MASK as BTN_MASK_NET, PLAYER, TICK_RATE } from '../shared/constants.js';
 import { getMap, DEFAULT_MAP_ID } from '../shared/maps/index.js';
@@ -275,6 +283,8 @@ export function createNet(opts = {}) {
     team: '', protected: false, carrier: false,
     match: null,                 // see createMatchState (header: Modes, lobby, maps)
     voice: { enabled: false, ice: [] },   // (v5) see header (Voice chat signaling)
+    memory: { enabled: false, host: null, lobby: '', loadout: '' },   // (v6) see header (Memory)
+    playerCode: '',
   };
   st.match = createMatchState();
 
@@ -376,6 +386,7 @@ export function createNet(opts = {}) {
     if (name !== undefined) st.name = String(name);
     if (room !== undefined) st.room = room ? String(room) : '';
     if (joinOpts !== undefined) st.bots = joinOpts && Number.isFinite(joinOpts.bots) ? joinOpts.bots : undefined;
+    if (joinOpts && typeof joinOpts.playerCode === 'string') st.playerCode = joinOpts.playerCode;
     wantConnected = true;
     st.reconnectAttempt = 0;
     clearTimeout(reconnectTimer); reconnectTimer = null;
@@ -404,7 +415,7 @@ export function createNet(opts = {}) {
       if (ws !== sock) return;
       setStatus('joining');
       lastMsgAt = now();
-      sendText(encodeJoin(st.name, st.room || undefined, st.bots, st.loadout.pendingCode));
+      sendText(encodeJoin(st.name, st.room || undefined, st.bots, st.loadout.pendingCode, st.playerCode || undefined));
     };
     sock.onmessage = (ev) => {
       if (ws !== sock) return;
@@ -577,7 +588,7 @@ export function createNet(opts = {}) {
   function applyMatch(m, silent) {
     const M = st.match, prev = M.phase;
     if (typeof m.phase === 'string') M.phase = m.phase;
-    if (m.config && typeof m.config === 'object') M.config = sanitizeMatchConfig(m.config, M.config);
+    if (m.config && typeof m.config === 'object') M.config = sanitizeMatchConfig(m.config, M.config, { allowAi: st.memory.enabled });
     M.mode = M.config.mode; M.modeInfo = MODES[M.mode]; M.teams = isTeamMode(M.mode);
     M.scoreLimit = M.config.scoreLimit; M.timeLimitS = M.config.timeLimitS;
     M.private = !!m.private;
@@ -673,7 +684,7 @@ export function createNet(opts = {}) {
    * sanitised config that will be requested (the server's 'match' reply is authoritative).
    */
   function setMatchConfig(partial) {
-    const full = sanitizeMatchConfig(partial, { ...st.match.config, ...(cfgPending || {}) });
+    const full = sanitizeMatchConfig(partial, { ...st.match.config, ...(cfgPending || {}) }, { allowAi: st.memory.enabled });
     cfgPending = full;
     const wait = CONFIG_GAP_MS - (now() - cfgSentAt);
     if (wait <= 0) flushConfig();
@@ -696,6 +707,7 @@ export function createNet(opts = {}) {
         st.roomName = String(m.room || '');
         st.mapName = String(m.map || '');
         st.voice = { enabled: m.voice === true, ice: m.voice === true && Array.isArray(m.ice) ? m.ice : [] };
+        st.memory = { enabled: m.memory === true, host: null, lobby: '', loadout: '' };
         for (const p of m.players || []) st.roster.set(p.id, rosterEntry(p));
         if (m.round) { st.round.phase = m.round.phase; st.round.endsTick = m.round.endsTick; st.round.winner = 0; }
         // (v4) match / lobby / objective state and the map to predict on
@@ -735,6 +747,7 @@ export function createNet(opts = {}) {
           }
         }, 1000);
         emit('welcome', m);
+        emit('memory', st.memory);
         selectMap(st.match.mapId, true);   // always tell the UI which map to build
         emit('match', st.match);
         emit('lobby', st.match.lobby);
@@ -755,6 +768,18 @@ export function createNet(opts = {}) {
         return;
       }
       case 'result': st.match.result = m; emit('result', m); return;
+      case 'memory': {
+        // (v6) suggestions; only a server with memory on sends these
+        if (!st.memory.enabled) return;
+        const txt = (v) => (typeof v === 'string' ? v.slice(0, 300) : '');
+        const h = m.host;
+        st.memory.host = h && typeof h === 'object' && typeof h.mode === 'string' && typeof h.mapId === 'string' && typeof h.text === 'string'
+          ? { mode: h.mode, mapId: h.mapId, text: txt(h.text) } : null;
+        st.memory.lobby = txt(m.lobby);
+        st.memory.loadout = txt(m.loadout);
+        emit('memory', st.memory);
+        return;
+      }
       case 'ev': emit('ev', m); return;
       case 'pong': onPong(m); return;
       case 'loadout': {

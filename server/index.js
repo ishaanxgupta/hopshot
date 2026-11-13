@@ -9,7 +9,15 @@
 //                    (default stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302)
 //   TURN_URLS        (v5 voice) comma-separated TURN urls (e.g. turn:relay.example.com:3478?transport=udp);
 //   TURN_USER, TURN_PASS  its credentials. Unset = STUN only (peers behind strict NATs cannot connect).
+//   (v6, optional long-term memory, server/memory; OFF by default)
+//   MEMORY_ENABLED        1 = on (needs SUPERMEMORY_API_KEY, or SUPERMEMORY_MOCK=1). Off = no network calls,
+//                         no AI bots, no suggestions: the game runs exactly as without it.
+//   SUPERMEMORY_API_KEY   Supermemory API key (only ever read from the environment; never logged)
+//   SUPERMEMORY_MOCK      1 = in-process mock store instead of the API (tests, offline)
+//   MEMORY_TAG_PREFIX     container tag prefix (default hopshot_player_; tests use hopshot_dev_test_...)
+//   A .env file in the project root is loaded at start if present (server/env.js; HOPSHOT_DOTENV=0 skips it).
 
+import './env.js';            // first: .env values must be visible to every module below
 import http from 'node:http';
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
@@ -23,6 +31,7 @@ import { Room, BOT_MIN } from './room.js';
 import { Bot } from './bots.js';
 import { MAPS } from '../shared/maps/index.js';
 import { serveStatic } from './static.js';
+import { memoryConfigFromEnv, createMemory } from './memory/index.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || undefined;
@@ -55,6 +64,8 @@ function buildIceServers() {
   return list;
 }
 const ICE_SERVERS = buildIceServers();
+const memoryCfg = memoryConfigFromEnv(process.env);
+const MEMORY = createMemory(memoryCfg);
 
 const startedAt = Date.now();
 const rooms = new Map();          // name -> Room
@@ -72,6 +83,7 @@ function createRoom(name, isPrivate, bots) {
     isPrivate,
     botMin: BOT_MIN,
     iceServers: ICE_SERVERS,
+    memory: MEMORY,
     config: isPrivate ? { bots: { fill: bots ?? BOT_MIN } } : undefined,
     onEmpty: (r) => {
       if (rooms.get(r.name) === r) rooms.delete(r.name);
@@ -118,6 +130,7 @@ function statusJson(reset) {
       bots: list.reduce((s, r) => s + r.bots, 0),
     },
     memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+    memory: MEMORY ? MEMORY.status() : { enabled: false },
     rooms: list,
   };
 }
@@ -134,7 +147,9 @@ const server = http.createServer((req, res) => {
         'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
       });
-      res.end(JSON.stringify({ ok: true, uptimeS: Math.round((Date.now() - startedAt) / 1000), rooms: rooms.size, humans }));
+      const h = { ok: true, uptimeS: Math.round((Date.now() - startedAt) / 1000), rooms: rooms.size, humans };
+      if (MEMORY) h.memory = true;          // (v6) the menu shows the Player code section only then
+      res.end(JSON.stringify(h));
       return;
     }
     if (url.pathname === '/status') {
@@ -269,7 +284,7 @@ function handleText(conn, msg) {
         ws.close(1008, 'room full');
         return;
       }
-      const p = room.addHuman(ws, name, msg.lo);
+      const p = room.addHuman(ws, name, msg.lo, MEMORY ? msg.pc : undefined);
       if (!p) {
         ws.send(encodeText({ t: 'error', code: 'room_full', message: 'room is full' }));
         ws.close(1008, 'room full');
@@ -347,14 +362,18 @@ function shutdown() {
   for (const r of rooms.values()) r.destroy();
   for (const ws of wss.clients) ws.terminate();
   wss.close();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 500).unref();
+  // queued memory writes (match summaries) get a moment to finish
+  const wait = MEMORY ? Promise.race([MEMORY.flush(), new Promise((r) => setTimeout(r, 2500))]) : Promise.resolve();
+  wait.then(() => server.close(() => process.exit(0)));
+  setTimeout(() => process.exit(0), MEMORY ? 3000 : 500).unref();
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 server.listen(PORT, HOST, () => {
   log(`Hopshot server on http://${HOST || 'localhost'}:${PORT}  (ws path /ws, bots min ${BOT_MIN})`);
+  if (memoryCfg && memoryCfg.error) log(memoryCfg.error);
+  else if (MEMORY) log(`memory on (${MEMORY.kind === 'mock' ? 'in-process mock store' : 'Supermemory v5 API'}, tag prefix ${memoryCfg.prefix}): AI bots + suggestions`);
   // bot navigation for every map, built in small chunks so the first match never stalls a tick
   const t0 = performance.now();
   Bot.prewarm(MAPS).then(() => log(`bot navigation ready for ${MAPS.length} maps (${Math.round(performance.now() - t0)} ms)`));

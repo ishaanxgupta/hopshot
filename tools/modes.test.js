@@ -470,7 +470,7 @@ function testCost() {
 let server = null;
 async function startServer() {
   server = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '600', RESULTS_MS: '1500', PUBLIC_COUNTDOWN_MS: '300' },
+    env: { ...process.env, HOPSHOT_DOTENV: process.env.HOPSHOT_DOTENV || '0', PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '600', RESULTS_MS: '1500', PUBLIC_COUNTDOWN_MS: '300' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});

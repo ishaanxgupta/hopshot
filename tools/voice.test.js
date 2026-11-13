@@ -29,7 +29,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let server = null;
 async function startServer() {
   server = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '300', TURN_URLS: 'turn:relay.test:3478', TURN_USER: 'u1', TURN_PASS: 'p1' },
+    env: { ...process.env, HOPSHOT_DOTENV: process.env.HOPSHOT_DOTENV || '0', PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '300', TURN_URLS: 'turn:relay.test:3478', TURN_USER: 'u1', TURN_PASS: 'p1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});

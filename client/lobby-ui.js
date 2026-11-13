@@ -3,7 +3,10 @@
 //
 //   const lobby = createLobby(hostEl, { touch, onConfig(partial) -> requested config, onStart(), onTeam(team),
 //                                       onLoadout(), onMenu() });
-//   lobby.update(match, ctx)   match = net.state.match, ctx = { selfId, inviteUrl, inviteNote, code }
+//   lobby.update(match, ctx)   match = net.state.match, ctx = { selfId, inviteUrl, inviteNote, code, memory }
+//                              (v6) memory = net.state.memory: when enabled, the bot difficulty gets a
+//                              fourth option "AI", the host sees memory.host (a suggested mode + map with
+//                              its reason; tap = apply) and everybody sees memory.lobby (one personal tip)
 //                              (cheap: DOM is touched only when something changed)
 //   lobby.notice(text)         a short toast (rejected request, ...)
 //   lobby.attachVoice(voice)   (voice chat, private rooms) mic + speaker buttons in the header, a
@@ -94,6 +97,7 @@ const ICON = {
   clock: SVG('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>', 18),
   goal: SVG('<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/>', 18),
   swap: SVG('<path d="M4 8h14l-3-3M20 16H6l3 3"/>', 16),
+  spark: SVG('<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/>', 16),
   crown: '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M2.5 8l4.8 4.2L12 4.5l4.7 7.7L21.5 8 19.6 19.5H4.4z"/></svg>',
   botGlyph: SVG('<rect x="5" y="8.5" width="14" height="10" rx="3"/><path d="M12 8.5V5"/><circle cx="9.3" cy="13.5" r="1.1" fill="currentColor"/><circle cx="14.7" cy="13.5" r="1.1" fill="currentColor"/>', 20),
 };
@@ -149,6 +153,10 @@ export function createLobby(host, o = {}) {
           <div class="lb-modehead"><h2 class="lb-title"></h2><p class="lb-rule"></p></div>
           <div class="lb-modes" role="group" aria-label="Mode"></div>
           <div class="lb-roster-wrap"><div class="lb-roster"></div><button type="button" class="lb-swap">${ICON.swap}<span></span></button></div>
+          <div class="lb-tips">
+            <button type="button" class="lb-sug" hidden>${ICON.spark}<span><b></b><em></em></span></button>
+            <p class="lb-tip" hidden>${ICON.spark}<span></span></p>
+          </div>
           <div class="lb-chips">
             <button type="button" class="lb-chip" data-k="bots">${ICON.bot}<span></span></button>
             <button type="button" class="lb-chip" data-k="time">${ICON.clock}<span></span></button>
@@ -163,7 +171,7 @@ export function createLobby(host, o = {}) {
       <div class="lb-pop" data-k="bots" role="dialog">
         <div class="lb-seg" role="group" aria-label="Bots"><button type="button" data-b="off">Off</button><button type="button" data-b="fill">Fill</button><button type="button" data-b="coop">Co-op</button></div>
         <div class="lb-step lb-botn"><button type="button" data-d="-1" aria-label="Fewer bots">&minus;</button><output></output><button type="button" data-d="1" aria-label="More bots">+</button></div>
-        <div class="lb-seg lb-lvl" role="group" aria-label="Bot difficulty"><button type="button" data-l="easy">Easy</button><button type="button" data-l="normal">Normal</button><button type="button" data-l="hard">Hard</button></div>
+        <div class="lb-seg lb-lvl" role="group" aria-label="Bot difficulty"><button type="button" data-l="easy">Easy</button><button type="button" data-l="normal">Normal</button><button type="button" data-l="hard">Hard</button><button type="button" data-l="ai" class="lb-ai" title="AI bots adapt to each player" hidden>AI</button></div>
       </div>
       <div class="lb-pop" data-k="time" role="dialog"><div class="lb-step lb-time"><button type="button" data-d="-1" aria-label="Shorter">&minus;</button><output></output><button type="button" data-d="1" aria-label="Longer">+</button></div></div>
       <div class="lb-pop" data-k="score" role="dialog"><div class="lb-step lb-score"><button type="button" data-d="-1" aria-label="Lower">&minus;</button><output></output><button type="button" data-d="1" aria-label="Higher">+</button></div></div>
@@ -180,7 +188,7 @@ export function createLobby(host, o = {}) {
     hero: $('.lb-hero'), herocv: $('.lb-herocv'), heroName: $('.lb-heroname b'), heroSize: $('.lb-heroname span'),
     title: $('.lb-title'), rule: $('.lb-rule'), modes: $('.lb-modes'), roster: $('.lb-roster'), sw: $('.lb-swap'), swT: $('.lb-swap span'),
     chips: $('.lb-chips'), maps: $('.lb-maps'), start: $('.lb-start'), startT: $('.lb-start b'), startH: $('.lb-start i'), toast: $('.lb-toast'),
-    seg: $('.lb-seg'), lvl: $('.lb-lvl'), botn: $('.lb-botn'), botnOut: $('.lb-botn output'), time: $('.lb-time'), timeOut: $('.lb-time output'), score: $('.lb-score'), scoreOut: $('.lb-score output'),
+    seg: $('.lb-seg'), lvl: $('.lb-lvl'), ai: $('.lb-ai'), sug: $('.lb-sug'), sugT: $('.lb-sug b'), sugW: $('.lb-sug em'), tip: $('.lb-tip'), tipT: $('.lb-tip span'), botn: $('.lb-botn'), botnOut: $('.lb-botn output'), time: $('.lb-time'), timeOut: $('.lb-time output'), score: $('.lb-score'), scoreOut: $('.lb-score output'),
   };
   const chipBtn = {};
   for (const b of el.chips.children) chipBtn[b.dataset.k] = b;
@@ -317,6 +325,8 @@ export function createLobby(host, o = {}) {
   el.menu.addEventListener('click', () => { if (o.onMenu) o.onMenu(); });
   el.start.addEventListener('click', () => { if (!el.start.disabled && o.onStart) o.onStart(); });
   el.sw.addEventListener('click', () => { if (el.sw.dataset.t && o.onTeam) o.onTeam(el.sw.dataset.t); });
+  // (v6) the host's suggested mode + map: one tap applies it
+  el.sug.addEventListener('click', () => { const h = el.sug._h; if (h && isHost) edit({ mode: h.mode, mapId: h.mapId }); });
   // keep the map strip scrolled to the selected thumbnail (2-10 maps; the strip scrolls sideways)
   function revealMap(id) {
     const b = mapBtns[id];
@@ -433,7 +443,9 @@ export function createLobby(host, o = {}) {
     // setting chips (+ their popover editors)
     const bmode = c.bots.fill <= 0 ? 'off' : c.coop ? 'coop' : 'fill';
     const lvl = c.bots.level || 'hard';
-    set('cb', chipBtn.bots.lastChild, bmode === 'off' ? 'No bots' : (bmode === 'coop' ? 'Co-op ' : 'Bots ') + c.bots.fill + ' · ' + lvl[0].toUpperCase() + lvl.slice(1));
+    const mem = ctx.memory && ctx.memory.enabled ? ctx.memory : null;
+    el.ai.hidden = !mem;
+    set('cb', chipBtn.bots.lastChild, bmode === 'off' ? 'No bots' : (bmode === 'coop' ? 'Co-op ' : 'Bots ') + c.bots.fill + ' · ' + (lvl === 'ai' ? 'AI' : lvl[0].toUpperCase() + lvl.slice(1)));
     for (const b of el.lvl.children) {
       cls('bl' + b.dataset.l, b, 'on', b.dataset.l === lvl);
       b.disabled = !isHost || bmode === 'off';
@@ -452,6 +464,7 @@ export function createLobby(host, o = {}) {
     set('score', el.scoreOut, scoreTxt);
 
     renderPlayers(c);
+    renderTips(c, mem);
     const canSwitch = M.teams && !c.coop && (M.myTeam === 'a' || M.myTeam === 'b');
     cls('swOn', el.sw, 'on', canSwitch);
     if (canSwitch) {
@@ -468,6 +481,25 @@ export function createLobby(host, o = {}) {
     set('why', el.startH, isHost ? why : '');
     cls('hasWhy', el.start, 'why', isHost && !!why);
     if (openKey) syncPop();
+  }
+
+  // ---- (v6) suggestions: calm, small, only what the server derived from recorded history ----
+  function renderTips(c, mem) {
+    const h = mem && isHost && mem.host && !(mem.host.mode === c.mode && mem.host.mapId === c.mapId) && MODES[mem.host.mode] && MAPS.some((m) => m.id === mem.host.mapId) ? mem.host : null;
+    el.sug._h = h;
+    const hk = h ? h.mode + '|' + h.mapId + '|' + h.text : '';
+    if (last.sug !== hk) {
+      last.sug = hk;
+      el.sug.hidden = !h;
+      if (h) {
+        const map = MAPS.find((m) => m.id === h.mapId);
+        el.sugT.textContent = 'Try ' + MODES[h.mode].name + ' on ' + map.name;
+        el.sugW.textContent = h.text;
+        el.sug.title = 'Tap to use ' + MODES[h.mode].name + ' on ' + map.name;
+      }
+    }
+    set('tip', el.tipT, mem && mem.lobby ? mem.lobby : '');
+    el.tip.hidden = !(mem && mem.lobby);
   }
 
   // ---- voice chat (private rooms) ----

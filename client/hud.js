@@ -22,6 +22,9 @@ import { createLobby, copyToClipboard, VOICE_ICON, micLabel } from './lobby-ui.j
 // frame (button state, a speaking wave next to talking players' name tags, scoreboard voice cells),
 // voiceNotice(text) (short toast under the buttons), setBoardHint(text) (a line under the scoreboard).
 // The scoreboard rows (rendered by matchhud.js) get a Voice cell: speaking wave + per-player mute + volume.
+// Memory (v6, only when the server has it on): setPlayerCode({ enabled, code, onUse(code) -> message })
+// shows a "Player code" settings group (masked code + Copy, paste a code from another device);
+// setLoadoutTip(text) puts one history-based line in the Loadout tab ('' hides it).
 
 const MAX_FEED = 6;
 const FEED_MS = 5500;
@@ -619,12 +622,51 @@ export function createHud(rootEl, hudOpts = {}) {
   }
   buildSettings();
 
+  // ---- (v6) player code: the memory identity, copy / paste between devices (hidden unless memory is on)
+  const pc = document.createElement('details');
+  pc.className = 'hs-sgroup hs-pcode';
+  pc.hidden = true;
+  pc.innerHTML = `<summary>Player code</summary><div class="hs-sbody">
+      <p class="hs-linknote">Your history on this server (AI bots tune to you, the lobby can suggest maps) is tied to this code. Copy it to play on another device. Clearing your browser data without saving it loses your history.</p>
+      <div class="hs-pcrow"><input type="password" class="hs-pcval" readonly spellcheck="false" autocomplete="off" aria-label="Your player code" /><button type="button" class="hs-btn hs-pcshow">Show</button><button type="button" class="hs-btn hs-pccopy">Copy</button></div>
+      <div class="hs-row"><input type="text" class="hs-pcin" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Paste a code from another device" aria-label="Use a player code" /><button type="button" class="hs-btn hs-pcuse">Use</button></div>
+      <p class="hs-linknote hs-pcmsg" role="status"></p>
+    </div>`;
+  setHost.appendChild(pc);
+  pc.addEventListener('toggle', () => { if (pc.open) for (const o of setHost.querySelectorAll('.hs-sgroup')) if (o !== pc) o.open = false; });
+  for (const o of setHost.querySelectorAll('.hs-sgroup')) if (o !== pc) o.addEventListener('toggle', () => { if (o.open) pc.open = false; });
+  const pcEl = { val: pc.querySelector('.hs-pcval'), show: pc.querySelector('.hs-pcshow'), copy: pc.querySelector('.hs-pccopy'), inp: pc.querySelector('.hs-pcin'), use: pc.querySelector('.hs-pcuse'), msg: pc.querySelector('.hs-pcmsg') };
+  let pcInfo = null;
+  function setPlayerCode(info) {
+    pcInfo = info || null;
+    const on = !!(pcInfo && pcInfo.enabled && pcInfo.code);
+    pc.hidden = !on;
+    if (on && pcEl.val.value !== pcInfo.code) pcEl.val.value = pcInfo.code;
+  }
+  pcEl.show.addEventListener('click', () => { const hid = pcEl.val.type === 'password'; pcEl.val.type = hid ? 'text' : 'password'; pcEl.show.textContent = hid ? 'Hide' : 'Show'; });
+  pcEl.copy.addEventListener('click', async () => {
+    const t = pcEl.val.type; pcEl.val.type = 'text';
+    const ok = await copyToClipboard(pcEl.val.value, pcEl.val);
+    pcEl.val.type = t;
+    pcEl.msg.textContent = ok ? 'Copied. Keep it somewhere safe - anyone with it plays as you.' : 'Select the code and copy it.';
+  });
+  pcEl.use.addEventListener('click', () => {
+    if (!pcInfo || !pcInfo.onUse) return;
+    pcEl.msg.textContent = pcInfo.onUse(pcEl.inp.value.trim()) || '';
+    pcEl.inp.value = '';
+  });
+  for (const inp of [pcEl.val, pcEl.inp]) {
+    inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (inp === pcEl.inp && e.key === 'Enter') pcEl.use.click(); });
+    inp.addEventListener('keyup', (e) => e.stopPropagation());
+  }
+
   // ---- loadout editor (the Loadout tab) ----
   const editor = createLoadoutEditor($('.hs-loadout'), {
     onChange(v) { if (menuCb && menuCb.loadout && menuCb.loadout.onChange) menuCb.loadout.onChange(v); },
     onPlay() { play(); },
   });
   function setLoadoutStatus(st) { editor.setStatus(st); }
+  function setLoadoutTip(text) { editor.setTip(text); }
 
   // ---- tabs ----
   const tabBtns = Array.from(rootEl.querySelectorAll('.hs-tabs button'));
@@ -739,5 +781,5 @@ export function createHud(rootEl, hudOpts = {}) {
   }
 
   return { update, setLoadoutStatus, addKill, hitmarker, damageFrom, setScoreboard, showMenu, hideMenu, setPrefs, setInGame, setInvite, setServer, setWake, setStatus, setTab, match, lobby,
-    attachVoice, voiceFrame, voiceNotice, setBoardHint };
+    attachVoice, voiceFrame, voiceNotice, setBoardHint, setPlayerCode, setLoadoutTip };
 }

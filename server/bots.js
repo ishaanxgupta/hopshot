@@ -16,6 +16,12 @@
 //   hardpoint  go to the active zone and hold it (wander inside it); fight while moving.
 // Only enemies are scanned / targeted (friendly fire is off anyway). Fighting never stops a
 // bot from moving towards its goal: it aims at the target while strafing along the route.
+//
+// AI bots (level 'ai', only with the optional memory layer; server/memory/ai.js): the same brain,
+// but the tuning comes from the OPPONENT: lv(q) is q.aiL (the human's adaptive parameters) or the
+// room's bot-vs-bot tuning, and a grudge (room.mem.grudge(name, q)) raises q's target priority,
+// lengthens the chase and sends an idle bot to q's last known position. Easy / Normal / Hard bots
+// never take these paths (this.ai is null for them).
 
 import { BTN } from '../shared/constants.js';
 import { encodeLoadout, displayStats } from '../shared/weapons.js';
@@ -37,11 +43,12 @@ const TURN_COMBAT = 0.3;
 //   decay: how fast the initial aim error closes (closer to 1 = slower)
 //   sway:  constant aim wobble (rad); turn: max aim turn per tick in combat
 //   view:  sight range (m); burst: fraction of the time an auto gun keeps firing
-const BOT_LEVEL = {
+export const BOT_LEVEL = {
   easy:   { skill: 0.45, decay: 0.992, sway: 0.05,  turn: 0.14, view: 40, burst: 0.45 },
   normal: { skill: 0.7,  decay: 0.985, sway: 0.028, turn: 0.2,  view: 55, burst: 0.75 },
   hard:   { skill: 1,    decay: 0.97,  sway: 0.012, turn: TURN_COMBAT, view: VIEW_RANGE, burst: 1 },
 };
+const HUNT_FRESH_TICKS = 60 * 15;   // AI bots hunt a grudge target's last known position this long
 function levelOf(room) {
   const l = room && room.config && room.config.bots && room.config.bots.level;
   return BOT_LEVEL[l] || BOT_LEVEL.hard;
@@ -113,6 +120,10 @@ export class Bot {
   }
 
   static pickName(room) {
+    if (room.mem && room.config.bots.level === 'ai') {
+      const n = room.mem.pickBotName();     // AI bots: names that hold grudges against the humans here come back
+      if (n) return n;
+    }
     const used = new Set(room.players.map((p) => p.name));
     const free = NAMES.filter((n) => !used.has(n));
     return free.length ? free[Math.floor(Math.random() * free.length)] : `Bot${Math.floor(Math.random() * 1000)}`;
@@ -169,7 +180,11 @@ export class Bot {
     this.stuck = 0; this.unstickUntil = 0; this.unstickDir = 1;
     this.slideTicks = 0;
     this.weapon = 0;
-    this.skill = rnd(0.6, 1.0);
+    // AI bots: the room's memory state (null for every other level); fixedLevel: tests only
+    this.ai = room.mem && room.config && room.config.bots && room.config.bots.level === 'ai' ? room.mem : null;
+    this.fixedLevel = null;
+    this.skill = this.ai ? rnd(0.92, 1.0) : rnd(0.6, 1.0);     // AI bots: little per-bot luck, the opponent decides
+    this.lostLimit = 40;
     this.firePulse = false;
     // goal: { key } (flow field) | { pos, path, i } (A* / straight) ; hold = wander radius at goal
     this.goal = null;
@@ -181,6 +196,12 @@ export class Bot {
   }
 
   get nav() { return getNav(this.room.map); }
+
+  /** Tuning used against opponent q (AI bots: q's adaptive parameters; else the room level). */
+  lv(q) {
+    if (this.ai) return (q && q.aiL) || this.ai.botL;
+    return this.fixedLevel || levelOf(this.room);
+  }
 
   /** Called by the room right before a respawn applies the pending loadout. */
   beforeSpawn() {
@@ -211,7 +232,9 @@ export class Bot {
     if (this.target === q) { this.lostTicks = 0; return; }
     this.target = q;
     this.lostTicks = 0;
-    const sk = this.skill * levelOf(this.room).skill;
+    // AI bots chase a grudge target longer before giving up on it
+    this.lostLimit = this.ai ? 40 + Math.round(45 * Math.min(2, this.ai.grudge(this.p.name, q))) : 40;
+    const sk = this.skill * this.lv(q).skill;
     this.reactAt = tick + Math.round(rnd(15, 27) / sk);   // 250-450 ms on hard (slower for weaker bots)
     const e = rnd(0.05, 0.12) / sk;
     this.errYaw = Math.random() < 0.5 ? -e : e;
@@ -228,31 +251,35 @@ export class Bot {
     const tx = q.state.x, ty = q.state.y + hitboxHeight(q.state) * 0.7, tz = q.state.z;
     let dx = tx - ex, dy = ty - ey, dz = tz - ez;
     const d = Math.hypot(dx, dy, dz);
-    if (d > levelOf(this.room).view || d < 1e-3) return d < 1e-3;
+    if (d > this.lv(q).view || d < 1e-3) return d < 1e-3;
     dx /= d; dy /= d; dz /= d;
     return raycastWorld(this.room.world, ex, ey, ez, dx, dy, dz, d, undefined) >= d - 0.3;
   }
 
   scan(tick) {
-    const me = this.p;
+    const me = this.p, ai = this.ai;
     let best = null, bestD = Infinity;
     for (const q of this.room.players) {
       if (!this.isEnemy(q)) continue;
       const dx = q.state.x - me.state.x, dz = q.state.z - me.state.z;
       let d = dx * dx + dz * dz;
       if (q.carrying) d *= 0.25;                         // flag carriers first
-      if (d >= bestD || d > levelOf(this.room).view ** 2) continue;
+      let pr = d;                                        // priority (smaller first)
+      if (ai && !q.bot) { const f = ai.grudgeFactor(me.name, q); pr = d / (f * f); }   // AI bots: grudge targets first
+      if (pr >= bestD || d > this.lv(q).view ** 2) continue;
       // rough field of view (about 200 degrees) unless very close
       const ang = Math.abs(wrapAngle(Math.atan2(-dx, -dz) - this.yaw));
       if (ang > 1.75 && d > 36) continue;
       if (!this.canSee(q)) continue;
-      best = q; bestD = d;
+      best = q; bestD = pr;
     }
-    if (best) this.acquire(best, tick);
-    else if (this.target) {
+    if (best) {
+      this.acquire(best, tick);
+      if (ai && !best.bot) ai.seen(best, tick);
+    } else if (this.target) {
       if (!this.isEnemy(this.target) || this.room.byId.get(this.target.id) !== this.target || !this.canSee(this.target)) {
         this.lostTicks += SCAN_EVERY;
-        if (this.lostTicks > 40 || !this.target.alive) this.target = null;
+        if (this.lostTicks > this.lostLimit || !this.target.alive) this.target = null;
       }
     }
   }
@@ -286,6 +313,15 @@ export class Bot {
       const cx = (z.min[0] + z.max[0]) / 2, cz = (z.min[2] + z.max[2]) / 2;
       this.setField(`hp:${room.hp.index}`, { x: cx, z: cz, rx: (z.max[0] - z.min[0]) / 2 - 0.6, rz: (z.max[2] - z.min[2]) / 2 - 0.6, y: z.min[1] });
       return;
+    }
+    // AI bots (ffa / tdm): with a grudge and nothing in sight, hunt that player's last known position
+    if (this.ai && (mode === 'ffa' || mode === 'tdm')) {
+      const hg = this.goal;
+      if (hg && hg.hunt && tick < this.goalUntil && Math.hypot(hg.pos[0] - st.x, hg.pos[2] - st.z) > 3) return;
+      if (!this.target) {
+        const h = this.ai.huntTarget(this, tick, HUNT_FRESH_TICKS);
+        if (h) { this.setPos(h.x, h.y, h.z, null); this.goal.hunt = true; this.goalUntil = tick + 60 * 8; return; }
+      }
     }
     // roam
     const pts = roamPoints(room.map);
@@ -454,7 +490,7 @@ export class Bot {
       const ex = st.x, ey = st.y + eyeHeight(st), ez = st.z;
       const tx = t.state.x - ex, ty = t.state.y + hitboxHeight(t.state) * 0.72 - ey, tz = t.state.z - ez;
       const hd = Math.hypot(tx, tz);
-      const L = levelOf(this.room);
+      const L = this.lv(t);
       const wantYaw = Math.atan2(-tx, -tz) + this.errYaw + Math.sin(tick * 0.11 + p.id) * L.sway;
       const wantPitch = Math.atan2(ty, hd) + this.errPitch + Math.sin(tick * 0.07 + p.id * 3) * L.sway * 0.5;
       this.errYaw *= L.decay; this.errPitch *= L.decay;

@@ -43,7 +43,7 @@ const MAP_ID = args.includes('--map') ? args[args.indexOf('--map') + 1] : MAP.id
 let server = null;
 async function startServer() {
   server = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '400' }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, HOPSHOT_DOTENV: process.env.HOPSHOT_DOTENV || '0', PORT: String(PORT), BOTS: '4', COUNTDOWN_MS: '400' }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});
   let inUse = false;

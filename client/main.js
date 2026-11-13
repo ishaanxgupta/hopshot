@@ -25,13 +25,19 @@
 // players + the camera (proximity), hud.voiceFrame() for buttons / speaking indicators, push-to-talk from
 // input.js. Desktop: while the Tab scoreboard is up, a click frees the cursor and pins the board so its
 // per-player voice controls can be used (click the game again to carry on). Debug: window.__hopshot.voice.
+//
+// Memory (protocol v6, only when the server has it on): a random secret player code (32 bytes, base64url) is
+// kept in localStorage 'hopshot.playerCode' and sent with every join; the Settings tab shows it (masked,
+// copy / paste to move to another device) once /health or the welcome says memory is on. The lobby gets
+// net.state.memory (AI bot option, host suggestion, personal tip), the Loadout tab its one tip line.
+// Debug: window.__hopshot.memory.
 
 import { TICK_RATE, BTN, RESPAWN_MS } from '../shared/constants.js';
 import { GUNS, currentSpread, popcount6, SLOT_COUNT } from '../shared/weapons.js';
 import { MAP } from '../shared/map.js';
 import { createWorld, eyeHeight } from '../shared/physics.js';
 import { MODES } from '../shared/modes.js';
-import { TICK_MS, SHOT } from '../shared/protocol.js';
+import { TICK_MS, SHOT, parsePlayerCode } from '../shared/protocol.js';
 import { createRenderer } from './render.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
@@ -204,6 +210,42 @@ function randomLoadoutCode() {
   return code;     // net.setLoadout sanitises it (3-attachment limit)
 }
 
+// ------------------------------------------------------------------ player code (v6, optional memory layer)
+// The only identity: a random secret made here and kept in this browser. The server hashes it into the
+// player's memory container and never stores or shows the code itself.
+const PCODE_KEY = 'hopshot.playerCode';
+function newPlayerCode() {
+  const b = new Uint8Array(32);
+  try { crypto.getRandomValues(b); } catch { for (let i = 0; i < b.length; i++) b[i] = Math.random() * 256; }
+  let bin = '';
+  for (let i = 0; i < b.length; i++) bin += String.fromCharCode(b[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+let playerCode = parsePlayerCode(load(PCODE_KEY, null)) || '';
+function ensurePlayerCode() {
+  if (!playerCode) { playerCode = newPlayerCode(); save(PCODE_KEY, playerCode); }
+  return playerCode;
+}
+function joinOpts() { return { bots: ROOM_BOTS, playerCode: ensurePlayerCode() }; }
+let memoryHealth = false;          // /health says the server has memory on
+function syncMemoryUi() {
+  const on = memoryHealth || net.state.memory.enabled;
+  hud.setPlayerCode({
+    enabled: on, code: on ? ensurePlayerCode() : '',
+    onUse(code) {
+      const c = parsePlayerCode(code);
+      if (!c) return 'That does not look like a player code.';
+      if (c === playerCode) return 'That is already your code.';
+      playerCode = c;
+      save(PCODE_KEY, c);
+      hud.setPlayerCode({ enabled: on, code: c, onUse: this.onUse });
+      if (started) { setTimeout(() => location.reload(), 700); return 'Code saved. Reloading to use it\u2026'; }
+      return 'Code saved. It is used when you join.';
+    },
+  });
+}
+net.on('memory', (m) => { hud.setLoadoutTip(m.enabled ? m.loadout : ''); syncMemoryUi(); });
+
 // ------------------------------------------------------------------ private rooms / invites
 function roomQuery(code, bots) {
   if (!code) return '';
@@ -285,7 +327,7 @@ function showMenu(tabName) {
       else lockHint = true;
       hideMenu();
       if (IS_TOUCH && !FORCED_TOUCH) goFullscreen();
-      if (!started) { started = true; net.connect(playerName, ROOM, { bots: ROOM_BOTS }); }
+      if (!started) { started = true; net.connect(playerName, ROOM, joinOpts()); }
     },
     onSettings(s) {
       Object.assign(settings, sanitize(s, settings));
@@ -361,6 +403,7 @@ async function probeServer() {
     if (!r.ok) throw new Error('bad status');
     const j = await r.json();
     server.humans = j.humans | 0;
+    if ((j.memory === true) !== memoryHealth) { memoryHealth = j.memory === true; syncMemoryUi(); }
     const wasDown = server.state !== 'online';
     setServerState('online');
     if (wasDown && started && !net.state.connected && net.state.status === 'reconnecting') net.retryNow();
@@ -777,7 +820,7 @@ function updateHud(t) {
   matchCtx.fov = renderer.getCamera().fov; matchCtx.alive = s.alive; matchCtx.kills = hudState.kills; matchCtx.deaths = hudState.deaths;
   matchCtx.myTeam = M.myTeam; matchCtx.selfId = s.id; matchCtx.self = local;
   if (s.connected && started) hud.match.update(matchCtx);
-  if (s.connected && M.phase === 'lobby') hud.lobby.update(M, { selfId: s.id, inviteUrl: roomMenu.inviteUrl, code: ROOM });
+  if (s.connected && M.phase === 'lobby') hud.lobby.update(M, { selfId: s.id, inviteUrl: roomMenu.inviteUrl, code: ROOM, memory: s.memory });
 
   if ((scoreboardHeld || sbPinned) && !menuOpen && playing && t >= sbNext) {
     sbNext = t + 250;
@@ -850,6 +893,7 @@ window.__hopshot = {
     scores: { ...M.scores }, config: M.config, timeLeftS: M.timeLeftS, countdown: M.countdown, lobby: M.lobby.map((p) => ({ ...p })),
     flags: M.flags ? { a: { ...M.flags.a }, b: { ...M.flags.b } } : null, hardpoint: M.hardpoint ? { ...M.hardpoint } : null, result: M.result }; },
   get gfx() { return renderer.memory(); },
+  get memory() { const m = net.state.memory; return { enabled: m.enabled, health: memoryHealth, host: m.host, lobby: m.lobby, loadout: m.loadout, hasCode: !!playerCode }; },
   hud,
   net, input, voice,
 };
@@ -859,7 +903,7 @@ if (AUTOPLAY) {
   started = true;
   menuOpen = false;
   input.enabled = false;
-  net.connect(playerName || 'Autoplay', ROOM, { bots: ROOM_BOTS });
+  net.connect(playerName || 'Autoplay', ROOM, joinOpts());
   setStatus('Connecting...');
 } else if (AUTOJOIN) {
   // "Create private room": straight into the room (and its lobby) with the saved name
@@ -867,7 +911,7 @@ if (AUTOPLAY) {
   menuOpen = false;
   playerName = String(playerName || 'Player').slice(0, 16);
   syncInput();
-  net.connect(playerName, ROOM, { bots: ROOM_BOTS });
+  net.connect(playerName, ROOM, joinOpts());
   setStatus('Connecting...');
   try { history.replaceState(null, '', location.pathname + roomQuery(ROOM, ROOM_BOTS)); } catch { /* ignore */ }
 } else {

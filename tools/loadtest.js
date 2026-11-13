@@ -3,7 +3,7 @@
 //
 //   node tools/loadtest.js [--clients 20] [--duration 20] [--warmup 3] [--port 3101]
 //                          [--host localhost] [--room name] [--spawn]
-//                          [--mode ffa|tdm|ctf|hardpoint --room name [--map id] [--bots 20]]
+//                          [--mode ffa|tdm|ctf|hardpoint --room name [--map id] [--bots 20] [--level ai]]
 //
 //   --mode    (protocol v4) the first client hosts a private match in --room: config
 //             { mode, mapId, bots: { fill } } + start, then everyone plays it (bots fill the
@@ -43,6 +43,9 @@ const SPAWN = opt('spawn', false) === true;
 const MODE = typeof opt('mode', '') === 'string' ? opt('mode', '') : '';
 const MAP_ID = typeof opt('map', '') === 'string' ? opt('map', '') : '';
 const BOTS_FILL = parseInt(opt('bots', '20'), 10);
+// (v6) --level easy|normal|hard|ai: bot level for --mode ('ai' needs a server with memory on, e.g.
+// MEMORY_ENABLED=1 SUPERMEMORY_MOCK=1 in this process's environment with --spawn)
+const BOT_LEVEL = typeof opt('level', '') === 'string' ? opt('level', '') : '';
 // --url https://host targets a remote (TLS) server instead of --host/--port.
 const URL_OPT = opt('url', '');
 const BASE_HTTP = typeof URL_OPT === 'string' && URL_OPT ? URL_OPT.replace(/\/+$/, '') : `http://${HOST}:${PORT}`;
@@ -61,7 +64,7 @@ const wireUp = (n) => n + (n < 126 ? 6 : n < 65536 ? 8 : 14);
 let serverProc = null;
 async function startServer() {
   serverProc = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, HOPSHOT_DOTENV: process.env.HOPSHOT_DOTENV || '0', PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   serverProc.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
   serverProc.stdout.on('data', () => {});
@@ -196,13 +199,13 @@ async function main() {
   if (MODE) {
     // (protocol v4) a named room starts in the lobby: client 0 is host, configures and starts
     if (!ROOM) throw new Error('--mode needs --room');
-    const cfg = { mode: MODE, bots: { fill: BOTS_FILL }, timeLimitS: 3600, scoreLimit: 1000 };
+    const cfg = { mode: MODE, bots: BOT_LEVEL ? { fill: BOTS_FILL, level: BOT_LEVEL } : { fill: BOTS_FILL }, timeLimitS: 3600, scoreLimit: 1000 };
     if (MAP_ID) cfg.mapId = MAP_ID;
     clients[0].send(encodeMatchConfig(cfg));
     await sleep(200);
     clients[0].send(encodeStart());
     for (let i = 0; i < 100 && clients[0].phase !== 'playing'; i++) await sleep(50);
-    console.log(`match: ${MODE} on ${MAP_ID || '(room default map)'}, bots fill ${BOTS_FILL}, phase ${clients[0].phase}`);
+    console.log(`match: ${MODE} on ${MAP_ID || '(room default map)'}, bots fill ${BOTS_FILL}${BOT_LEVEL ? ' level ' + BOT_LEVEL : ''}, phase ${clients[0].phase}`);
   }
 
   // 60 Hz input driven by an accumulator (each client sends exactly one packet per tick on average)

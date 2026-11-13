@@ -180,6 +180,25 @@
 //   team modes in phase countdown / playing -> teammates only; otherwise everyone in the room.
 //   A client never sends its microphone track to a peer that is not allowed to hear it.
 //
+// MEMORY (v6) - an OPTIONAL long-term memory layer (server/memory, powered by Supermemory). It is on
+//   only when the server runs with MEMORY_ENABLED=1 and a SUPERMEMORY_API_KEY (or SUPERMEMORY_MOCK=1).
+//   Off, nothing below is ever sent and the server ignores `pc`.
+//   Identity: no accounts. The browser keeps a random secret "player code" (32 random bytes,
+//   base64url, localStorage) and sends it on join. The server only keeps a hash of it (the
+//   player's memory container tag); the code is never stored, logged, echoed or shown to others.
+// client -> server:
+//   join gains  pc?:<player code, 22..128 chars of [A-Za-z0-9_-]>
+// server -> client:
+//   welcome gains  memory:<bool>      true = AI bots and suggestions are available on this server
+//   match.config.bots.level may be 'ai' (AI bots, shared/modes.js AI_BOT_LEVEL) only when memory is on
+//   { t:'memory', host, lobby, loadout }   suggestions for YOU (only when memory is on and you sent
+//                                           a player code; re-sent whenever one changes):
+//     host    = null | { mode, mapId, text }   (host only, lobby) a mode + map for the current
+//               group of humans with the reason in `text`; apply it with a normal 'config'
+//     lobby   = '' | text    one personal tip for the lobby
+//     loadout = '' | text    one tip for the Loadout tab
+//   Every text is built from recorded history with exact counts; no history = '' / null.
+//
 // CLOCK SYNC (client side; client/net.js implements all of this)
 //   v2: the render clock for remote players is derived from SNAPSHOT ARRIVAL TIMES, not from
 //   the ping clock: base = max over a few seconds of (snapshot.tick - arrivalMs / TICK_MS)
@@ -215,7 +234,7 @@ import {
 } from './weapons.js';
 import { STATE_BYTES, writeState, readState, createPlayerState } from './physics.js';
 
-export const PROTOCOL_VERSION = 5;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps; v5: voice chat signaling
+export const PROTOCOL_VERSION = 6;   // v2: input-buffer feedback + dilation; v3: guns + loadouts; v4: modes, teams, lobby, maps; v5: voice chat signaling; v6: optional memory (player code, AI bots, suggestions)
 export const MSG = { INPUT: 1, SNAPSHOT: 2 };
 export const SHOT = { MISS: 0, WORLD: 1, BODY: 2, HEAD: 3 };
 export const PFLAG = { ALIVE: 1, CROUCHING: 2, SLIDING: 4, ON_GROUND: 8, ADS: 16, RELOADING: 32 };
@@ -614,7 +633,7 @@ export function decodeText(data, maxBytes = MAX_TEXT_BYTES) {
 }
 
 // Typed constructors for client -> server text messages.
-export function encodeJoin(name, room, bots, loadoutCode) {
+export function encodeJoin(name, room, bots, loadoutCode, playerCode) {
   const m = { t: 'join', v: PROTOCOL_VERSION, name: String(name ?? '') };
   if (room) m.room = String(room);
   // Optional: minimum participants to keep by adding bots (0 = no bots). Only honoured when
@@ -622,7 +641,14 @@ export function encodeJoin(name, room, bots, loadoutCode) {
   if (Number.isFinite(bots)) m.bots = bots | 0;
   // Optional (v3): loadout code (weapons.encodeLoadout) for the first life.
   if (Number.isInteger(loadoutCode)) m.lo = sanitizeLoadoutCode(loadoutCode);
+  // Optional (v6): the secret player code (memory identity; ignored unless the server has memory on).
+  const pc = parsePlayerCode(playerCode);
+  if (pc) m.pc = pc;
   return JSON.stringify(m);
+}
+/** (v6) A valid player code (22..128 chars of base64url) or null. Server and client. */
+export function parsePlayerCode(v) {
+  return typeof v === 'string' && /^[A-Za-z0-9_-]{22,128}$/.test(v) ? v : null;
 }
 /** (v3) Set the pending loadout; it becomes active at the next spawn. */
 export function encodeSetLoadout(loadoutCode) {

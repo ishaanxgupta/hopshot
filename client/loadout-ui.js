@@ -13,6 +13,7 @@
 //   ed.setState({ code, builds })     load a saved loadout (any garbage is sanitised)
 //   ed.setStatus({ pendingCode, activeCode, joined })   honest timing line
 //   ed.setPlayLabel('PLAY' | 'RESUME')
+//   ed.setTip(text)                   (v6, memory on) one short line tied to the player's history; '' hides it
 //   ed.refresh()                      call when the tab becomes visible
 //
 // Persisted form (main.js keeps it in localStorage 'hopshot.loadout'): { code: int, builds: [6 masks] }.
@@ -107,6 +108,7 @@ export function createLoadoutEditor(host, opts = {}) {
         <div class="hs-lo-stats" aria-label="Gun ratings"></div>
       </div>
       <div class="hs-lo-opts">
+        <p class="hs-lo-hint" hidden><i aria-hidden="true"></i><span></span></p>
         <div class="hs-lo-guns"></div>
         <div class="hs-lo-atthead">
           <span class="t">Attachments</span>
@@ -124,6 +126,7 @@ export function createLoadoutEditor(host, opts = {}) {
     play: $('.hs-lo-play'), reset: $('.hs-lo-reset'),
     slots: $('.hs-lo-slots'), guns: $('.hs-lo-guns'), pips: $('.hs-pips'), msg: $('.hs-lo-msg'),
     atts: $('.hs-lo-atts'), stats: $('.hs-lo-stats'), def: $('.hs-lo-def'), clear: $('.hs-lo-clear'),
+    hint: $('.hs-lo-hint'), hintT: $('.hs-lo-hint span'),
     view: $('.hs-lo-view'), cv: $('.hs-lo-cv'), nowGun: $('.hs-lo-nowgun'), hl: $('.hs-lo-hl'), tip: $('.hs-lo-tip'),
   };
 
@@ -391,6 +394,11 @@ export function createLoadoutEditor(host, opts = {}) {
     },
     setStatus(s) { status = { ...status, ...s }; renderStatus(); },
     setPlayLabel(t) { el.play.textContent = t; },
+    setTip(text) {
+      const t = typeof text === 'string' ? text : '';
+      if (el.hintT.textContent !== t) el.hintT.textContent = t;
+      el.hint.hidden = !t;
+    },
     refresh() { render(); },
     get code() { return code(); },
     get builds() { return builds.slice(); },

@@ -33,6 +33,12 @@
 //   Public rooms never use the lobby. Score changes that end a match are applied at the end of
 //   the tick (pendingEnd), so nothing is despawned while the tick is still iterating players.
 //
+// Memory (protocol v6, optional; server/memory): opts.memory = the MemoryService (null = off, the
+// default). When on, this.mem (a MemoryRoom) gets O(1) hooks from addHuman / removePlayer / fire /
+// damage / kill / match start + end and a 1 Hz tick while playing; it never blocks the loop (all
+// I/O is async, after the match). 'ai' bots exist only then (sanitizeMatchConfig allowAi). Off,
+// every hook is skipped by a null check and the room behaves exactly as before.
+//
 // Voice (protocol v5): private rooms only. relaySignal() forwards WebRTC signaling between two
 // humans of this room (validated + rebuilt by protocol.sanitizeSignal); setVoiceState() keeps
 // each human's mic / deaf flags and broadcasts changes. The server never touches audio, and who
@@ -121,6 +127,8 @@ export class Room {
     this.spawnPolicy = opts.spawnPolicy || 'smart';
     this.iceServers = Array.isArray(opts.iceServers) ? opts.iceServers : [];
     this.voiceStats = { relayed: 0, refused: 0, limited: 0, states: 0 };
+    this.memory = opts.memory || null;
+    this.mem = this.memory ? this.memory.createRoom(this) : null;
     this.players = [];          // dense list, humans and bots
     this.byId = new Map();
     this.nextId = 1;
@@ -130,7 +138,7 @@ export class Room {
 
     // match
     this.modeRot = 0; this.mapRot = 0;
-    const cfg = this.isPrivate ? sanitizeMatchConfig(opts.config || {}, defaultMatchConfig())
+    const cfg = this.isPrivate ? sanitizeMatchConfig(opts.config || {}, defaultMatchConfig(), { allowAi: !!this.mem })
       : this.rotationConfig(opts.config);
     this.config = cfg;
     this.map = null; this.world = null;
@@ -193,6 +201,7 @@ export class Room {
   }
 
   destroy() {
+    if (this.mem && !this.destroyed) this.mem.destroy();
     this.destroyed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
@@ -325,11 +334,15 @@ export class Room {
     else this.despawn(p);
   }
 
-  /** Add a human (loadoutCode: optional client-supplied code). Returns the player, or null if the room is full. */
-  addHuman(ws, name, loadoutCode) {
+  /**
+   * Add a human (loadoutCode: optional client-supplied code; playerCode: (v6) the secret memory
+   * identity, only looked at when memory is on and never kept). Returns the player, or null if full.
+   */
+  addHuman(ws, name, loadoutCode, playerCode) {
     if (!this.hasFreeSlot()) return null;
     const p = this.createPlayer(name, ws, false, loadoutCode);
     if (!p) return null;
+    if (this.mem) this.mem.addHuman(p, playerCode);
     p.team = this.teamForNew(p);
     // make room by removing a bot first if necessary (one from the newcomer's team if possible)
     if (this.players.length >= MAX_PLAYERS) {
@@ -339,6 +352,7 @@ export class Room {
     this.addPlayer(p);
     this.updateBots();
     this.lobbyChanged();
+    if (this.mem) this.mem.refreshTips();
     return p;
   }
 
@@ -365,10 +379,12 @@ export class Room {
     p.ws = null;
     this.broadcast(encodeText({ t: 'leave', id: p.id }), null);
     if (!p.bot) {
+      if (this.mem) this.mem.removeHuman(p);
       if (this.humans === 0) { this.destroy(); this.onEmpty(this); return; }
       if (this.hostId === p.id) this.migrateHost();
       this.updateBots();
       this.lobbyChanged();
+      if (this.mem) this.mem.refreshTips();
     }
   }
 
@@ -378,6 +394,7 @@ export class Room {
     for (const q of this.players) if (!q.bot && (!best || q.joinSeq < best.joinSeq)) best = q;
     this.hostId = best ? best.id : 0;
     this.broadcastMatch();
+    if (this.mem) this.mem.refreshTips();
   }
 
   get teamMode() { return isTeamMode(this.config.mode); }
@@ -528,6 +545,8 @@ export class Room {
       match: this.matchState(), lobby: this.lobbyState(), obj: this.objState(),
       // (v5) voice chat: private rooms only
       voice: !!this.isPrivate, ice: this.isPrivate ? this.iceServers : undefined,
+      // (v6) optional memory layer: AI bots + suggestions available
+      memory: !!this.mem,
     });
   }
 
@@ -597,11 +616,12 @@ export class Room {
     if (this.phase !== 'lobby') return 'bad_phase';
     if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return 'bad_config';
     const prev = this.config;
-    const next = sanitizeMatchConfig(cfg, prev);
+    const next = sanitizeMatchConfig(cfg, prev, { allowAi: !!this.mem });
     this.config = next;
     if (next.mapId !== this.map.id) this.setMap(next.mapId);
     if (next.mode !== prev.mode || next.coop !== prev.coop) { this.reassignTeams(); this.lobbyChanged(); }
     this.broadcastMatch();
+    if (this.mem) this.mem.refreshTips();
     return null;
   }
 
@@ -658,6 +678,7 @@ export class Room {
     this.broadcastMatch();
     this.lobbyChanged();
     this.broadcast(encodeText({ t: 'round', ...this.roundCompat() }), null);
+    if (this.mem) this.mem.refreshTips();
   }
 
   startPlaying() {
@@ -668,6 +689,7 @@ export class Room {
     this.startTick = this.tick;
     this.endsTick = this.tick + msToTicks(this.config.timeLimitS * 1000);
     for (const p of this.players) { p.kills = 0; p.deaths = 0; p.obj = 0; p.carrying = ''; }
+    if (this.mem) this.mem.matchStart();
     this.initObjectives();
     this.broadcastMatch();
     this.event('match_start', { mode: this.config.mode, mapId: this.map.id, endsTick: this.endsTick });
@@ -691,6 +713,7 @@ export class Room {
       winnerName: wp ? wp.name : winner === 'a' ? 'Team A' : winner === 'b' ? 'Team B' : '',
       scores: { a: this.scores.a, b: this.scores.b }, reason, endsTick: this.endsTick, rows,
     };
+    if (this.mem) this.mem.matchEnd(this.result);     // reads the live stats; writes happen later, async
     for (const p of this.players) this.despawn(p);
     this.flags = null; this.hp = null;
     this.broadcast(encodeText({ t: 'result', ...this.result }), null);
@@ -719,6 +742,7 @@ export class Room {
     this.broadcastMatch();
     this.lobbyChanged();
     this.broadcast(encodeText({ t: 'round', ...this.roundCompat() }), null);
+    if (this.mem) this.mem.refreshTips();
   }
 
   /**
@@ -1148,6 +1172,7 @@ export class Room {
     if (tick % SCORES_EVERY === 0) this.broadcast(encodeText({ t: 'scores', rows: this.scoreRows() }), null);
     if (tick % MATCH_REFRESH === 0) this.broadcastMatch();
     if (this.botWarm && this.botWarm.length) Bot.warmStep(this);
+    if (this.mem && this.phase === 'playing' && tick % TICK_RATE === 0) this.mem.second();
   }
 
   // ------------------------------------------------------------------ combat
@@ -1245,6 +1270,7 @@ export class Room {
     }
 
     if (this.phase !== 'playing') { for (let j = 0; j < nd; j++) this.dmgVictim[j] = null; return; }
+    if (this.mem && p.mem) this.mem.shot(p, gun, p.kit.masks[slot], nd > 0);
     for (let j = 0; j < nd; j++) {
       const v = this.dmgVictim[j];
       this.dmgVictim[j] = null;
@@ -1254,6 +1280,7 @@ export class Room {
   }
 
   damage(victim, attacker, amount, headshot, weapon, gun = weapon * 2) {
+    if (this.mem) this.mem.damaged(victim, attacker);
     victim.health -= amount;
     victim.lastDamageTick = this.tick;
     const killed = victim.health <= 0;
@@ -1289,6 +1316,7 @@ export class Room {
         if (this.config.mode === 'tdm' && killer.team) this.addScore(killer.team, 1);
         else if (this.config.mode === 'ffa' && killer.kills >= this.config.scoreLimit) this.pendingEnd = 'score';
       }
+      if (this.mem) this.mem.killed(victim, killer, gun | 0);
     }
     this.broadcast(encodeText({
       t: 'kill', killer: killer && killer !== victim ? killer.id : 0, victim: victim.id,

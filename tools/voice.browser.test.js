@@ -52,7 +52,7 @@ async function waitHttp(url, ms) {
 
 async function startServer() {
   server = spawn(process.execPath, [path.join(ROOT, 'server/index.js')], {
-    env: { ...process.env, PORT: String(PORT), BOTS: '0', COUNTDOWN_MS: '1500', RESULTS_MS: '15000' }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, HOPSHOT_DOTENV: process.env.HOPSHOT_DOTENV || '0', PORT: String(PORT), BOTS: '0', COUNTDOWN_MS: '1500', RESULTS_MS: '15000' }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (d) => { serverLog += d; if (serverLog.length > 200000) serverLog = serverLog.slice(-100000); });
   server.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));

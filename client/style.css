@@ -988,3 +988,26 @@ td.vc.vx { opacity: 0.45; }
   .lb-btn.lb-vb { width: 38px; min-width: 38px; }
   .lb-acts { gap: 0; }
 }
+
+/* (v6) optional memory layer: lobby suggestion + tip, Loadout tip line, Player code settings group */
+.lb-tips { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+.lb-tips:not(:has(> :not([hidden]))) { display: none; }
+.lb-sug { max-width: 100%; display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 14px 6px 10px; text-align: left; color: #fff;
+  background: rgba(63, 208, 192, 0.1); border: 0; border-radius: 14px; box-shadow: inset 0 0 0 1px rgba(63, 208, 192, 0.28); cursor: pointer; font: inherit; }
+.lb-sug:hover { background: rgba(63, 208, 192, 0.17); }
+.lb-sug[hidden], .lb-tip[hidden], .hs-lo-hint[hidden] { display: none; }
+.lb-sug svg, .lb-tip svg { flex: none; color: var(--accent-2); }
+.lb-sug span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.lb-sug b { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lb-sug em { font-style: normal; font-size: 12px; color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lb-tip { margin: 0; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 1.4; color: var(--ink-dim); }
+.lb-tip svg { margin-top: 1px; }
+.lb-seg button.lb-ai[hidden] { display: none; }
+.hs-lo-hint { order: 1; margin: 0 0 12px; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 1.45; color: var(--ink-dim); }
+.hs-lo-hint i { flex: none; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--accent-2); }
+.hs-pcrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; }
+.hs-pcode input { min-width: 0; min-height: 40px; width: 100%; padding: 9px 12px; font: 600 13px var(--font); color: #fff; background: rgba(255, 255, 255, 0.1); border: 1px solid var(--line); border-radius: 9px; outline: none; }
+.hs-pcode input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255, 180, 58, 0.25); }
+.hs-pcode input::placeholder { color: var(--ink-dim); }
+.hs-pcmsg:empty { display: none; }
+@media (min-width: 560px) { .hs-lo-hint { order: -1; } }
